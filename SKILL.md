@@ -20,7 +20,7 @@ description: trình bày SKILL.md theo format bảng Task, Input, Element, Outpu
 ```markdown
 | Task | Input  | Output | 
 | --- | --- | ---| --- |
-| <Task> | <Input> | <Output> | 
+|<số task>.<Task> | <Input> | <Output> | 
 ```
 
 - Mỗi task có đúng một dòng trong bảng
@@ -30,7 +30,7 @@ description: trình bày SKILL.md theo format bảng Task, Input, Element, Outpu
 Mỗi task phải có phần chi tiết theo cấu trúc:
 
 ```markdown
-## <số skill>.<số task> <Task>
+## <Task>
 
 ### Input
 
