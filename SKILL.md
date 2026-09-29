@@ -18,14 +18,13 @@ description: trình bày SKILL.md theo format bảng Task, Input, Element, Outpu
 Đặt bảng tóm tắt ngay dưới tiêu đề cấp một của skill:
 
 ```markdown
-| Task | Input | Element | Output | 
-| --- | --- | --- | --- | --- |
-| <Task> | <Input> | - Item 1<br>- Item 2 | <Output> | 
+| Task | Input  | Output | 
+| --- | --- | ---| --- |
+| <Task> | <Input> | <Output> | 
 ```
 
 - Mỗi task có đúng một dòng trong bảng
 - Ô input, output chỉ có đúng 1 object ngắn gọn dưới 5 chữ
-- Viết các ô Element ngắn gọn, khi một ô có nhiều ý, phân tách bằng `<br>` để phân tách các dòng, mỗi dòng chỉ có một ý dưới 5 chữ 
 - Dùng tên task nhất quán giữa bảng và tiêu đề chi tiết.
 
 Mỗi task phải có phần chi tiết theo cấu trúc:
@@ -37,9 +36,11 @@ Mỗi task phải có phần chi tiết theo cấu trúc:
 
 - ...
 
-### Element
+### Elements
 
 - ...
+
+
 
 ### Output
 
