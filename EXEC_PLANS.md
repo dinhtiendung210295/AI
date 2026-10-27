@@ -41,3 +41,8 @@ Bảng gồm có các cột:
 - Loại: Bất ngờ (nhận ra plan bị sai hoặc chưa có thông tin mới quan trọng có thể làm đổi hướng plan ), Quyết định của người dùng 
 - Bằng chứng: Lệnh, log, tệp, kết quả test, câu hỏi người dùng và lựa chọn đề xuất
 - Hành động đối ứng: Đã làm gì
+
+## Script và asset quan trọng
+Bảng script gồm có các cột:
+- Công việc hoặc Mốc sử dụng:
+- Script/Asset và công dụng
