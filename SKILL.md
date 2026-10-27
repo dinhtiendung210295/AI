@@ -32,19 +32,10 @@ Mỗi task phải có phần chi tiết theo cấu trúc:
 ```markdown
 ## <Task>
 
-### Input
-
-- ...
-
-### Elements
-
-- ...
+- ... dùng ref ... và script ...
+- ... output theo format ...
 
 
-
-### Output
-
-- ...
 
 
 ```
