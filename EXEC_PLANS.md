@@ -7,8 +7,7 @@
 ## Mẫu
 ---
 
-# [Tên công việc: ngắn, dùng động từ và nêu rõ kết quả]
-**Trạng thái:** Chưa bắt đầu  
+# [Tên công việc]
 **Cập nhật gần nhất:** [YYYY-MM-DD HH:mm, múi giờ]  
 
 
@@ -37,17 +36,8 @@ Cập nhật trạng thái ngay khi có bằng chứng hoàn thành hoàn toàn 
 [Bổ sung khi đóng từng mốc lớn. Đối chiếu kết quả với mục tiêu ban đầu; ghi điều đã đạt, chưa đạt, kiểm thử đã chạy, nợ kỹ thuật và bài học.]
 
 ## Nhật ký
-Bảng gôm có các cột:
+Bảng gồm có các cột:
 - Ngày giờ: 
 - Loại: Bất ngờ (nhận ra plan bị sai hoặc chưa có thông tin mới quan trọng có thể làm đổi hướng plan ), Quyết định của người dùng 
 - Bằng chứng: Lệnh, log, tệp, kết quả test, câu hỏi người dùng và lựa chọn đề xuất
 - Hành động đối ứng: Đã làm gì
-
-
-
-
-
-
-   > Đọc `AGENTS.md`, `.agent/PLANS.md` và ExecPlan tại `[đường dẫn]`. Đối chiếu kế hoạch với repository hiện tại, xác minh trạng thái thực tế và tiếp tục từ milestone chưa hoàn thành tiếp theo.
-
-**Lưu ý:** Tệp này chỉ là tài liệu chỉ dẫn. Codex không tự động áp dụng nó cho mọi yêu cầu nếu `AGENTS.md` hoặc prompt không yêu cầu đọc. Các tiêu chí và lệnh kiểm thử phải được điều chỉnh theo từng repository; không dùng nguyên các mục ví dụ trong khuôn mẫu làm bằng chứng hoàn thành.
