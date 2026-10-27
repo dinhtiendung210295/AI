@@ -15,7 +15,7 @@
 
 [Giải thích vấn đề từ góc nhìn người sử dụng. Mô tả hành vi trước và sau thay đổi, lợi ích đạt được và cách người dùng tự quan sát kết quả.]
 
-## Progress — Tiến độ
+## Tiến độ
 
 - [ ] [Mốc kèm điều kiện hoàn thành].
 - [ ] [Mốc kèm điều kiện hoàn thành].
@@ -26,23 +26,11 @@ Cập nhật trạng thái ngay khi có bằng chứng hoàn thành hoàn toàn 
 
 ## Plan of Work — Kế hoạch thực hiện
 
-**[Tên mốc]** [các tệp/hàm cụ thể, kết quả nhìn thấy được và cách kiểm chứng độc lập.]
+**[Tên mốc]** [kế hoạch chi tiết để đạt mốc]
 
-**[Tên mốc]** [Tiếp nối từ milestone trước, mô tả công việc và bằng chứng hoàn tất.]
+**[Tên mốc]** [kế hoạch chi tiết để đạt mốc]
 
 
-## Outcomes & Retrospective — Kết quả và tổng kết
+## Ngoại lệ
 
-[Bổ sung khi đóng từng mốc lớn. Đối chiếu kết quả với mục tiêu ban đầu; ghi điều đã đạt, chưa đạt, kiểm thử đã chạy, nợ kỹ thuật và bài học.]
 
-## Nhật ký
-Bảng gồm có các cột:
-- Ngày giờ: 
-- Loại: Bất ngờ (nhận ra plan bị sai hoặc chưa có thông tin mới quan trọng có thể làm đổi hướng plan ), Quyết định của người dùng 
-- Bằng chứng: Lệnh, log, tệp, kết quả test, câu hỏi người dùng và lựa chọn đề xuất
-- Hành động đối ứng: Đã làm gì
-
-## Script và asset quan trọng
-Bảng script gồm có các cột:
-- Công việc hoặc Mốc sử dụng:
-- Script/Asset và công dụng
