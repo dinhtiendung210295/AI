@@ -1,0 +1,308 @@
+[
+  {
+    "session_id": "01a12ef6-780c-7721-ac81-856586854d36",
+    "title": "Tháng 7: kiểm tra migration ban đầu",
+    "group": "07-staging",
+    "status": "exported",
+    "file": "sessions/07-staging-01a12ef6-780c-7721-ac81-856586854d36.md",
+    "messages": 455,
+    "tool_calls": 1197,
+    "source_sha256": "1f52a9be41ee95a7db4b02f96b63ca00db72b366a7331cbb17e8e8a74fc927ab",
+    "warnings": [
+      "Có asset nhúng trong công cụ; chỉ giữ text/tham chiếu.",
+      "Có compact: không xuất tóm tắt nội bộ và không khôi phục lịch sử đã mất.",
+      "Loại record chưa hỗ trợ: inter_agent_communication_metadata",
+      "Loại response chưa hỗ trợ: agent_message",
+      "Ảnh/tệp chỉ được giữ dưới dạng tham chiếu, không sao chép asset."
+    ],
+    "compressed": false
+  },
+  {
+    "session_id": "01a1386a-b62b-7f42-a6c0-06c73d365c64",
+    "title": "Tháng 7: tiếp tục migration ban đầu",
+    "group": "07-staging",
+    "status": "exported",
+    "file": "sessions/07-staging-01a1386a-b62b-7f42-a6c0-06c73d365c64.md",
+    "messages": 3,
+    "tool_calls": 0,
+    "source_sha256": "2862a79eac681ff58d77b953d0ad939691da2c90422349551527cc805af16cad",
+    "warnings": [],
+    "compressed": true
+  },
+  {
+    "session_id": "01a1586f-6059-7c30-8d7b-27ace90a687c",
+    "title": "Rà soát tồn kho và phản hồi nghiệp vụ",
+    "group": "20-review",
+    "status": "exported",
+    "file": "sessions/20-review-01a1586f-6059-7c30-8d7b-27ace90a687c.md",
+    "messages": 5,
+    "tool_calls": 9,
+    "source_sha256": "4cc1c5aa62380d751b5d38b9741387bc0dc226ee162c3df8935f8b7f3a69a7b9",
+    "warnings": [
+      "Ảnh/tệp chỉ được giữ dưới dạng tham chiếu, không sao chép asset."
+    ],
+    "compressed": true
+  },
+  {
+    "session_id": "01a15d6d-88f7-7502-841c-4a3d332aad70",
+    "title": "Contact và ánh xạ Bill",
+    "group": "21-master",
+    "status": "exported",
+    "file": "sessions/21-master-01a15d6d-88f7-7502-841c-4a3d332aad70.md",
+    "messages": 179,
+    "tool_calls": 542,
+    "source_sha256": "83a8131d30a3a74bc5e933378eede0775d864a08072010ca24a562d6a2fe1fe3",
+    "warnings": [
+      "Có asset nhúng trong công cụ; chỉ giữ text/tham chiếu.",
+      "Có compact: không xuất tóm tắt nội bộ và không khôi phục lịch sử đã mất.",
+      "Loại record chưa hỗ trợ: inter_agent_communication_metadata",
+      "Loại response chưa hỗ trợ: agent_message",
+      "Ảnh/tệp chỉ được giữ dưới dạng tham chiếu, không sao chép asset."
+    ],
+    "compressed": false
+  },
+  {
+    "session_id": "01a15d76-3c77-7a00-8ceb-41011f63f549",
+    "title": "Bổ sung product",
+    "group": "21-master",
+    "status": "exported",
+    "file": "sessions/21-master-01a15d76-3c77-7a00-8ceb-41011f63f549.md",
+    "messages": 230,
+    "tool_calls": 779,
+    "source_sha256": "a11c55879f5f40a7fb575fae09bb802505c49840fb80550e15fa25b44f839975",
+    "warnings": [
+      "Có asset nhúng trong công cụ; chỉ giữ text/tham chiếu.",
+      "Có compact: không xuất tóm tắt nội bộ và không khôi phục lịch sử đã mất.",
+      "Loại record chưa hỗ trợ: inter_agent_communication_metadata",
+      "Loại response chưa hỗ trợ: agent_message",
+      "Ảnh/tệp chỉ được giữ dưới dạng tham chiếu, không sao chép asset."
+    ],
+    "compressed": false
+  },
+  {
+    "session_id": "01a1695d-f0a0-7c11-9117-1e793ca11804",
+    "title": "SO tháng 8–10",
+    "group": "23-orders",
+    "status": "exported",
+    "file": "sessions/23-orders-01a1695d-f0a0-7c11-9117-1e793ca11804.md",
+    "messages": 38,
+    "tool_calls": 102,
+    "source_sha256": "04066ffa4fe1890fe68c8a87180ff2dfe6828b0b1ab0d0936087ac72b06f3c4b",
+    "warnings": [
+      "Có asset nhúng trong công cụ; chỉ giữ text/tham chiếu.",
+      "Ảnh/tệp chỉ được giữ dưới dạng tham chiếu, không sao chép asset."
+    ],
+    "compressed": false
+  },
+  {
+    "session_id": "01a16b3e-7d6a-70f2-92a9-1a8c75d4af5b",
+    "title": "PO tháng 8–10",
+    "group": "23-orders",
+    "status": "exported",
+    "file": "sessions/23-orders-01a16b3e-7d6a-70f2-92a9-1a8c75d4af5b.md",
+    "messages": 32,
+    "tool_calls": 99,
+    "source_sha256": "b61daaf776da1c917885c3e06b6e136c2191bef449909af7860e015ae3692b36",
+    "warnings": [
+      "Có asset nhúng trong công cụ; chỉ giữ text/tham chiếu.",
+      "Ảnh/tệp chỉ được giữ dưới dạng tham chiếu, không sao chép asset."
+    ],
+    "compressed": false
+  },
+  {
+    "session_id": "01a1733d-e280-7ac2-ad10-174de032ba69",
+    "title": "PO confirm theo pha",
+    "group": "25-confirm",
+    "status": "exported",
+    "file": "sessions/25-confirm-01a1733d-e280-7ac2-ad10-174de032ba69.md",
+    "messages": 66,
+    "tool_calls": 216,
+    "source_sha256": "8d81d5b7c16e39326d0b84271bd4fea9cff3a1516725e04b15c4eb6c456d8b66",
+    "warnings": [
+      "Ảnh/tệp chỉ được giữ dưới dạng tham chiếu, không sao chép asset."
+    ],
+    "compressed": false
+  },
+  {
+    "session_id": "01a17366-5771-71a1-b3c1-2dec51dd4e09",
+    "title": "SO confirm trên production",
+    "group": "25-confirm",
+    "status": "exported",
+    "file": "sessions/25-confirm-01a17366-5771-71a1-b3c1-2dec51dd4e09.md",
+    "messages": 59,
+    "tool_calls": 228,
+    "source_sha256": "9696e90b9eb40a6ee73084a07a1f4e9c94c8f5321a89d0232f21e245790c41e7",
+    "warnings": [
+      "Có asset nhúng trong công cụ; chỉ giữ text/tham chiếu."
+    ],
+    "compressed": false
+  },
+  {
+    "session_id": "01a1773d-638c-7dd0-816f-e7ff124aac1a",
+    "title": "Kế hoạch và đối chiếu toàn kỳ",
+    "group": "26-plan",
+    "status": "exported",
+    "file": "sessions/26-plan-01a1773d-638c-7dd0-816f-e7ff124aac1a.md",
+    "messages": 33,
+    "tool_calls": 59,
+    "source_sha256": "d4af2a90d63581dd690e620ae1c031a95338409479d5a473641c4f2916bed974",
+    "warnings": [
+      "Có asset nhúng trong công cụ; chỉ giữ text/tham chiếu.",
+      "Ảnh/tệp chỉ được giữ dưới dạng tham chiếu, không sao chép asset."
+    ],
+    "compressed": false
+  },
+  {
+    "session_id": "01a17770-d37c-75b0-b61f-bf4c93b53c11",
+    "title": "Đối chiếu move liên quan PO",
+    "group": "26-stock",
+    "status": "exported",
+    "file": "sessions/26-stock-01a17770-d37c-75b0-b61f-bf4c93b53c11.md",
+    "messages": 737,
+    "tool_calls": 2852,
+    "source_sha256": "9f1b9d607bfb535c4c18436f092c6321aa6e7139be1e2125eaf610091ea276e0",
+    "warnings": [
+      "Có asset nhúng trong công cụ; chỉ giữ text/tham chiếu.",
+      "Có compact: không xuất tóm tắt nội bộ và không khôi phục lịch sử đã mất.",
+      "Loại event chưa hỗ trợ: thread_goal_updated",
+      "Ảnh/tệp chỉ được giữ dưới dạng tham chiếu, không sao chép asset."
+    ],
+    "compressed": false
+  },
+  {
+    "session_id": "01a17d70-a4ef-76a1-b004-6086a729545a",
+    "title": "MO và unbuild tháng 9–10",
+    "group": "27-manufacturing",
+    "status": "exported",
+    "file": "sessions/27-manufacturing-01a17d70-a4ef-76a1-b004-6086a729545a.md",
+    "messages": 1015,
+    "tool_calls": 4434,
+    "source_sha256": "7e218669f0233e7c4bcd3305a0cd620e522905574ab4039aa3fe9ffd9a682565",
+    "warnings": [
+      "Có compact: không xuất tóm tắt nội bộ và không khôi phục lịch sử đã mất.",
+      "Loại event chưa hỗ trợ: thread_goal_updated",
+      "Ảnh/tệp chỉ được giữ dưới dạng tham chiếu, không sao chép asset."
+    ],
+    "compressed": false
+  },
+  {
+    "session_id": "01a17ff4-3a2f-7ab2-8eba-7a7ad1bfe157",
+    "title": "Bill tháng 9–10",
+    "group": "28-accounting",
+    "status": "exported",
+    "file": "sessions/28-accounting-01a17ff4-3a2f-7ab2-8eba-7a7ad1bfe157.md",
+    "messages": 232,
+    "tool_calls": 1326,
+    "source_sha256": "e802890d5d9bdd66f0a3943d43d8cb78530bce73af8700b08e9ccd0314c28fc7",
+    "warnings": [
+      "Có asset nhúng trong công cụ; chỉ giữ text/tham chiếu.",
+      "Có compact: không xuất tóm tắt nội bộ và không khôi phục lịch sử đã mất.",
+      "Loại event chưa hỗ trợ: thread_goal_updated",
+      "Ảnh/tệp chỉ được giữ dưới dạng tham chiếu, không sao chép asset."
+    ],
+    "compressed": false
+  },
+  {
+    "session_id": "01a181fb-67d1-75b0-b80f-3dbd17be24e5",
+    "title": "Other move: phạm vi và chuẩn bị",
+    "group": "28-other-move",
+    "status": "exported",
+    "file": "sessions/28-other-move-01a181fb-67d1-75b0-b80f-3dbd17be24e5.md",
+    "messages": 104,
+    "tool_calls": 415,
+    "source_sha256": "eaae973dd125b8001a1e811ed9ddac69f6a30ae05a99105373fd9657f0f87398",
+    "warnings": [
+      "Có asset nhúng trong công cụ; chỉ giữ text/tham chiếu.",
+      "Có compact: không xuất tóm tắt nội bộ và không khôi phục lịch sử đã mất.",
+      "Ảnh/tệp chỉ được giữ dưới dạng tham chiếu, không sao chép asset."
+    ],
+    "compressed": false
+  },
+  {
+    "session_id": "01a181f9-b11e-74e0-9e74-25c0eb94696d",
+    "title": "SO delivered: xử lý ngoại lệ",
+    "group": "28-delivery",
+    "status": "exported",
+    "file": "sessions/28-delivery-01a181f9-b11e-74e0-9e74-25c0eb94696d.md",
+    "messages": 1092,
+    "tool_calls": 3955,
+    "source_sha256": "32e4bf45c21556ef84d5b359cffb001a833effa1d6d0b1e1c60be498db2cca74",
+    "warnings": [
+      "Có compact: không xuất tóm tắt nội bộ và không khôi phục lịch sử đã mất.",
+      "Loại event chưa hỗ trợ: thread_goal_updated",
+      "Ảnh/tệp chỉ được giữ dưới dạng tham chiếu, không sao chép asset."
+    ],
+    "compressed": false
+  },
+  {
+    "session_id": "01a184fe-23db-7af0-a8c7-2b000c04930b",
+    "title": "Other move: thực hiện tiếp",
+    "group": "29-other-move",
+    "status": "exported",
+    "file": "sessions/29-other-move-01a184fe-23db-7af0-a8c7-2b000c04930b.md",
+    "messages": 2,
+    "tool_calls": 1,
+    "source_sha256": "5e37b657241f4c15ecdda7345832956cb0112c3549590f1b048c9de5df38bd34",
+    "warnings": [],
+    "compressed": false
+  },
+  {
+    "session_id": "01a1872b-474e-7463-907f-b8455e8a7037",
+    "title": "Kiểm tra tồn âm và ngày ghi kho",
+    "group": "29-stock",
+    "status": "exported",
+    "file": "sessions/29-stock-01a1872b-474e-7463-907f-b8455e8a7037.md",
+    "messages": 6,
+    "tool_calls": 11,
+    "source_sha256": "2ffafebd5431990006a410cf9a405c683cef307a06a27dcfea9976357fc51296",
+    "warnings": [],
+    "compressed": false
+  },
+  {
+    "session_id": "01a18979-916a-7051-9ea7-6c79d39af9c9",
+    "title": "SO delivered: thực hiện tiếp",
+    "group": "29-delivery",
+    "status": "metadata_only",
+    "source_sha256": "31ef11fc008d620b8c9f3bb9a532a546ea80f120d403e3443bd9d3cd0c447da1"
+  },
+  {
+    "session_id": "01a18999-ff0e-72e3-99b6-91793f80578f",
+    "title": "SO delivered: tiếp nối",
+    "group": "29-delivery",
+    "status": "metadata_only",
+    "source_sha256": "a6b49005f7150c8f80be0af0553274b64bf37d0d70f0dee6f8d265694533c2f6"
+  },
+  {
+    "session_id": "01a1899a-653c-7ea0-9ec5-2d741c9bee39",
+    "title": "SO delivered: tiếp nối",
+    "group": "29-delivery",
+    "status": "metadata_only",
+    "source_sha256": "9c942ccfa17b872acd498434e1d8c316bde2df3f8025d67718b56730e06ea857"
+  },
+  {
+    "session_id": "01a18a93-c0e0-78c3-8108-9907589424de",
+    "title": "Kế hoạch final verify",
+    "group": "30-verify",
+    "status": "exported",
+    "file": "sessions/30-verify-01a18a93-c0e0-78c3-8108-9907589424de.md",
+    "messages": 9,
+    "tool_calls": 12,
+    "source_sha256": "986ea3f45891360e5479c42c1cae49e6b3f0860c951d62f39a3edf11117beaf9",
+    "warnings": [],
+    "compressed": false
+  },
+  {
+    "session_id": "01a18aba-a430-7311-8506-d6b6b05ab9c6",
+    "title": "Thực hiện đối chiếu cuối và xử lý ngoại lệ",
+    "group": "30-verify",
+    "status": "exported",
+    "file": "sessions/30-verify-01a18aba-a430-7311-8506-d6b6b05ab9c6.md",
+    "messages": 154,
+    "tool_calls": 804,
+    "source_sha256": "2cd185447f6ade1cb45fb73d7c664802703392d3eddea4312d621580a47ec00d",
+    "warnings": [
+      "Có compact: không xuất tóm tắt nội bộ và không khôi phục lịch sử đã mất."
+    ],
+    "compressed": false
+  }
+]

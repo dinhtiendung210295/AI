@@ -1,0 +1,28 @@
+"""Final evidence for old-PO late receipts and the additional temporary adjustment."""
+import json
+from pathlib import Path
+from collections import Counter
+OUT=Path(__file__).resolve().parents[6]/'outputs/pysb-stock-migration-20261012'
+def load(name):return json.loads((OUT/name).read_text(encoding='utf8'))
+def save(name,data):(OUT/name).write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf8')
+def main():
+ j=load('execution-journal.json');d=load('old-po-late-receipts-discovery.json');audit=load('stock-reconciliation-report.json');records=j['standalone_source_receipts'];moves={x['id']:x for x in d['moves']};picks={x['id']:x for x in d['pickings']};po={i:x for x in d['old_pos'] for i in x['order_line']};pos={po[moves[i]['purchase_line_id'][0]]['id']:po[moves[i]['purchase_line_id'][0]] for i in d['roots'] if moves[i]['purchase_line_id']}
+ summary={'old_pos_with_late_receipts':len(pos),'source_receipt_root_moves':len(d['roots']),'source_pickings_with_chains_and_returns':len(picks),'source_moves':len(moves),'target_pickings':len({r['target_picking'] for r in records}),'source_move_statuses':dict(Counter(r['status'] for r in records)),'latest_source_date':d['summary']['latest_move_date'],'additional_original_scope_completed':len(j['completed_events'])-3179,'original_scope_event_counts':dict(Counter(r['status'] for r in j['event_results'].values())),'temporary_adjustments_total':len(j['temporary_negative_stock_adjustments']),'new_temporary_move':17096}
+ new_temporary=[r for r in j['temporary_negative_stock_adjustments'] if r['target_move']>17089]
+ result={'summary':summary,'old_pos':list(pos.values()),'standalone_receipts':records,'supplier_alignment':j['old_po_receipt_supplier_alignment'],'new_temporary_adjustments':new_temporary,'audit':audit['summary']}
+ save('all-old-po-receipts-result.json',result)
+ audit['standalone_source_receipts']=records;audit['temporary_negative_stock_adjustments']=j['temporary_negative_stock_adjustments'];audit['summary'].update(standalone_source_receipts=len(records),temporary_negative_stock_adjustments=len(j['temporary_negative_stock_adjustments']));audit['approved_operator_master_changes']=j.get('approved_operator_master_changes',[]);save('stock-reconciliation-report.json',audit)
+ handoff=load('stock-next-step-handoff.json');handoff.update(summary=audit['summary'],event_results=j['event_results'],standalone_source_receipts=records,temporary_negative_stock_adjustments=j['temporary_negative_stock_adjustments'],all_old_po_receipts_summary=summary);save('stock-next-step-handoff.json',handoff)
+ text=['# Kết quả nhập muộn từ PO trước tháng 7', '', 'Pao Yeang, company ID 1; v14 prod chỉ đọc; chỉ ghi py19-staging-39654560. PO có ngày trước 01/07/2026 theo múi giờ nguồn UTC+08; phiếu hoàn tất từ 01/07/2026 đến dữ liệu nguồn hiện tại. Không giới hạn tháng nhập cuối. Không nhập PO cũ hoặc bill.', '',
+       f"Đã tìm thấy **{len(pos)} PO** có nhập muộn; ngày giao dịch cuối nguồn **{summary['latest_source_date']} UTC**. Có {len(moves)} move thuộc {len(picks)} phiếu nguồn, gồm receipt, Storage và trả nhà cung cấp liên quan. Được tái hiện trên {summary['target_pickings']} phiếu v19; một số phiếu nguồn đã chuyển một phần trong lượt trước nên phần còn thiếu nằm trên phiếu lẻ khác. Không trùng source move.", '',
+       'Giữ đúng tuyến kho, sản phẩm đã ánh xạ, số lượng, đơn vị, lot và ngày UTC nguồn. 27 sản phẩm ngoài manifest ban đầu được ánh xạ vào sản phẩm v19 đã có; 163 lot lịch sử bổ sung được đối chiếu/tạo. Nhà cung cấp dùng 10 danh bạ v19 hiện có, kiểm tra trên 64 phiếu; không tạo hoặc sửa danh bạ/sản phẩm/UOM.', '',
+       '## Điều chỉnh tạm bổ sung', '',
+       'HQ/PICK/55987: nguồn cần 6 PACK, trước xuất có 4. Bổ sung tổng **2 PACK**, lot **20270803**, qua move v19 **17096 và 17402** (mỗi record 1 PACK). Lần bù đầu dùng kiểm tra theo ngày nên chưa đủ; lần sau dùng đúng thời điểm nguồn, có ghi liên kết tới record trước. HQ/DO/53800: v14 xuất âm tại Output, bổ sung **1 đơn vị 5KGS**, lot **03042024**, move v19 **17401**. Reference PYSB-TEMP-NEG / REVIEW REQUIRED; note có SO gốc, chứng từ/move/line nguồn, bằng chứng tồn âm, ngày lịch sử và ngày tạo thực tế. Đây là tồn tạm, không phải điều chỉnh thực trên v14; còn chờ đối soát riêng.', '',f"Tổng các lượt hiện có {len(j['temporary_negative_stock_adjustments'])} điều chỉnh tạm. Kiểm tra tồn trước khi validate dùng đúng thời điểm UTC nguồn, tránh tính nhầm nhập/xuất sau trong cùng ngày.", '',
+       '## Kết quả chạy lại', '',f"Hoàn tất thêm {summary['additional_original_scope_completed']} chứng từ thuộc phạm vi gốc. Trạng thái cuối: {summary['original_scope_event_counts']}.", '',f"Kiểm tra sau chạy: {audit['summary']}", '',
+       'Ledger chỉ đối chiếu các giao dịch đã chuyển và phần tồn tạm được cho phép; không đồng nghĩa toàn bộ tồn v19 đã khớp v14. Không đối chiếu AVCO/FIFO valuation.', '',
+       '## Danh sách phiếu nguồn và đích', '', '| Phiếu v14 | Origin nguồn | Phiếu v19 | Move v14 | Move v19 | Lượng theo đơn vị dòng | Trạng thái |', '|---|---|---|---|---|---:|---|']
+ for r in records:
+  p=picks[r['source_picking']];text.append(f"| {p['name']} | {p['origin']} | [{r['target_picking']}](https://py-staging.odoo.com/odoo/stock.picking/{r['target_picking']}) | {r['source_move']} | {r['target_move']} | {r['source_qty']} | {r['status']} |")
+ text+=['', '[Báo cáo tổng hợp](PYSB_Stock_Migration_Review.html) · [Dữ liệu kết quả](all-old-po-receipts-result.json) · [Nhật ký](execution-journal.json)']
+ (OUT/'All_Old_PO_Late_Receipts_Result.md').write_text('\n'.join(text)+'\n',encoding='utf8');print(json.dumps(summary))
+if __name__=='__main__':main()
