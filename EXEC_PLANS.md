@@ -31,8 +31,5 @@ Cập nhật trạng thái ngay khi có bằng chứng hoàn thành hoàn toàn 
 **[Tên mốc]** [Tiêu chí để đạt mốc]
 
 
-## Ngoại lệ cần xử lý
-
-## Kinh nghiệm ngoại lệ cần xử lý
 
 
