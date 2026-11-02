@@ -26,9 +26,9 @@ Cập nhật trạng thái ngay khi có bằng chứng hoàn thành hoàn toàn 
 
 ## Plan of Work — Kế hoạch thực hiện
 
-**[Tên mốc]** [Tiêu chí để đạt mốc]
+**[Tên mốc]** [Tiêu chí để đạt mốc + plan để đạt mốc]
 
-**[Tên mốc]** [Tiêu chí để đạt mốc]
+**[Tên mốc]** [Tiêu chí để đạt mốc + plan để đạt mốc]
 
 
 
