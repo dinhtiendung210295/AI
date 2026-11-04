@@ -1,0 +1,29 @@
+{
+  "name": "peer-orchestrator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenCode 2 plugin that spawns independent top-level peer sessions and opens them as Desktop tabs",
+  "exports": {
+    ".": "./src/index.ts",
+    "./rpc": "./src/rpc.ts",
+    "./gui-experimental": "./dist/gui-experimental.cjs"
+  },
+  "files": [
+    "src",
+    "dist"
+  ],
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.2.5"
+  },
+  "devDependencies": {
+    "solid-js": "^1.9.17",
+    "typescript": "^5.9.0",
+    "vite": "^7.3.7",
+    "vite-plugin-solid": "^2.11.10"
+  }
+}
