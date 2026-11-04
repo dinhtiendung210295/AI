@@ -16,6 +16,6 @@ commit that file, account stores, logs, or runtime state.
 Example:
 
 ```powershell
-$env:PILOT_SECRETS_FILE = (Resolve-Path .\local\pilot-secrets.json)
-python .\tools\multivibe-review\pilot_service.py status
+$env:PILOT_SECRETS_FILE = (Resolve-Path .\multivibe-pilot\local\pilot-secrets.json)
+python .\multivibe-pilot\router\pilot_service.py status
 ```

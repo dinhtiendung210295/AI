@@ -1,5 +1,5 @@
-local/*
-!local/README.md
+multivibe-pilot/local/*
+!multivibe-pilot/local/README.md
 **/node_modules/
 **/.env
 **/.env.local

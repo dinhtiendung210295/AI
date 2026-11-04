@@ -8,8 +8,8 @@ into chat.
 Run the service with:
 
 ```powershell
-$env:PILOT_SECRETS_FILE = (Resolve-Path .\local\pilot-secrets.json)
-python .\tools\multivibe-review\pilot_service.py start
+$env:PILOT_SECRETS_FILE = (Resolve-Path .\multivibe-pilot\local\pilot-secrets.json)
+python .\multivibe-pilot\router\pilot_service.py start
 ```
 
 If `accounts` is present, `pilot_service.py` uses those local records to
