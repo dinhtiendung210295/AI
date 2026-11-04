@@ -1,0 +1,564 @@
+import XCTest
+
+/// Run on a disposable simulator with no saved account. These tests never submit
+/// credentials or request a recovery email. SSO tests open the first-party browser only.
+@MainActor
+final class AuthenticationUITests: XCTestCase {
+    private func openAuthentication(_ app: XCUIApplication) {
+        let options = app.buttons["Plus d’options"].firstMatch
+        XCTAssertTrue(options.waitForExistence(timeout: 5))
+        options.tap()
+        let login = app.buttons["openAuthentication"].firstMatch
+        XCTAssertTrue(login.waitForExistence(timeout: 5))
+        login.tap()
+    }
+
+    private func launch(dark: Bool = false) -> XCUIApplication {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-AppleLanguages", "(fr)", "-AppleLocale", "fr_FR"]
+        // Set simulator appearance externally with simctl ui before the dark-only run.
+        // AppleInterfaceStyle launch arguments do not reliably override UIKit traits.
+        app.launch()
+        XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "Message").firstMatch.waitForExistence(timeout: 15))
+        openAuthentication(app)
+        XCTAssertTrue(app.textFields["Adresse e-mail"].waitForExistence(timeout: 15))
+        let capture = XCTAttachment(screenshot: app.screenshot())
+        capture.name = dark ? "login-dark" : "login-light"
+        capture.lifetime = .keepAlways
+        add(capture)
+        return app
+    }
+
+    func testGuestChatOpensFirstAndRetainsDraftAfterDismissingLogin() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-AppleLanguages", "(fr)", "-AppleLocale", "fr_FR"]
+        app.launch()
+        let message = app.descendants(matching: .any).matching(identifier: "Message").firstMatch
+        XCTAssertTrue(message.waitForExistence(timeout: 15))
+        XCTAssertFalse(app.textFields["Adresse e-mail"].exists)
+        XCTAssertFalse(app.descendants(matching: .any)["localModelStatus"].exists)
+        XCTAssertFalse(app.staticTexts["Connectez-vous pour envoyer un message."].exists)
+        message.tap()
+        message.typeText("Bonjour MultiVibe")
+        // Collapse the keyboard before interacting with the background toolbar.
+        message.swipeDown()
+        for _ in 0..<3 {
+            openAuthentication(app)
+            XCTAssertTrue(app.textFields["Adresse e-mail"].waitForExistence(timeout: 5))
+            app.buttons["Fermer la connexion"].tap()
+            XCTAssertTrue(message.waitForExistence(timeout: 5))
+            XCTAssertEqual(message.value as? String, "Bonjour MultiVibe")
+            XCTAssertFalse(app.buttons["showComposerSheet"].exists)
+        }
+    }
+
+    func testGuestAccountUsesExpandedCardLayout() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-AppleLanguages", "(fr)", "-AppleLocale", "fr_FR"]
+        app.launch()
+        XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "Message").firstMatch.waitForExistence(timeout: 15))
+
+        let options = app.buttons["Plus d’options"].firstMatch
+        XCTAssertTrue(options.waitForExistence(timeout: 5))
+        options.tap()
+        app.buttons["Profil"].tap()
+
+        XCTAssertTrue(app.staticTexts["Bienvenue"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Compte"].exists)
+        XCTAssertTrue(app.staticTexts["Statut"].exists)
+        XCTAssertTrue(app.staticTexts["Invité"].exists)
+        XCTAssertTrue(app.staticTexts["Données"].exists)
+        XCTAssertTrue(app.staticTexts["Sur cet appareil"].exists)
+        XCTAssertTrue(app.buttons["openAuthentication"].exists)
+        XCTAssertTrue(app.buttons["Fermer"].exists)
+
+        let capture = XCTAttachment(screenshot: app.screenshot())
+        capture.name = "account-guest-redesign"
+        capture.lifetime = .keepAlways
+        add(capture)
+    }
+
+    func testNewConversationFromHistoryAlwaysShowsComposer() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-AppleLanguages", "(fr)", "-AppleLocale", "fr_FR"]
+        app.launch()
+        let message = app.descendants(matching: .any).matching(identifier: "Message").firstMatch
+        XCTAssertTrue(message.waitForExistence(timeout: 15))
+        app.buttons["Nouvelle conversation"].firstMatch.tap()
+        message.tap()
+        message.typeText("Brouillon conservé")
+        message.swipeDown()
+        for _ in 0..<3 {
+            // The native split view exposes history through its leading back button.
+            app.navigationBars.buttons.element(boundBy: 0).tap()
+            let newConversation = app.buttons["Nouvelle conversation"].firstMatch
+            XCTAssertTrue(newConversation.waitForExistence(timeout: 5))
+            XCTAssertFalse(app.cells.staticTexts["Nouvelle conversation"].exists)
+            newConversation.tap()
+            XCTAssertTrue(message.waitForExistence(timeout: 5))
+            XCTAssertFalse(app.buttons["showComposerSheet"].exists)
+            XCTAssertEqual(message.value as? String, "Brouillon conservé")
+        }
+    }
+
+    func testConversationListUsesBrandedCompactNavigation() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-AppleLanguages", "(fr)", "-AppleLocale", "fr_FR"]
+        app.launch()
+        XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "Message").firstMatch.waitForExistence(timeout: 15))
+
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(app.staticTexts["MultiVibe"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["searchConversations"].exists)
+        XCTAssertTrue(app.buttons["openAutomations"].exists)
+        XCTAssertTrue(app.buttons["openMemory"].exists)
+        XCTAssertTrue(app.buttons["openDocuments"].exists)
+        XCTAssertTrue(app.otherElements["conversationLayoutPicker"].exists || app.segmentedControls["conversationLayoutPicker"].exists)
+        XCTAssertTrue(app.buttons["flatConversationLayout"].exists)
+        XCTAssertTrue(app.buttons["groupedConversationLayout"].exists)
+        XCTAssertTrue(app.buttons["Nouvelle conversation"].exists)
+        XCTAssertTrue(app.buttons["openProfile"].exists)
+
+        app.buttons["groupedConversationLayout"].tap()
+        XCTAssertTrue(app.buttons["groupedConversationLayout"].isSelected)
+        let groupedCapture = XCTAttachment(screenshot: app.screenshot())
+        groupedCapture.name = "conversation-list-grouped-by-harness"
+        groupedCapture.lifetime = .keepAlways
+        add(groupedCapture)
+
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "Message").firstMatch.waitForExistence(timeout: 15))
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(app.buttons["groupedConversationLayout"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["groupedConversationLayout"].isSelected)
+
+        app.buttons["flatConversationLayout"].tap()
+        XCTAssertTrue(app.buttons["flatConversationLayout"].isSelected)
+
+        app.buttons["searchConversations"].tap()
+        XCTAssertTrue(app.textFields["Rechercher dans les conversations"].waitForExistence(timeout: 5))
+        let capture = XCTAttachment(screenshot: app.screenshot())
+        capture.name = "conversation-list-branded"
+        capture.lifetime = .keepAlways
+        add(capture)
+    }
+
+    func testDarkLoginKeepsNativeSecureFieldsAndDismissal() {
+        let app = launch(dark: true)
+        XCTAssertTrue(app.secureTextFields["Mot de passe"].exists)
+        XCTAssertFalse(app.buttons["submitAuthentication"].isEnabled)
+        app.buttons["Fermer la connexion"].tap()
+        XCTAssertTrue(app.buttons["Plus d’options"].waitForExistence(timeout: 5))
+    }
+
+    func testEmptyLoginAndSignupRemainDisabled() {
+        let app = launch()
+        XCTAssertTrue(app.secureTextFields["Mot de passe"].exists)
+        XCTAssertFalse(app.buttons["submitAuthentication"].isEnabled)
+        XCTAssertTrue(app.buttons["signInWithGoogle"].exists)
+        XCTAssertTrue(app.buttons["signInWithGitHub"].exists)
+        XCTAssertTrue(app.buttons["signInWithApple"].exists)
+        let google = app.buttons["signInWithGoogle"]
+        let github = app.buttons["signInWithGitHub"]
+        XCTAssertEqual(google.label, "Continuer avec Google")
+        XCTAssertEqual(github.label, "Continuer avec GitHub")
+        XCTAssertLessThan(abs(google.frame.midY - github.frame.midY), 2)
+        XCTAssertLessThanOrEqual(google.frame.maxX, github.frame.minX)
+        for button in [google, github] {
+            XCTAssertGreaterThanOrEqual(button.frame.height, 44)
+            XCTAssertLessThanOrEqual(button.frame.height, 56)
+        }
+        XCTAssertTrue(app.buttons["Autre fournisseur SSO"].exists)
+        app.buttons["Créer un compte"].tap()
+        XCTAssertTrue(app.secureTextFields["Confirmer le mot de passe"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["submitAuthentication"].isEnabled)
+        app.swipeUp()
+        app.buttons["J’ai déjà un compte"].tap()
+        XCTAssertTrue(app.buttons["submitAuthentication"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.secureTextFields["Confirmer le mot de passe"].exists)
+    }
+
+    func testGoogleTapPresentsSecureAuthenticationOrAssociationDiagnostic() {
+        assertSSOTap(provider: "Google")
+    }
+
+    func testGitHubTapPresentsSecureAuthenticationOrAssociationDiagnostic() {
+        assertSSOTap(provider: "GitHub")
+    }
+
+    func testAppleTapPresentsSecureAuthenticationOrAssociationDiagnostic() {
+        assertSSOTap(provider: "Apple")
+    }
+
+    private func assertSSOTap(provider: String) {
+        let app = launch()
+        let consent = app.switches["J’accepte les conditions d’utilisation"]
+        app.swipeUp()
+        XCTAssertTrue(consent.waitForExistence(timeout: 5))
+        if consent.value as? String != "1" { consent.tap() }
+        let button = app.buttons["signInWith" + provider]
+        XCTAssertTrue(button.isEnabled)
+        button.tap()
+        // Opening the first-party SSO window does not submit provider credentials.
+        let browser = app.webViews.firstMatch
+        let presented = browser.waitForExistence(timeout: 15)
+        let capture = XCTAttachment(screenshot: app.screenshot())
+        capture.name = provider.lowercased() + "-after-tap"
+        capture.lifetime = .keepAlways
+        add(capture)
+        // Unsigned simulators / an unconfigured AASA cannot open HTTPS SSO.
+        // Accept only that precise diagnostic, never an arbitrary error or no-op.
+        if !presented {
+            let failure = app.staticTexts["nativeSSOError"]
+            XCTAssertTrue(failure.exists, "SSO must not silently swallow a presentation failure")
+            XCTAssertTrue(failure.label.contains("n’est pas associé à cette application"))
+            XCTAssertTrue(failure.isHittable, "The configuration diagnostic must be visible beside SSO controls")
+            XCTAssertTrue(button.isEnabled, "A failed attempt must allow retry")
+        }
+    }
+
+    func testRecoveryUsesNativeSheetWithoutSubmitting() {
+        let app = launch()
+        app.buttons["Mot de passe oublié ?"].tap()
+        XCTAssertTrue(app.buttons["Envoyer le lien"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["Envoyer le lien"].isEnabled)
+        XCTAssertTrue(app.secureTextFields["Lien de réinitialisation"].exists)
+        XCTAssertFalse(app.buttons["Changer mon mot de passe"].isEnabled)
+        app.buttons["Terminé"].tap()
+        XCTAssertTrue(app.buttons["submitAuthentication"].waitForExistence(timeout: 5))
+    }
+}
+
+@MainActor final class ModelMarketplaceUITests: XCTestCase {
+    func testQuickPickerOpensMarketplaceWithoutEmptyChoice() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-local-agent-ui-fixture", "-AppleLanguages", "(fr)", "-AppleLocale", "fr_FR"]
+        app.launch()
+        let picker = app.buttons["Modèle"]
+        XCTAssertTrue(picker.waitForExistence(timeout: 15))
+        picker.tap()
+        XCTAssertTrue(app.navigationBars["Changer de modèle"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["Choisir un modèle"].exists)
+        XCTAssertTrue(app.staticTexts["Apple Foundation Local"].exists)
+        let explore = app.buttons["Explorer tous les modèles"]
+        XCTAssertTrue(explore.exists)
+        explore.tap()
+        XCTAssertTrue(app.navigationBars["Modèles"].waitForExistence(timeout: 5))
+        for tab in ["Découvrir", "Catégories", "Favoris", "Fournisseurs"] {
+            XCTAssertTrue(app.tabBars.buttons[tab].exists)
+        }
+        let capture = XCTAttachment(screenshot: app.screenshot())
+        capture.name = "model-marketplace-discover"
+        capture.lifetime = .keepAlways
+        add(capture)
+    }
+}
+
+@MainActor final class CloudWorkspaceBrowserUITests: XCTestCase {
+    func testFinderGridFolderSearchAndListLayout() {
+        continueAfterFailure = false
+        let app=XCUIApplication()
+        app.launchArguments=["-cloud-workspace-ui-fixture","-AppleLanguages","(fr)","-AppleLocale","fr_FR"]
+        app.launch()
+
+        XCTAssertTrue(app.navigationBars["Espace design"].waitForExistence(timeout:15))
+        XCTAssertTrue(app.otherElements["workspaceGrid"].exists)
+        XCTAssertTrue(app.staticTexts["Documents"].exists)
+        let grid=XCTAttachment(screenshot:app.screenshot());grid.name="workspace-finder-grid";grid.lifetime = .keepAlways;add(grid)
+
+        app.staticTexts["Documents"].tap()
+        XCTAssertTrue(app.navigationBars["Documents"].waitForExistence(timeout:5))
+        let search=app.textFields["workspaceSearch"]
+        XCTAssertTrue(search.exists);search.tap();search.typeText("Brief")
+        XCTAssertTrue(app.staticTexts["Brief produit.md"].waitForExistence(timeout:5))
+
+        app.buttons["workspaceOptions"].tap()
+        let list=app.buttons["Liste"]
+        XCTAssertTrue(list.waitForExistence(timeout:3));list.tap()
+        XCTAssertTrue(app.otherElements["workspaceList"].waitForExistence(timeout:3))
+        let listCapture=XCTAttachment(screenshot:app.screenshot());listCapture.name="workspace-finder-list-search";listCapture.lifetime = .keepAlways;add(listCapture)
+    }
+}
+
+final class LocalInternetUITests: XCTestCase {
+    func testFirstReplyRemainsVisibleAfterComposerDismissal() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-local-agent-ui-fixture", "-local-agent-ui-immediate-reply", "-AppleLanguages", "(fr)", "-AppleLocale", "fr_FR"]
+        app.launch()
+
+        let newConversation = app.buttons["Nouvelle conversation"].firstMatch
+        XCTAssertTrue(newConversation.waitForExistence(timeout: 10))
+        newConversation.tap()
+        let message = app.descendants(matching: .any).matching(identifier: "Message").firstMatch
+        XCTAssertTrue(message.waitForExistence(timeout: 10))
+        message.tap()
+        message.typeText("FIRST-TURN-PROMPT")
+        app.buttons["Envoyer"].tap()
+
+        XCTAssertTrue(app.staticTexts["FIRST-TURN-PROMPT"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["FIXTURE-REPLY"].waitForExistence(timeout: 10))
+    }
+
+    func testLocalWebPermissionCanBeDeniedOnceWithoutSigningIn() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-AppleLanguages", "(fr)", "-AppleLocale", "fr_FR", "-local-agent-ui-fixture"]
+        app.launch()
+        let newConversation = app.buttons["Nouvelle conversation"].firstMatch
+        XCTAssertTrue(newConversation.waitForExistence(timeout: 10))
+        newConversation.tap()
+        let message = app.descendants(matching: .any).matching(identifier: "Message").firstMatch
+        XCTAssertTrue(message.waitForExistence(timeout: 10))
+        message.tap()
+        message.typeText("Lis la page https://example.com avec ton outil fetch_website (GET, offset 0) et résume son contenu en français.")
+        app.buttons["Envoyer"].tap()
+        let deny = app.buttons["denyConversationInternet"]
+        XCTAssertTrue(deny.waitForExistence(timeout: 40), "The first network call must ask permission")
+        XCTAssertFalse(app.textFields["Adresse e-mail"].exists)
+        let capture = XCTAttachment(screenshot: app.screenshot())
+        capture.name = "local-internet-consent"
+        capture.lifetime = .keepAlways
+        add(capture)
+        deny.tap()
+        XCTAssertTrue(deny.waitForNonExistence(timeout: 5))
+        let stop = app.buttons["Arrêter"]
+        XCTAssertTrue(stop.waitForNonExistence(timeout: 40))
+        message.tap()
+        message.typeText("Utilise encore fetch_website sur https://example.com.")
+        app.buttons["Envoyer"].tap()
+        XCTAssertTrue(stop.waitForNonExistence(timeout: 40))
+        XCTAssertFalse(deny.exists, "A refusal must not trigger another prompt in this conversation")
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "refusé pour cette conversation")).firstMatch.waitForExistence(timeout: 5))
+    }
+}
+
+@MainActor final class MemoryUITests: XCTestCase {
+    func testExplicitMemoryCanBeReviewedAndForgottenOffline() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-local-agent-ui-fixture", "-AppleLanguages", "(fr)", "-AppleLocale", "fr_FR"]
+        app.launch()
+        XCTAssertFalse(app.buttons["chatMemory"].exists)
+        let back = app.navigationBars.buttons.element(boundBy: 0)
+        if !app.buttons["openMemory"].exists && back.exists { back.tap() }
+        let more = app.buttons["More"]
+        if !app.buttons["openMemory"].exists && more.exists { more.tap() }
+        let open = app.buttons["openMemory"]
+        XCTAssertTrue(open.waitForExistence(timeout: 10)); open.tap()
+        let add = app.buttons["addMemory"]
+        XCTAssertTrue(add.waitForExistence(timeout: 5)); add.tap()
+        let topic = app.textFields["memoryTopic"]
+        XCTAssertTrue(topic.waitForExistence(timeout: 5)); topic.tap(); topic.typeText("Boisson")
+        let text = app.descendants(matching: .any).matching(identifier: "memoryText").firstMatch
+        text.tap(); text.typeText("ORION4729")
+        app.buttons["confirmMemory"].tap()
+        XCTAssertTrue(app.staticTexts["ORION4729"].firstMatch.waitForExistence(timeout: 5))
+        app.buttons["Source et date"].firstMatch.tap()
+        XCTAssertTrue(app.staticTexts["Rôle initial : user"].waitForExistence(timeout: 5))
+        app.buttons["Source et date"].firstMatch.tap()
+        app.buttons["Oublier"].firstMatch.tap()
+        XCTAssertTrue(app.buttons["Confirmer l’oubli"].waitForExistence(timeout: 5))
+        app.buttons["Confirmer l’oubli"].tap()
+        XCTAssertFalse(app.staticTexts["ORION4729"].exists)
+    }
+}
+
+
+@MainActor final class NativeShortcutUITests: XCTestCase {
+    func testColdLocalDraftSurvivesNavigationAndDoesNotSend() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-local-agent-ui-fixture", "-native-intent-local-draft"]
+        app.launch()
+        let draft = app.textFields.matching(NSPredicate(format: "value == %@", "NATIVE-SHORTCUT-DRAFT")).firstMatch
+        let editor = app.textViews.matching(NSPredicate(format: "value == %@", "NATIVE-SHORTCUT-DRAFT")).firstMatch
+        XCTAssertTrue(draft.waitForExistence(timeout: 10) || editor.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["Envoyer"].exists)
+        XCTAssertFalse(app.staticTexts["EXAMPLE-FETCH-SUCCEEDED"].exists)
+    }
+    func testColdMemoryShortcutOpensReview() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-local-agent-ui-fixture", "-native-intent-memory"]
+        app.launch()
+        XCTAssertTrue(app.buttons["confirmMemory"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.staticTexts["EXAMPLE-FETCH-SUCCEEDED"].exists)
+    }
+}
+
+@MainActor final class DownloadedMarketplaceUITests: XCTestCase {
+    func testLocalMarketplaceIsAvailableWithoutAccount() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-local-agent-ui-fixture", "-AppleLanguages", "(fr)", "-AppleLocale", "fr_FR"]
+        app.launch()
+        let picker = app.buttons["Modèle"].firstMatch
+        XCTAssertTrue(picker.waitForExistence(timeout: 15))
+        picker.tap()
+        let explore = app.buttons["Explorer tous les modèles"].firstMatch
+        XCTAssertTrue(explore.waitForExistence(timeout: 5))
+        explore.tap()
+        let device = app.tabBars.buttons["Sur cet appareil"]
+        XCTAssertTrue(device.waitForExistence(timeout: 5))
+        device.tap()
+        XCTAssertTrue(app.staticTexts["Téléchargés"].firstMatch.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.textFields["Adresse e-mail"].exists)
+        let capture = XCTAttachment(screenshot: app.screenshot())
+        capture.name = "local-model-marketplace"; capture.lifetime = .keepAlways; add(capture)
+    }
+}
+
+@MainActor final class RealtimeVoiceUITests: XCTestCase {
+    private func launch(_ fixture: String) -> XCUIApplication {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = [fixture, "-AppleLanguages", "(fr)", "-AppleLocale", "fr_FR"]
+        app.launch()
+        XCTAssertTrue(app.descendants(matching: .any)["voiceComposer"].waitForExistence(timeout: 15))
+        return app
+    }
+
+    func testFirstVoiceCallConfiguresAudioModelsBeforeStarting() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-voice-audio-configuration-ui-fixture", "-AppleLanguages", "(fr)", "-AppleLocale", "fr_FR"]
+        app.launch()
+        XCTAssertTrue(app.descendants(matching: .any)["voiceAudioConfiguration"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.navigationBars["Configurer le vocal"].exists)
+        XCTAssertTrue(app.descendants(matching: .any)["voiceTranscriptionModel"].exists)
+        XCTAssertTrue(app.descendants(matching: .any)["voiceSynthesisModel"].exists)
+        XCTAssertTrue(app.descendants(matching: .any)["voiceOutputVoice"].exists)
+        XCTAssertTrue(app.staticTexts["Whisper large v3 turbo"].exists)
+        XCTAssertTrue(app.staticTexts["Kokoro 82M"].exists)
+
+        let capture = XCTAttachment(screenshot: app.screenshot())
+        capture.name = "voice-audio-first-configuration"
+        capture.lifetime = .keepAlways
+        add(capture)
+
+        app.descendants(matching: .any)["voiceConfigurationConfirm"].tap()
+        XCTAssertTrue(app.descendants(matching: .any)["voiceConfigurationSaved"].waitForExistence(timeout: 5))
+    }
+
+    func testListeningStartsWithLargeOrbAndCompactControls() {
+        let app = launch("-realtime-voice-ui-fixture-hero")
+        let orb = app.descendants(matching: .any)["voiceOrb"].firstMatch
+        XCTAssertTrue(orb.waitForExistence(timeout: 5))
+        XCTAssertGreaterThan(orb.frame.width, 110)
+        XCTAssertEqual(orb.frame.midX, app.windows.firstMatch.frame.midX, accuracy: 1.5)
+        XCTAssertTrue((orb.value as? String)?.contains("78") == true)
+        XCTAssertTrue(app.staticTexts["Je vous écoute"].exists)
+        XCTAssertTrue(app.buttons["voiceSettings"].exists)
+        XCTAssertTrue(app.buttons["Couper le micro"].exists)
+        XCTAssertTrue(app.buttons["Terminer"].exists)
+        XCTAssertFalse(app.descendants(matching: .any)["voiceTranscript"].exists)
+
+        let capture = XCTAttachment(screenshot: app.screenshot())
+        capture.name = "realtime-voice-listening"
+        capture.lifetime = .keepAlways
+        add(capture)
+    }
+
+    func testRichAnswerKeepsVoiceActiveInTranscript() {
+        let app = launch("-realtime-voice-ui-fixture-results")
+        let transcript = app.descendants(matching: .any)["voiceTranscript"]
+        XCTAssertTrue(transcript.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Restaurants ouverts demain")).firstMatch.exists)
+        XCTAssertTrue(app.staticTexts["Réflexion…"].exists)
+        let orb = app.descendants(matching: .any)["voiceOrb"].firstMatch
+        XCTAssertTrue(orb.exists)
+        XCTAssertLessThan(orb.frame.width, 125)
+        XCTAssertEqual(orb.frame.midX, app.windows.firstMatch.frame.midX, accuracy: 1.5)
+        XCTAssertTrue(app.buttons["Terminer"].isEnabled)
+
+        let capture = XCTAttachment(screenshot: app.screenshot())
+        capture.name = "realtime-voice-rich-answer"
+        capture.lifetime = .keepAlways
+        add(capture)
+    }
+
+    func testAgentAudioLevelDrivesTheCenteredDockedOrb() {
+        let app = launch("-realtime-voice-ui-fixture-speaking")
+        let orb = app.descendants(matching: .any)["voiceOrb"].firstMatch
+        XCTAssertTrue(orb.waitForExistence(timeout: 5))
+        XCTAssertEqual(orb.frame.midX, app.windows.firstMatch.frame.midX, accuracy: 1.5)
+        XCTAssertTrue((orb.value as? String)?.contains("86") == true)
+    }
+}
+
+
+final class HarnessActivityUITests: XCTestCase {
+    func testIntermediateMessageAndToolAreVisibleBeforeFinalResponse() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-local-agent-ui-fixture", "-local-agent-ui-progress", "-AppleLanguages", "(fr)", "-AppleLocale", "fr_FR"]
+        app.launch()
+        let newConversation = app.buttons["Nouvelle conversation"].firstMatch
+        XCTAssertTrue(newConversation.waitForExistence(timeout: 10)); newConversation.tap()
+        let message = app.descendants(matching: .any).matching(identifier: "Message").firstMatch
+        XCTAssertTrue(message.waitForExistence(timeout: 10)); message.tap(); message.typeText("Consulte la page demandée.")
+        app.buttons["Envoyer"].tap()
+        let allow = app.buttons["allowConversationInternet"]
+        XCTAssertTrue(allow.waitForExistence(timeout: 10)); allow.tap()
+        XCTAssertTrue(app.staticTexts["Je consulte la page demandée."].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.staticTexts["Plan"].exists)
+        XCTAssertTrue(app.staticTexts["Sous-agent recherche"].exists)
+        XCTAssertTrue(app.staticTexts["En cours"].firstMatch.exists)
+        XCTAssertFalse(app.staticTexts["EXAMPLE-FETCH-SUCCEEDED"].exists)
+        let running = XCTAttachment(screenshot: app.screenshot()); running.name = "Hermes activity during tool execution"; running.lifetime = .keepAlways; add(running)
+        XCTAssertTrue(app.staticTexts["EXAMPLE-FETCH-SUCCEEDED"].waitForExistence(timeout: 15))
+        XCTAssertFalse(app.staticTexts["En cours"].exists)
+        let completed = XCTAttachment(screenshot: app.screenshot()); completed.name = "Hermes completed activity"; completed.lifetime = .keepAlways; add(completed)
+    }
+}
+
+@MainActor final class CloudUsageUITests: XCTestCase {
+    private func launch(_ flags: [String] = []) -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments = ["-cloud-usage-ui-fixture", "-AppleLanguages", "(fr)", "-AppleLocale", "fr_FR"] + flags
+        app.launch()
+        let credits = app.buttons["cloudCreditBalance"]
+        XCTAssertTrue(credits.waitForExistence(timeout: 15)); credits.tap()
+        XCTAssertTrue(app.navigationBars["Usage et crédits"].waitForExistence(timeout: 5))
+        return app
+    }
+    func testUsageNavigationChartsFiltersAndRequestDetails() {
+        continueAfterFailure = false
+        let app = launch()
+        XCTAssertTrue(app.staticTexts["Crédits consommés"].exists)
+        app.segmentedControls["cloudUsageRange"].buttons["24 h"].tap()
+        app.segmentedControls["cloudUsageRange"].buttons["30 jours"].tap()
+        app.swipeUp()
+        let metric = app.segmentedControls["cloudUsageMetric"]
+        XCTAssertTrue(metric.waitForExistence(timeout: 5)); metric.buttons["Requêtes"].tap()
+        metric.buttons["Tokens"].tap()
+        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "ios-cloud-usage-chart"; shot.lifetime = .keepAlways; add(shot)
+        let search = app.textFields["cloudUsageSearch"]
+        for _ in 0..<10 { if search.isHittable { break }; app.swipeUp() }
+        XCTAssertTrue(search.isHittable); search.tap(); search.typeText("Claude")
+        let request = app.buttons["cloudUsageRequest-request-1"]
+        app.swipeUp(); XCTAssertTrue(request.waitForExistence(timeout: 5)); request.tap()
+        XCTAssertTrue(app.navigationBars["Détail de la requête"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Premier token"].exists)
+        app.buttons["Fermer"].tap()
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(app.navigationBars["Compte"].waitForExistence(timeout: 5))
+    }
+    func testEmptyUsageAndMissingMeasurements() {
+        let empty = launch(["-usage-empty"])
+        XCTAssertTrue(empty.staticTexts["Aucun usage sur cette période"].exists)
+        empty.terminate()
+        let missing = launch(["-usage-missing", "-usage-stale"])
+        XCTAssertTrue(missing.staticTexts["Crédits consommés"].exists)
+        XCTAssertTrue(missing.staticTexts["Actualisation impossible. Les dernières statistiques chargées restent affichées."].exists)
+        missing.swipeUp()
+        XCTAssertTrue(missing.staticTexts["Coût partiel : seules les requêtes chiffrées sont représentées."].exists)
+        let shot = XCTAttachment(screenshot: missing.screenshot()); shot.name = "ios-cloud-usage-missing"; shot.lifetime = .keepAlways; add(shot)
+    }
+}

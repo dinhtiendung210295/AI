@@ -1,0 +1,33 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { matchesAccessFilter, PROVIDER_ACCESS, providerAccess } from "../../packages/ui/src/lib/providerAccess";
+import { SDK_PROVIDERS } from "../../src/ai-sdk/providers";
+
+test("free tiers also support paid and freemium filtering", () => {
+  for (const id of ["github-copilot", "openai", "google", "groq", "openrouter", "opencode", "mistral"]) {
+    for (const filter of ["Paid", "Free", "Freemium"] as const) assert.equal(matchesAccessFilter(id, filter), true, `${id}: ${filter}`);
+  }
+});
+test("trials and consumer free plans do not imply free API access", () => {
+  for (const id of ["cerebras", "togetherai", "deepseek", "anthropic", "perplexity", "xai", "mammouth", "zai"]) {
+    assert.equal(matchesAccessFilter(id, "Free"), false);
+    assert.equal(matchesAccessFilter(id, "Freemium"), false);
+    assert.equal(matchesAccessFilter(id, "Paid"), true);
+  }
+});
+test("unknown and custom endpoints are not assigned guessed pricing", () => {
+  for (const id of ["new-provider", "nvidia-pair", "openai-compatible"]) {
+    assert.equal(matchesAccessFilter(id, null), true);
+    for (const filter of ["Paid", "Free", "Freemium"] as const) assert.equal(matchesAccessFilter(id, filter), false);
+  }
+  for (const { id } of SDK_PROVIDERS) assert.ok(PROVIDER_ACCESS[id], `Review pricing for ${id}`);
+});
+test("API connections do not inherit a same-named subscription's pricing claims", () => {
+  for (const id of ["openai", "xai", "mistral", "z-ai"]) {
+    assert.equal(providerAccess(id, true)?.reviewPricing, true, id);
+    assert.equal(matchesAccessFilter(id, null, true), true);
+    for (const filter of ["Paid", "Free", "Freemium"] as const) assert.equal(matchesAccessFilter(id, filter, true), false, `${id}: ${filter}`);
+  }
+  assert.equal(matchesAccessFilter("openai", "Free"), true);
+  assert.equal(providerAccess("zai")?.reviewPricing, undefined);
+});

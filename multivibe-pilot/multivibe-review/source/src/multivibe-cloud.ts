@@ -1,0 +1,832 @@
+import { normalizeCloudInvoices, type Invoice } from "./provider-invoices.js";
+import { readCloudModelCatalog } from "./cloud-model-catalog.js";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { isIP } from "node:net";
+import type { AccountStore, OAuthStateStore } from "./store.js";
+import type { Account, OAuthFlowState, PrivacyMode, StoreSettings } from "./types.js";
+import type { MultivibeTeamSyncService, TeamSyncManifest } from "./team-sync.js";
+import type { ManagedEnrollmentIdentity } from "./managed-team-enrollment.js";
+
+const CLIENT_ID = "multivibe-core";
+const ACCOUNT_ID = "multivibe-cloud";
+const SCOPES = [
+  "openid",
+  "profile",
+  "billing:read",
+  "projects:read",
+  "projects:write",
+  "core:credential:create",
+  "provider:read",
+  "team:read",
+  "team:instances",
+  "team:providers",
+  "team:analytics:write",
+  "team:keys",
+].join(" ");
+const FLOW_LIFETIME_MS = 10 * 60_000;
+const API_KEY_LIFETIME_MS = 365 * 24 * 60 * 60_000;
+const API_KEY_RENEWAL_MARGIN_MS = 24 * 60 * 60_000;
+const REFRESH_MARGIN_MS = 3 * 60_000;
+const REQUEST_TIMEOUT_MS = 15_000;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CORE_CALLBACK_PATH = "/admin/cloud/oauth/callback";
+
+type CloudConnection = NonNullable<StoreSettings["multivibeCloud"]>;
+
+class CloudHttpError extends Error {
+  constructor(readonly status: number, readonly code?: string) {
+    super("MultiVibe Cloud request failed");
+    this.name = "CloudHttpError";
+  }
+}
+
+export type MultivibeCloudStatus = {
+  status: "disconnected" | "connected" | "unavailable";
+  reconnecting?: boolean;
+  quota?: { status: "available" | "no_plan" | "unavailable"; name?: string; remainingPercent?: number; usedPercent?: number; resetsAt?: string };
+  dollarCreditsUsd?: string;
+  balanceUsd?: string;
+  subscription?: string;
+  apiKeyExpiresAt?: string;
+  topupUrl: string;
+  autoTopup?: {
+    enabled: true;
+    thresholdUsd: string;
+    rechargeUsd: string;
+  };
+  workerEarnings?: {
+    currency: "USD";
+    lifetimeNetUsd: string;
+    monthNetUsd: string;
+    averageMonthlyNetUsd: string;
+  };
+};
+
+export type MultivibeCloudServiceOptions = {
+  authBaseUrl: string;
+  apiBaseUrl: string;
+  inferenceBaseUrl: string;
+  redirectUri: string;
+  topupUrl: string;
+  privacyMode?: PrivacyMode;
+  fetchImpl?: typeof fetch;
+  managedTeamIdentity?: ManagedEnrollmentIdentity;
+  clock?: () => number;
+};
+
+function normalizedOrigin(value: string, label: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`${label} must be an absolute URL`);
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password
+    || parsed.search || parsed.hash || (parsed.pathname !== "" && parsed.pathname !== "/")) {
+    throw new Error(`${label} must be an HTTP(S) origin`);
+  }
+  return parsed.origin;
+}
+
+function codeChallenge(verifier: string): string {
+  return createHash("sha256").update(verifier).digest("base64url");
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function usdValue(value: unknown): string | undefined {
+  const text = stringValue(value);
+  if (!text || !/^(?:0|[1-9]\d{0,12})(?:\.\d{1,6})?$/.test(text)) return undefined;
+  const amount = Number(text);
+  return Number.isFinite(amount) && amount >= 0 ? text : undefined;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function autoTopupValue(value: unknown): MultivibeCloudStatus["autoTopup"] {
+  const root = recordValue(value);
+  if (root?.monetaryEffectsApplied !== true) return undefined;
+  const data = recordValue(root?.current) ?? recordValue(root?.data) ?? root;
+  if (!data || data.state !== "active") return undefined;
+  const thresholdUsd = usdValue(data.thresholdUsd);
+  const rechargeUsd = usdValue(data.rechargeUsd);
+  return thresholdUsd && rechargeUsd
+    ? { enabled: true, thresholdUsd, rechargeUsd }
+    : undefined;
+}
+
+function workerEarningsValue(value: unknown): MultivibeCloudStatus["workerEarnings"] {
+  const data = recordValue(value);
+  if (data?.monetaryEffectsApplied !== true) return undefined;
+  const lifetimeNetUsd = usdValue(data?.lifetimeNetUsd);
+  const monthNetUsd = usdValue(data?.monthNetUsd);
+  const averageMonthlyNetUsd = usdValue(data?.averageMonthlyNetUsd);
+  return data?.currency === "USD" && lifetimeNetUsd && monthNetUsd && averageMonthlyNetUsd
+    ? { currency: "USD", lifetimeNetUsd, monthNetUsd, averageMonthlyNetUsd }
+    : undefined;
+}
+
+function expiresAtFromToken(value: unknown): number | undefined {
+  const seconds = Number(value);
+  return Number.isFinite(seconds) && seconds > 0 ? Date.now() + seconds * 1000 : undefined;
+}
+
+function expiresAtFromApiKey(value: unknown, fallback: number): number {
+  const parsed = Date.parse(String(value ?? ""));
+  return Number.isFinite(parsed) && parsed > Date.now() ? parsed : fallback;
+}
+
+function validAccessToken(value: unknown): string {
+  const token = stringValue(value);
+  if (!token || token.length > 8192 || /\s/.test(token)) throw new Error("MultiVibe Cloud token response is invalid");
+  return token;
+}
+
+function validRefreshToken(value: unknown): string | undefined {
+  const token = stringValue(value);
+  if (token && (token.length > 8192 || /\s/.test(token))) throw new Error("MultiVibe Cloud refresh token response is invalid");
+  return token;
+}
+
+function currentCloudConnection(settings: StoreSettings): CloudConnection | undefined {
+  const value = settings.multivibeCloud;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const accessToken = stringValue(value.accessToken);
+  if (!accessToken || accessToken.length > 8192 || /\s/.test(accessToken)) return undefined;
+  const rawRefreshToken = stringValue(value.refreshToken);
+  if (rawRefreshToken && (rawRefreshToken.length > 8192 || /\s/.test(rawRefreshToken))) return undefined;
+  const refreshToken = rawRefreshToken;
+  const expiresAt = typeof value.expiresAt === "number" && Number.isFinite(value.expiresAt)
+    ? value.expiresAt : undefined;
+  const projectId = stringValue(value.projectId);
+  const apiKeyExpiresAt = typeof value.apiKeyExpiresAt === "number" && Number.isFinite(value.apiKeyExpiresAt)
+    ? value.apiKeyExpiresAt : undefined;
+  return {
+    accessToken,
+    ...(refreshToken ? { refreshToken } : {}),
+    ...(expiresAt ? { expiresAt } : {}),
+    ...(projectId ? { projectId } : {}),
+    ...(apiKeyExpiresAt ? { apiKeyExpiresAt } : {}),
+    ...(value.refreshAttemptId && UUID_PATTERN.test(value.refreshAttemptId) ? { refreshAttemptId: value.refreshAttemptId } : {}),
+    ...(value.authenticationRequired ? { authenticationRequired: true } : {}),
+  };
+}
+
+function existingCloudAccount(accounts: Account[]): Account | undefined {
+  return accounts.find((account) => account.id === ACCOUNT_ID && account.multivibeCloud);
+}
+
+function subscriptionLabel(value: unknown): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const plan = stringValue(record.planCode) ?? stringValue(record.plan_code) ?? stringValue(record.name);
+  if (!plan) return undefined;
+  return plan.replace(/[-_]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+export class MultivibeCloudService {
+  private readonly authBaseUrl: string;
+  private readonly apiBaseUrl: string;
+  private readonly inferenceBaseUrl: string;
+  private readonly redirectUri: string;
+  private readonly topupUrl: string;
+  private readonly privacyMode: PrivacyMode;
+  private readonly fetchImpl: typeof fetch;
+  private readonly managedTeamIdentity?: ManagedEnrollmentIdentity;
+
+  private readonly clock: () => number;
+  private sessionQueue: Promise<unknown> = Promise.resolve();
+  private generation = 0;
+  private sessionAbort = new AbortController();
+  private renewalTimer?: ReturnType<typeof setInterval>;
+  private maintenanceInFlight?: Promise<void>;
+  private retryAt = 0;
+  private failures = 0;
+
+  /** Serialize rotation AND provisioning: neither may write an older token snapshot. */
+  private serialize<T>(operation: (generation: number) => Promise<T>): Promise<T> {
+    const generation = this.generation;
+    const result = this.sessionQueue.then(() => {
+      this.assertGeneration(generation);
+      return operation(generation);
+    });
+    this.sessionQueue = result.catch(() => undefined);
+    return result;
+  }
+
+  private assertGeneration(generation: number): void {
+    if (generation !== this.generation) throw new Error("Cloud connection changed");
+  }
+
+  private signal(signal?: AbortSignal): AbortSignal {
+    return AbortSignal.any([this.sessionAbort.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS), ...(signal ? [signal] : [])]);
+  }
+
+  /** Timers run in Core, including while the Host window is closed. Overdue timers
+   * run on resume; startup also checks persisted expiry before any UI is opened. */
+  get sessionRevision(): number { return this.generation; }
+
+  async withRelayAccount<T>(operation:(accessToken:string)=>Promise<T>):Promise<T> {
+    const generation=this.generation;
+    const connection=currentCloudConnection(await this.store.getSettings());
+    if(!connection||connection.authenticationRequired)throw new Error('Connect this Host to MultiVibe Cloud first');
+    const refreshed=await this.refreshConnectionIfNeeded(connection);
+    this.assertGeneration(generation);
+    const result=await operation(refreshed.accessToken);
+    this.assertGeneration(generation);
+    return result;
+  }
+
+  installManagedConnection(operation: () => Promise<void>): Promise<void> {
+    return this.serialize(async () => {
+      if ((await this.store.getSettings()).multivibeCloudDisconnectedAt !== undefined) throw new Error("Cloud was explicitly disconnected");
+      await operation();
+    });
+  }
+
+  start(): void {
+    if (this.renewalTimer) return;
+    this.renewalTimer = setInterval(() => { void this.maintainSession().catch(() => undefined); }, 15_000);
+    this.renewalTimer.unref();
+    void this.maintainSession().catch(() => undefined);
+  }
+
+  stop(): void {
+    if (this.renewalTimer) clearInterval(this.renewalTimer);
+    this.renewalTimer = undefined;
+  }
+
+  maintainSession(): Promise<void> {
+    if (this.maintenanceInFlight) return this.maintenanceInFlight;
+    const run = (async () => {
+      const connection = currentCloudConnection(await this.store.getSettings());
+      if (!connection || this.clock() < this.retryAt) return;
+      try {
+        const refreshed = await this.refreshConnectionIfNeeded(connection);
+        await this.ensureCloudAccount(refreshed);
+        this.failures = 0;
+        this.retryAt = 0;
+      } catch (error) {
+        this.deferRetry();
+        throw error;
+      }
+    })();
+    this.maintenanceInFlight = run;
+    void run.finally(() => { if (this.maintenanceInFlight === run) this.maintenanceInFlight = undefined; }).catch(() => undefined);
+    return run;
+  }
+
+  private deferRetry(): void {
+    if (this.clock() < this.retryAt) return;
+    this.retryAt = this.clock() + Math.min(300_000, 5_000 * 2 ** Math.min(this.failures++, 6));
+  }
+
+  constructor(
+    private readonly store: AccountStore,
+    private readonly oauthStore: OAuthStateStore,
+    options: MultivibeCloudServiceOptions,
+  ) {
+    this.authBaseUrl = normalizedOrigin(options.authBaseUrl, "MultiVibe Cloud auth base URL");
+    this.apiBaseUrl = normalizedOrigin(options.apiBaseUrl, "MultiVibe Cloud API base URL");
+    this.inferenceBaseUrl = normalizedOrigin(options.inferenceBaseUrl, "MultiVibe Cloud inference base URL");
+    this.redirectUri = this.validRedirectUri(options.redirectUri);
+    this.topupUrl = this.validHttpUrl(options.topupUrl, "MultiVibe Cloud top-up URL");
+    this.privacyMode = options.privacyMode ?? "standard";
+    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.managedTeamIdentity = options.managedTeamIdentity;
+    this.clock = options.clock ?? Date.now;
+  }
+
+  // Read the account's inference catalog, never the public discovery catalog.
+  // Only IDs leave this service; upstream errors/bodies and credentials stay private.
+  async getAccessibleModels(): Promise<{ status: 'available' | 'disconnected' | 'access_denied' | 'unavailable'; modelIds: string[]; checkedAt: string }> {
+    const checkedAt = new Date().toISOString();
+    const result = (status: 'available' | 'disconnected' | 'access_denied' | 'unavailable', modelIds: string[] = []) => ({ status, modelIds, checkedAt });
+    const account = existingCloudAccount(await this.store.listAccounts());
+    if (!account) return result('disconnected');
+    if (!account.enabled || !account.accessToken || account.state?.needsTokenRefresh
+      || (account.expiresAt != null && account.expiresAt <= Date.now())
+      || Number(account.state?.authBlockedUntil) > Date.now()) return result('access_denied');
+    try {
+      const response = await this.fetchImpl(`${this.inferenceBaseUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${account.accessToken}`, accept: 'application/json' },
+        redirect: 'error', signal: AbortSignal.timeout(10_000),
+      });
+      if (response.status === 401 || response.status === 403) return result('access_denied');
+      if (!response.ok) return result('unavailable');
+      // Bound the authenticated catalog before JSON parsing, including chunked bodies.
+      const reader = response.body?.getReader();
+      if (!reader) return result('unavailable');
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          size += value.byteLength;
+          if (size > 4 * 1024 * 1024) {
+            await reader.cancel();
+            return result('unavailable');
+          }
+          chunks.push(value);
+        }
+      } finally { reader.releaseLock(); }
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      if (!Array.isArray(body?.data) || body.data.length > 10000
+        || body.data.some((item: any) => typeof item?.id !== 'string' || !item.id || item.id.length > 512)) return result('unavailable');
+      return result('available', [...new Set<string>(body.data.map((item: { id: string }) => item.id))]);
+    } catch { return result('unavailable'); }
+  }
+
+  async getModelCatalog() {
+    return { models: await readCloudModelCatalog(this.apiBaseUrl, this.fetchImpl) };
+  }
+
+  async syncTeam(teamSync:MultivibeTeamSyncService):Promise<void>{
+    const settings=await this.store.getSettings();let connection=currentCloudConnection(settings);if(!connection)return;connection=await this.refreshConnectionIfNeeded(connection);const identity=teamSync.getIdentity();
+    if(!settings.multivibeTeam?.enabled){await this.requestJson('/team/v1/instances/enroll',connection.accessToken,{method:'POST',body:teamSync.enrollmentDocument(settings.multivibeTeam?.instanceName??'Multivibe instance','core-0.2')});}
+    const cursor=settings.multivibeTeam?.syncCursor??0;const manifest=await this.requestJson(`/team/v1/sync?cursor=${cursor}&instanceId=${encodeURIComponent(identity.instanceId)}`,connection.accessToken) as TeamSyncManifest;const applied=await teamSync.applyManifest(manifest);
+    if(applied.applied.length||applied.removed.length){const revisions=new Map(manifest.providers.map(provider=>[provider.id,provider.revision]));await this.requestJson('/team/v1/acknowledgements',connection.accessToken,{method:'POST',body:teamSync.signRequest({schemaVersion:'multivibe-team-acknowledgements-v1',cursor:manifest.cursor,acknowledgements:[...applied.applied.map(providerId=>({providerId,revision:revisions.get(providerId)??manifest.cursor,status:'applied'})),...applied.removed.map(providerId=>({providerId,revision:manifest.removedProviders?.find(removal=>removal.id===providerId)?.revision??manifest.cursor,status:'removed'}))]})});}
+    const batch=teamSync.analyticsBatch();if(batch.buckets.length){const result=await this.requestJson('/team/v1/analytics/batches',connection.accessToken,{method:'POST',body:teamSync.signRequest(batch)}) as Record<string,unknown>;const accepted=Array.isArray(result.acceptedBucketIds)?result.acceptedBucketIds.filter(value=>typeof value==='string') as string[]:[];await teamSync.acknowledgeAnalytics(accepted);}
+  }
+
+  private validRedirectUri(value: string): string {
+    let parsed: URL;
+    try { parsed = new URL(value); }
+    catch { throw new Error("MultiVibe Cloud redirect URI must be an absolute URL"); }
+    if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password
+      || parsed.search || parsed.hash || !parsed.pathname) {
+      throw new Error("MultiVibe Cloud redirect URI is invalid");
+    }
+    return parsed.toString();
+  }
+
+  private validCoreCallbackOrigin(value: string): string {
+    const origin = normalizedOrigin(value, "MultiVibe Core callback origin");
+    const parsed = new URL(origin);
+    const hostname = parsed.hostname.startsWith("[") && parsed.hostname.endsWith("]")
+      ? parsed.hostname.slice(1, -1) : parsed.hostname;
+    if (hostname !== "localhost" && isIP(hostname) === 0) {
+      throw new Error("MultiVibe Core callback origin must use an IP address or localhost");
+    }
+    return new URL(CORE_CALLBACK_PATH, `${origin}/`).toString();
+  }
+
+  private validHttpUrl(value: string, label: string): string {
+    let parsed: URL;
+    try { parsed = new URL(value); }
+    catch { throw new Error(`${label} must be an absolute URL`); }
+    if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) {
+      throw new Error(`${label} is invalid`);
+    }
+    return parsed.toString();
+  }
+
+  async startConnection(callbackOrigin?: string): Promise<{ flowId: string; authorizeUrl: string }> {
+    const redirectUri = callbackOrigin === undefined
+      ? this.redirectUri : this.validCoreCallbackOrigin(callbackOrigin);
+    const flow: OAuthFlowState = {
+      id: randomUUID(),
+      email: "",
+      codeVerifier: randomBytes(32).toString("base64url"),
+      redirectUri,
+      createdAt: Date.now(),
+      method: "browser",
+      status: "pending",
+    };
+    await this.oauthStore.create(flow);
+    const authorizeUrl = new URL(`${this.authBaseUrl}/oauth/authorize`);
+    authorizeUrl.searchParams.set("response_type", "code");
+    authorizeUrl.searchParams.set("client_id", CLIENT_ID);
+    authorizeUrl.searchParams.set("redirect_uri", redirectUri);
+    authorizeUrl.searchParams.set("scope", SCOPES);
+    authorizeUrl.searchParams.set("state", flow.id);
+    authorizeUrl.searchParams.set("code_challenge", codeChallenge(flow.codeVerifier));
+    authorizeUrl.searchParams.set("code_challenge_method", "S256");
+    return { flowId: flow.id, authorizeUrl: authorizeUrl.toString() };
+  }
+
+  async failConnection(flowId: string, message: string): Promise<void> {
+    if (!UUID_PATTERN.test(flowId)) return;
+    await this.oauthStore.update(flowId, {
+      status: "error",
+      error: message.slice(0, 300),
+      completedAt: Date.now(),
+    });
+  }
+
+  async completeConnection(flowId: string, code: string): Promise<void> {
+    const generation = this.generation;
+    await this.serialize(async () => { await this.completeConnectionLocked(flowId, code, generation); });
+    const connection = currentCloudConnection(await this.store.getSettings());
+    if (connection) await this.ensureCloudAccount(connection);
+    this.assertGeneration(generation);
+    await this.oauthStore.update(flowId, { status: "success", completedAt: Date.now(), accountId: ACCOUNT_ID });
+    ++this.generation;
+  }
+
+  private async completeConnectionLocked(flowId: string, code: string, generation: number): Promise<void> {
+    const flow = await this.oauthStore.get(flowId);
+    if (!flow || flow.status !== "pending") throw new Error("Cloud connection flow is invalid or expired");
+    if (flow.createdAt + FLOW_LIFETIME_MS <= Date.now()) throw new Error("Cloud connection flow is expired");
+    if (!/^[A-Za-z0-9_-]{8,512}$/.test(code)) throw new Error("Cloud authorization code is invalid");
+    const disconnectedAt = (await this.store.getSettings()).multivibeCloudDisconnectedAt;
+    if (disconnectedAt !== undefined && flow.createdAt <= disconnectedAt) throw new Error("Cloud connection flow was disconnected");
+    const redirectUri = flow.redirectUri ?? this.redirectUri;
+
+    const response = await this.fetchImpl(`${this.authBaseUrl}/oauth/token`, {
+      method: "POST",
+      signal: this.signal(),
+      redirect: "error",
+      headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: CLIENT_ID,
+        code,
+        redirect_uri: redirectUri,
+        code_verifier: flow.codeVerifier,
+      }),
+    });
+    const tokenData = await this.readJson(response);
+    if (!response.ok) throw new CloudHttpError(response.status, stringValue(tokenData.error) ?? stringValue(recordValue(tokenData.error)?.code));
+    const accessToken = validAccessToken(tokenData.access_token);
+    const refreshToken = validRefreshToken(tokenData.refresh_token);
+    const expiresAt = expiresAtFromToken(tokenData.expires_in);
+    const connection: CloudConnection = {
+      accessToken,
+      ...(refreshToken ? { refreshToken } : {}),
+      ...(expiresAt ? { expiresAt } : {}),
+    };
+    this.assertGeneration(generation);
+    await this.store.patchSettings({ multivibeCloud: connection });
+    this.failures = 0;
+    this.retryAt = 0;
+  }
+
+  async disconnect(): Promise<void> {
+    // Invalidate before awaiting anything. All older queued work must fail closed.
+    ++this.generation;
+    this.sessionAbort.abort();
+    this.sessionAbort = new AbortController();
+    this.retryAt = 0;
+    this.failures = 0;
+    const connection = await this.serialize(async () => {
+      const current = currentCloudConnection(await this.store.getSettings());
+      await this.store.patchSettings({ multivibeCloud: undefined, multivibeCloudDisconnectedAt: this.clock() });
+      const account = existingCloudAccount(await this.store.listAccounts());
+      if (account) await this.store.deleteAccount(account.id);
+      await this.store.flushIfDirty();
+      return current;
+    });
+    // Revoking a consumed OAuth token still revokes its family, even if an
+    // interrupted rotation committed server-side. Local logout never depends on the network.
+    if (connection?.refreshToken) {
+      if (connection.refreshToken.startsWith("mvir_")) {
+        await this.revokeManagedConnection(connection).catch(() => undefined);
+      } else {
+        await this.fetchImpl(`${this.authBaseUrl}/oauth/revoke`, {
+          method: "POST", redirect: "error", signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ token: connection.refreshToken, client_id: CLIENT_ID, token_type_hint: "refresh_token" }),
+        }).catch(() => undefined);
+      }
+    }
+  }
+
+  private async revokeManagedConnection(connection: CloudConnection): Promise<void> {
+    const settings = await this.store.getSettings();
+    const enrollmentId = settings.multivibeTeam?.managedEnrollmentId;
+    if (!enrollmentId || !this.managedTeamIdentity) return;
+    await this.fetchImpl(`${this.apiBaseUrl}/team/v1/instances/managed-disconnect`, {
+      method: "POST", redirect: "error", signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      headers: { authorization: `Bearer ${connection.refreshToken}`, "content-type": "application/json" },
+      body: JSON.stringify(this.managedTeamIdentity.signRequest({ schemaVersion: "multivibe-team-managed-disconnect-v1", enrollmentId })),
+    });
+  }
+
+  async getInvoices(): Promise<Invoice[]> {
+    let connection = currentCloudConnection(await this.store.getSettings());
+    if (!connection) return [];
+    connection = await this.refreshConnectionIfNeeded(connection);
+    return normalizeCloudInvoices(await this.requestJson("/client/v1/billing/invoices?limit=100", connection.accessToken, { signal: AbortSignal.timeout(8000) }));
+  }
+
+  async getStatus(): Promise<MultivibeCloudStatus> {
+    const generation = this.generation;
+    const settings = await this.store.getSettings();
+    let connection = currentCloudConnection(settings);
+    if (!connection) return { status: "disconnected", topupUrl: this.topupUrl };
+
+    try {
+      connection = await this.refreshConnectionIfNeeded(connection);
+      await this.ensureCloudAccount(connection);
+      const account = existingCloudAccount(await this.store.listAccounts());
+      if (!account) return { status: "disconnected", topupUrl: this.topupUrl };
+      const [creditsResult, subscriptionResult, autoTopupResult, earningsResult] = await Promise.allSettled([
+        this.requestJson("/client/v1/credits", connection.accessToken),
+        this.requestJson("/client/v1/billing/subscription", connection.accessToken),
+        this.requestJson("/client/v1/auto-recharge", connection.accessToken),
+        this.requestJson("/provider/v1/earnings", connection.accessToken),
+      ]);
+      this.assertGeneration(generation);
+      if (creditsResult.status !== "fulfilled") throw creditsResult.reason;
+      const credits = creditsResult.value as Record<string, unknown>;
+      const balance = usdValue(credits.totalAvailableUsd) ?? usdValue(credits.availableUsd);
+      if (balance === undefined) throw new Error("MultiVibe Cloud balance response is invalid");
+      const subscription = subscriptionResult.status === "fulfilled"
+        ? subscriptionResult.value as Record<string, unknown> : undefined;
+      const subscriptionName = subscriptionLabel(subscription?.data);
+      const autoTopup = autoTopupResult.status === "fulfilled"
+        ? autoTopupValue(autoTopupResult.value) : undefined;
+      const workerEarnings = earningsResult.status === "fulfilled"
+        ? workerEarningsValue(earningsResult.value) : undefined;
+      return {
+        status: "connected",
+        balanceUsd: balance,
+        ...(usdValue(credits.topUpAvailableUsd) !== undefined ? { dollarCreditsUsd: usdValue(credits.topUpAvailableUsd)! } : {}),
+        ...(subscriptionName ? { subscription: subscriptionName } : {}),
+        ...(account.expiresAt ? { apiKeyExpiresAt: new Date(account.expiresAt).toISOString() } : {}),
+        topupUrl: this.topupUrl,
+        ...(autoTopup ? { autoTopup } : {}),
+        ...(workerEarnings ? { workerEarnings } : {}),
+      };
+    } catch (error) {
+      const current = currentCloudConnection(await this.store.getSettings());
+      if (!current || current.authenticationRequired) {
+        return { status: "disconnected", topupUrl: this.topupUrl };
+      }
+      return { status: "unavailable", reconnecting: true, topupUrl: this.topupUrl };
+    }
+  }
+
+  private refreshConnectionIfNeeded(connection: CloudConnection, force = false): Promise<CloudConnection> {
+    return this.serialize(async (generation) => {
+      const current = currentCloudConnection(await this.store.getSettings());
+      if (!current) throw new Error("Cloud is disconnected");
+      if (current.authenticationRequired) throw new Error("Cloud authentication is required");
+      // A caller may hold an old snapshot. Never rotate a token twice, even on 401.
+      const forced = force && current.accessToken === connection.accessToken;
+      if (!current.refreshToken) {
+        if (current.expiresAt && current.expiresAt <= this.clock()) {
+          await this.store.patchSettings({ multivibeCloud: { ...current, authenticationRequired: true } });
+          throw new Error("Cloud authentication is required");
+        }
+        return current;
+      }
+      if (!forced && !current.refreshAttemptId && current.expiresAt && current.expiresAt > this.clock() + REFRESH_MARGIN_MS) return current;
+      if (this.clock() < this.retryAt) throw new Error("Cloud renewal is backing off");
+      // Persist the random attempt BEFORE sending. A process restart or a lost
+      // response retries the same bounded server-side rotation, not a new one.
+      const pending = { ...current, refreshAttemptId: current.refreshAttemptId ?? randomUUID() };
+      await this.store.patchSettings({ multivibeCloud: pending });
+      this.assertGeneration(generation);
+      try {
+        const next = { ...await this.rotateConnection(pending), refreshAttemptId: undefined, authenticationRequired: undefined };
+        this.assertGeneration(generation);
+        await this.store.patchSettings({ multivibeCloud: { ...next, refreshAttemptId: undefined, authenticationRequired: undefined } });
+        this.retryAt = 0;
+        this.failures = 0;
+        return next;
+      } catch (error) {
+        this.assertGeneration(generation);
+        if (error instanceof CloudHttpError && (error.code === "invalid_grant" || error.code === "managed_refresh_rejected")) {
+          await this.store.patchSettings({ multivibeCloud: { ...pending, authenticationRequired: true } });
+        } else this.deferRetry();
+        throw error;
+      }
+    });
+  }
+
+  private async rotateConnection(connection: CloudConnection): Promise<CloudConnection> {
+    if (!connection.refreshToken) throw new Error("Missing Cloud refresh token");
+    if (connection.refreshToken.startsWith("mvir_")) {
+      if (!/^mvir_[A-Za-z0-9_-]{43}$/.test(connection.refreshToken) || !this.managedTeamIdentity) {
+        throw new Error("Managed Team refresh state is invalid");
+      }
+      const settings = await this.store.getSettings();
+      const enrollmentId = settings.multivibeTeam?.managedEnrollmentId;
+      const identity = this.managedTeamIdentity.getIdentity();
+      if (!enrollmentId || !UUID_PATTERN.test(enrollmentId)
+        || settings.multivibeTeam?.instanceId !== identity.instanceId) {
+        throw new Error("Managed Team refresh state is invalid");
+      }
+      const response = await this.fetchImpl(`${this.apiBaseUrl}/team/v1/instances/managed-refresh`, {
+        method: "POST",
+        signal: this.signal(),
+        redirect: "error",
+        headers: {
+          "idempotency-key": connection.refreshAttemptId!,
+          authorization: `Bearer ${connection.refreshToken}`,
+          "content-type": "application/json",
+          accept: "application/json",
+        },
+        body: JSON.stringify(this.managedTeamIdentity.signRequest({
+          schemaVersion: "multivibe-team-managed-refresh-v1",
+          enrollmentId,
+        })),
+      });
+      const tokenData = await this.readJson(response);
+      if (!response.ok) throw new CloudHttpError(response.status, stringValue(tokenData.error) ?? stringValue(recordValue(tokenData.error)?.code));
+      const expiresIn = Number(tokenData.expiresIn);
+      if (tokenData.schemaVersion !== "multivibe-managed-refresh-result-v1"
+        || typeof tokenData.accessToken !== "string" || !/^mvmi_[A-Za-z0-9_-]{43}$/.test(tokenData.accessToken)
+        || typeof tokenData.refreshToken !== "string" || !/^mvir_[A-Za-z0-9_-]{43}$/.test(tokenData.refreshToken)
+        || !Number.isSafeInteger(expiresIn) || expiresIn < 60 || expiresIn > 86_400) {
+        throw new Error("Managed Team refresh response is invalid");
+      }
+      const next: CloudConnection = {
+        ...connection,
+        accessToken: tokenData.accessToken,
+        refreshToken: tokenData.refreshToken,
+        expiresAt: Date.now() + expiresIn * 1000,
+      };
+      return next;
+    }
+    const response = await this.fetchImpl(`${this.authBaseUrl}/oauth/token`, {
+      method: "POST",
+      signal: this.signal(),
+      redirect: "error",
+      headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json", "idempotency-key": connection.refreshAttemptId! },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        client_id: CLIENT_ID,
+        refresh_token: connection.refreshToken,
+      }),
+    });
+    const tokenData = await this.readJson(response);
+    if (!response.ok) throw new CloudHttpError(response.status, stringValue(tokenData.error) ?? stringValue(recordValue(tokenData.error)?.code));
+    const expiresAt = expiresAtFromToken(tokenData.expires_in);
+    const refreshToken = validRefreshToken(tokenData.refresh_token);
+    const next: CloudConnection = {
+      ...connection,
+      accessToken: validAccessToken(tokenData.access_token),
+      ...(refreshToken ? { refreshToken } : {}),
+      ...(expiresAt ? { expiresAt } : {}),
+    };
+    return next;
+  }
+
+  private ensureCloudAccount(_connection: CloudConnection): Promise<void> {
+    return this.serialize(async (generation) => {
+      const connection = currentCloudConnection(await this.store.getSettings());
+      if (!connection || connection.authenticationRequired) throw new Error("Cloud is disconnected");
+      await this.ensureCloudAccountLocked(connection, generation);
+    });
+  }
+
+  private async ensureCloudAccountLocked(connection: CloudConnection, generation: number): Promise<void> {
+    const accounts = await this.store.listAccounts();
+    const current = existingCloudAccount(accounts);
+    if (current && current.expiresAt && current.expiresAt > Date.now() + API_KEY_RENEWAL_MARGIN_MS) {
+      if ((current.privacyMode ?? "standard") !== this.privacyMode) {
+        await this.store.patchAccount(current.id, { privacyMode: this.privacyMode });
+        await this.store.flushIfDirty();
+      }
+      return;
+    }
+
+    const project = await this.ensureProject(connection.accessToken, connection.projectId);
+    const key = await this.createApiKey(connection.accessToken, project.id);
+    const account: Account = {
+      id: ACCOUNT_ID,
+      provider: "openai-compatible",
+      upstreamMode: "responses",
+      compatibilityMode: "responses",
+      accessToken: key.secret,
+      baseUrl: this.inferenceBaseUrl,
+      enabled: true,
+      priority: 0,
+      location: "cloud",
+      multivibeCloud: true,
+      privacyMode: this.privacyMode,
+      expiresAt: key.expiresAt,
+      state: {},
+    };
+    this.assertGeneration(generation);
+    await this.store.upsertAccount(account);
+    this.assertGeneration(generation);
+    await this.store.patchSettings({
+      multivibeCloud: {
+        ...connection,
+        projectId: project.id,
+        apiKeyExpiresAt: key.expiresAt,
+      },
+    });
+    await this.store.flushIfDirty();
+  }
+
+  private async ensureProject(accessToken: string, projectId?: string): Promise<{ id: string }> {
+    if (projectId && UUID_PATTERN.test(projectId)) return { id: projectId };
+    const projects = await this.requestJson("/client/v1/projects?limit=50", accessToken, { retryAuth: false });
+    const items = Array.isArray((projects as Record<string, unknown>).data)
+      ? (projects as Record<string, unknown>).data as Array<Record<string, unknown>> : [];
+    const existing = items.find((project) => project.slug === "multivibe-core");
+    if (stringValue(existing?.id) && UUID_PATTERN.test(String(existing?.id))) return { id: String(existing?.id) };
+    const created = await this.requestJson("/client/v1/projects", accessToken, {
+      method: "POST",
+      body: { name: "MultiVibe Core", slug: "multivibe-core" },
+      retryAuth: false,
+      idempotencyKey: `multivibe-core-project-${randomUUID()}`,
+    });
+    if (!UUID_PATTERN.test(String((created as Record<string, unknown>).id ?? ""))) {
+      throw new Error("MultiVibe Cloud project response is invalid");
+    }
+    return { id: String((created as Record<string, unknown>).id) };
+  }
+
+  private async createApiKey(accessToken: string, projectId: string): Promise<{ secret: string; expiresAt: number }> {
+    const expiresAt = Date.now() + API_KEY_LIFETIME_MS;
+    const created = await this.requestJson(
+      `/client/v1/projects/${encodeURIComponent(projectId)}/integrations/multivibe-core/credential`,
+      accessToken,
+      {
+        method: "POST",
+        body: {},
+        retryAuth: false,
+        idempotencyKey: `multivibe-core-key-${randomUUID()}`,
+      },
+    );
+    const secret = stringValue((created as Record<string, unknown>).secret);
+    if (!secret) throw new Error("MultiVibe Cloud API key response is missing its secret");
+    const apiKey = (created as Record<string, unknown>).apiKey;
+    const actualExpiresAt = apiKey && typeof apiKey === "object" && !Array.isArray(apiKey)
+      ? expiresAtFromApiKey((apiKey as Record<string, unknown>).expiresAt, expiresAt)
+      : expiresAt;
+    return { secret, expiresAt: actualExpiresAt };
+  }
+
+  /** UI context comes from Cloud; local enrollment alone never grants an admin role. */
+  async teamWorkspace(): Promise<{ state: "personal" | "team" | "unavailable"; role: "owner" | "admin" | "billing" | "member" | null }> {
+    const settings = await this.store.getSettings();
+    let connection = currentCloudConnection(settings);
+    const enrolled = settings.multivibeTeam?.enabled === true;
+    if (!connection) return { state: enrolled ? "team" : "personal", role: null };
+    try {
+      connection = await this.refreshConnectionIfNeeded(connection);
+      const overview = recordValue(await this.requestJson("/client/v1/team", connection.accessToken));
+      const role = overview?.role;
+      if (role !== "owner" && role !== "admin" && role !== "billing" && role !== "member") throw new Error("team_role_unavailable");
+      const subscription = recordValue(overview?.subscription);
+      if (!enrolled && role === "owner" && subscription?.state === "inactive") return { state: "personal", role: null };
+      return { state: "team", role };
+    } catch {
+      // A Cloud account is not necessarily a Team account. Keep the local
+      // workspace personal unless this machine has explicit Team enrollment.
+      return { state: enrolled ? "team" : "personal", role: null };
+    }
+  }
+
+  private async requestJson(path: string, accessToken: string, options: {
+    method?: string;
+    body?: unknown;
+    idempotencyKey?: string;
+    signal?: AbortSignal;
+    retryAuth?: boolean;
+  } = {}): Promise<unknown> {
+    const headers: Record<string, string> = {
+      accept: "application/json",
+      authorization: `Bearer ${accessToken}`,
+    };
+    if (options.body !== undefined) {
+      headers["content-type"] = "application/json";
+      if (options.idempotencyKey) headers["idempotency-key"] = options.idempotencyKey;
+    }
+    const response = await this.fetchImpl(`${this.apiBaseUrl}${path}`, {
+      method: options.method ?? "GET",
+      signal: this.signal(options.signal),
+      redirect: "error",
+      headers,
+      ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
+    });
+    const data = await this.readJson(response);
+    const error = recordValue(data.error);
+    if (!response.ok) {
+      if (response.status === 401 && options.retryAuth !== false && (!options.method || options.method === "GET" || options.idempotencyKey)) {
+        const connection = currentCloudConnection(await this.store.getSettings());
+        if (connection?.refreshToken) {
+          const next = await this.refreshConnectionIfNeeded({ ...connection, accessToken }, true);
+          return this.requestJson(path, next.accessToken, { ...options, retryAuth: false });
+        }
+      }
+      throw new CloudHttpError(response.status, stringValue(error?.code) ?? stringValue(data.code));
+    }
+    return data;
+  }
+
+  private async readJson(response: Response): Promise<Record<string, unknown>> {
+    let data: unknown;
+    try {
+      data = await response.json();
+    } catch {
+      data = undefined;
+    }
+    return data && typeof data === "object" && !Array.isArray(data)
+      ? data as Record<string, unknown> : {};
+  }
+}

@@ -1,0 +1,74 @@
+services:
+  multivibe:
+    build:
+      context: .
+      args:
+        GIT_SHA: ${GIT_SHA:?GIT_SHA must be set to the deployed commit}
+        BUILD_ID: ${BUILD_ID:?BUILD_ID must be set to the deployed commit}
+    container_name: multivibe
+    init: true
+    ports:
+      - "1455:1455"
+    environment:
+      - MULTIVIBE_CONTROL_PLANE=true
+      - PORT=1456
+      - HOST=127.0.0.1
+      - CONTROL_PLANE_PORT=1456
+      - V1_EDGE_HOST=0.0.0.0
+      - V1_EDGE_PORT=1455
+      - NODE_CONTROL_PLANE_URL=http://127.0.0.1:1456
+      - V1_EDGE_BASE_URL=http://127.0.0.1:1455
+      - V1_EDGE_INTERNAL_JOB_TOKEN=${V1_EDGE_INTERNAL_JOB_TOKEN:-}
+      - PUBLIC_BASE_URL=http://localhost:1455
+      - STORE_PATH=/data/accounts.json
+      - MODULES_PATH=/data/modules
+      - OAUTH_STATE_PATH=/data/oauth-state.json
+      - TRACE_FILE_PATH=/data/requests-trace.jsonl
+      - V1_EDGE_JOBS_PATH=/data/v1-edge-jobs.json
+      - V1_EDGE_MODELS_CACHE_PATH=/data/v1-edge-models-cache.json
+      - REQUEST_BODY_LIMIT=${REQUEST_BODY_LIMIT:-500mb}
+      - CHATGPT_BASE_URL=https://chatgpt.com
+      - REALTIME_PROVIDER=${REALTIME_PROVIDER:-openai}
+      - REALTIME_WEBRTC_CALL_URL=${REALTIME_WEBRTC_CALL_URL:-}
+      - REALTIME_REQUEST_TIMEOUT_MS=${REALTIME_REQUEST_TIMEOUT_MS:-30000}
+      - REALTIME_CASCADE_ENABLED=${REALTIME_CASCADE_ENABLED:-}
+      - REALTIME_CASCADE_MODEL=${REALTIME_CASCADE_MODEL:-multivibe/voice}
+      - REALTIME_CASCADE_LLM_MODEL=${REALTIME_CASCADE_LLM_MODEL:-}
+      - REALTIME_STT_URL=${REALTIME_STT_URL:-}
+      - REALTIME_STT_API_KEY=${REALTIME_STT_API_KEY:-}
+      - REALTIME_STT_MODEL=${REALTIME_STT_MODEL:-whisper-1}
+      - REALTIME_TTS_URL=${REALTIME_TTS_URL:-}
+      - REALTIME_TTS_API_KEY=${REALTIME_TTS_API_KEY:-}
+      - REALTIME_TTS_MODEL=${REALTIME_TTS_MODEL:-kokoro}
+      - REALTIME_TTS_VOICE=${REALTIME_TTS_VOICE:-af_heart}
+      - REALTIME_TTS_RESPONSE_FORMAT=${REALTIME_TTS_RESPONSE_FORMAT:-pcm}
+      - REALTIME_MAX_AUDIO_BYTES=${REALTIME_MAX_AUDIO_BYTES:-12582912}
+      - REALTIME_MAX_CONVERSATION_ITEMS=${REALTIME_MAX_CONVERSATION_ITEMS:-128}
+      - REALTIME_MAX_SESSION_SECONDS=${REALTIME_MAX_SESSION_SECONDS:-3600}
+      - REALTIME_ADAPTER_TIMEOUT_MS=${REALTIME_ADAPTER_TIMEOUT_MS:-120000}
+      - REALTIME_CLIENT_SECRET_TTL_SECONDS=${REALTIME_CLIENT_SECRET_TTL_SECONDS:-600}
+      - IMAGE_REQUEST_TIMEOUT_MS=${IMAGE_REQUEST_TIMEOUT_MS:-300000}
+      - UPSTREAM_PATH=/backend-api/codex/responses
+      - PROXY_MODELS=gpt-5.3-codex,gpt-5.2-codex,gpt-5-codex
+      - MODELS_CLIENT_VERSION=1.0.0
+      - MODELS_CACHE_MS=600000
+      - CODEX_SESSION_AFFINITY=${CODEX_SESSION_AFFINITY:-false}
+      - CODEX_SESSION_AFFINITY_TTL_MS=${CODEX_SESSION_AFFINITY_TTL_MS:-3600000}
+      - CODEX_SESSION_AFFINITY_MAX_ENTRIES=${CODEX_SESSION_AFFINITY_MAX_ENTRIES:-10000}
+      - EXCLUDED_PROVIDER_MODELS=openai-compatible:gpt-5.5,mistral:mistral-medium-latest
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-change-me}
+      - PROXY_API_KEY=${PROXY_API_KEY:-}
+      - CLAUDE_CODE_MODEL=${CLAUDE_CODE_MODEL:-gpt-5.6-luna}
+      - CLAUDE_CODE_FAST_MODEL=${CLAUDE_CODE_FAST_MODEL:-gpt-5.4-mini}
+      - OAUTH_CLIENT_ID=app_EMoamEEZ73f0CkXaXp7hrann
+      - OAUTH_AUTHORIZATION_URL=https://auth.openai.com/oauth/authorize
+      - OAUTH_TOKEN_URL=https://auth.openai.com/oauth/token
+      - OAUTH_SCOPE=openid profile email offline_access
+      - OAUTH_REDIRECT_URI=http://localhost:1455/auth/callback
+      # Sentry (optional - leave SENTRY_DSN empty to disable)
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT:-production}
+      - SENTRY_TRACES_SAMPLE_RATE=${SENTRY_TRACES_SAMPLE_RATE:-0.1}
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

@@ -1,0 +1,748 @@
+import XCTest
+@testable import MultiVibeChat
+
+@MainActor final class LocalAgentTests: XCTestCase {
+    func testOnDeviceCapabilitiesSerializeExplicitRuntimeLimits() throws {
+        let encoded = try JSONEncoder().encode(HermesOnDeviceCapabilities.current)
+        let value = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertEqual(value["schemaVersion"] as? Int, 1)
+        XCTAssertEqual(value["profile"] as? String, "ios_degraded")
+        for key in ["linuxShell", "packageInstallation", "skillScriptExecution", "directCloudFilesystemAccess"] {
+            XCTAssertEqual(value[key] as? Bool, false, key)
+        }
+    }
+    func testOnDevicePromptKeepsPermissionsAndPendingWritesTruthful() throws {
+        let prompt = try HermesOnDeviceCapabilities.current.promptInstructions()
+        XCTAssertTrue(prompt.contains(#""profile":"ios_degraded""#))
+        XCTAssertTrue(prompt.contains("Only supplied tools and explicitly selected cached context"))
+        XCTAssertTrue(prompt.contains("Linux shell commands, package installation, skill script execution or direct Cloud filesystem access"))
+        XCTAssertTrue(prompt.contains("Internet, device and local automation tools remain subject to their existing permissions and availability"))
+        XCTAssertTrue(prompt.contains("If no tools are supplied, do not claim tool access or execution"))
+        XCTAssertTrue(prompt.contains("they are not already Cloud writes"))
+        XCTAssertEqual(prompt, try HermesOnDeviceCapabilities.current.promptInstructions())
+    }
+    func testBothLocalModelKindsRemainOnDeviceWithCloudContext() async throws {
+        let workspace = LocalAgentWorkspace(conversations: [], documents: [],
+            selectedCloudContext: "Explicitly selected cached Hermes context", event: { _ in }, saveDocument: { _ in })
+        let context = await workspace.selectedCloudContext
+        XCTAssertEqual(context, "Explicitly selected cached Hermes context")
+        XCTAssertEqual(ModelExecution(LocalModel.id), .apple)
+        XCTAssertEqual(ModelExecution("device-gguf:installed-model"), .downloaded)
+        XCTAssertTrue(ModelExecution(LocalModel.id).isLocal)
+        XCTAssertTrue(ModelExecution("device-gguf:installed-model").isLocal)
+        XCTAssertFalse(ModelExecution("relay/model").isLocal)
+    }
+    func testFoundationSummaryRequiresBoundedUsageAndOnlyContent() throws {
+        let valid = #"{"content":"Completed exchange, no commands replayed."}"#
+        let wire = try HermesFoundationAdapter.summaryWire(valid,outputTokens:20,reservedOutputTokens:128)
+        let value = try JSONSerialization.jsonObject(with:Data(wire.utf8)) as! [String:Any]
+        XCTAssertEqual(value["finish_reason"] as? String,"stop")
+        XCTAssertEqual(value["content"] as? String,"Completed exchange, no commands replayed.")
+        for used in [0,128,129] { XCTAssertThrowsError(try HermesFoundationAdapter.summaryWire(valid,outputTokens:used,reservedOutputTokens:128)) }
+        for reserve in [0,1025] { XCTAssertThrowsError(try HermesFoundationAdapter.summaryWire(valid,outputTokens:20,reservedOutputTokens:reserve)) }
+        for raw in [#"{"content":""}"#,#"{"content":"ok","proposedCalls":[]}"#,#"{"content":"ok","refusal":"denied"}"#] {
+            XCTAssertThrowsError(try HermesFoundationAdapter.summaryWire(raw,outputTokens:20,reservedOutputTokens:128))
+        }
+    }
+    func testFoundationCompactionAvailabilityMatchesVerifiedUsageSDK() {
+        if #available(iOS 27, macOS 27, *) { XCTAssertTrue(HermesFoundationAdapter.supportsCompaction) }
+        else { XCTAssertFalse(HermesFoundationAdapter.supportsCompaction) }
+    }
+    func testHermesFoundationKeepsFullTranscriptAndToolObservationsOutOfInstructions() throws {
+        let messages = #"[{"role":"system","content":"SYSTEM"},{"role":"user","content":"FIRST-REQUEST"},{"role":"assistant","tool_calls":[{"id":"a","function":{"name":"read","arguments":"{}"}}]},{"role":"tool","tool_call_id":"a","content":"UNTRUSTED-OBSERVATION"},{"role":"user","content":"CURRENT"}]"#
+        let tools = #"[{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}]"#
+        let prepared = try HermesFoundationAdapter.prepare(messages: messages, tools: tools)
+        XCTAssertTrue(prepared.prompt.contains("FIRST-REQUEST"))
+        XCTAssertTrue(prepared.prompt.contains("UNTRUSTED-OBSERVATION"))
+        XCTAssertTrue(prepared.prompt.contains("tool_call_id"))
+        XCTAssertFalse(prepared.instructions.contains("UNTRUSTED-OBSERVATION"))
+        XCTAssertTrue(prepared.instructions.contains("SYSTEM"))
+        XCTAssertEqual(prepared.names, ["read"])
+    }
+    func testHermesFoundationConvertsOnlyCompletedCallsAndPreservesInvalidArgumentsForValidation() throws {
+        let generated = #"{"content":"not an executed result","proposedCalls":[{"name":"read","arguments":"{bad}"}]}"#
+        let first = try HermesFoundationAdapter.wireReply(generated, names: ["read"], messages: "transcript")
+        XCTAssertEqual(first, try HermesFoundationAdapter.wireReply(generated, names: ["read"], messages: "transcript"))
+        let wire = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(first.utf8)) as? [String: Any])
+        XCTAssertEqual(wire["content"] as? String, "")
+        XCTAssertEqual(wire["finish_reason"] as? String, "tool_calls")
+        let call = try XCTUnwrap((wire["tool_calls"] as? [[String: Any]])?.first)
+        XCTAssertEqual((call["function"] as? [String: String])?["arguments"], "{bad}")
+        XCTAssertThrowsError(try HermesFoundationAdapter.wireReply(generated, names: [], messages: "transcript"))
+        XCTAssertThrowsError(try HermesFoundationAdapter.wireReply(#"{"content":"","proposedCalls":"invalid"}"#, names: ["read"], messages: "transcript"))
+        XCTAssertThrowsError(try HermesFoundationAdapter.wireReply(#"{"content":"","proposedCalls":[]}"#, names: [], messages: "transcript"))
+        XCTAssertThrowsError(try HermesFoundationAdapter.wireReply("{", names: ["read"], messages: "transcript"))
+    }
+    func testHermesFoundationCancellationNeverProducesAnExecutableReply() async throws {
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try HermesFoundationAdapter.wireReply(#"{"content":"","proposedCalls":[{"name":"read","arguments":"{}"}]}"#, names: ["read"], messages: "transcript")
+        }
+        do { _ = try await task.value; XCTFail("Cancelled generation produced a tool call") }
+        catch is CancellationError { }
+    }
+    func testDeviceToolsAreLazyAndDenialIsRecoverable() async throws {
+        actor Reads {
+            var actions: [String] = []
+            func read(_ action: String, _ query: String) -> String {
+                actions.append(action)
+                return "Accès refusé"
+            }
+            func count() -> Int { actions.count }
+        }
+        let reads = Reads()
+        let workspace = LocalAgentWorkspace(conversations: [], documents: [], event: { _ in },
+            saveDocument: { _ in }, readDevice: { LocalToolResult(await reads.read($0, $1)) },
+            allowedDeviceActions: ["read_calendar", "read_reminders", "read_contacts", "current_location", "read_mail"])
+        _ = try await workspace.execute(action: "current_date", query: "", documentID: "", text: "", lhs: 0, rhs: 0)
+        let before = await reads.count()
+        XCTAssertEqual(before, 0)
+        for action in ["read_calendar", "read_reminders", "read_contacts", "current_location", "read_mail"] {
+            let result = try await workspace.execute(action: action, query: "", documentID: "", text: "", lhs: 0, rhs: 0)
+            XCTAssertEqual(result, "Accès refusé")
+        }
+        let after = await reads.count()
+        XCTAssertEqual(after, 5)
+        let result = try await workspace.execute(action: "add", query: "", documentID: "", text: "", lhs: 2, rhs: 3)
+        XCTAssertEqual(result, "5.0")
+    }
+
+    func testLocationRequestCannotPromptForContacts() async throws {
+        let scope = LocalDeviceScope.actions(for: "Where are we?")
+        XCTAssertEqual(scope, ["current_location"])
+        XCTAssertEqual(LocalDeviceScope.actions(for: "Où sommes-nous ?"), ["current_location"])
+        XCTAssertEqual(LocalDeviceScope.actions(for: "Lis mon calendrier et mes rappels"), ["read_calendar", "read_reminders"])
+        let workspace = LocalAgentWorkspace(conversations: [], documents: [], event: { _ in }, saveDocument: { _ in },
+            readDevice: { _, _ in XCTFail("Unrelated data must never reach native permissions"); return LocalToolResult("") },
+            allowedDeviceActions: scope)
+        let result = try await workspace.execute(action: "read_contacts", query: "", documentID: "", text: "", lhs: 0, rhs: 0)
+        XCTAssertTrue(result.contains("Aucune permission"))
+    }
+
+    func testExplicitAuthorizationKeepsPreviousCalendarScope() {
+        let messages = [
+            ChatMessage(role: "user", content: "Il y a quoi dans mon calendrier cette semaine ?"),
+            ChatMessage(role: "assistant", content: "J’ai besoin de ton autorisation."),
+            ChatMessage(role: "user", content: "Je t’autorises")
+        ]
+        XCTAssertEqual(LocalDeviceScope.actions(for: messages), ["read_calendar"])
+    }
+
+    func testAuthorizationDoesNotWidenPreviousPersonalDataScope() {
+        let messages = [
+            ChatMessage(role: "user", content: "Lis mon calendrier"),
+            ChatMessage(role: "assistant", content: "J’ai besoin de ton autorisation."),
+            ChatMessage(role: "user", content: "Je t’autorise pour mes contacts")
+        ]
+        XCTAssertEqual(LocalDeviceScope.actions(for: messages), ["read_contacts"])
+        XCTAssertTrue(LocalDeviceScope.actions(for: [
+            ChatMessage(role: "user", content: "Lis mon calendrier"),
+            ChatMessage(role: "assistant", content: "D’accord."),
+            ChatMessage(role: "user", content: "Oui")
+        ]).isEmpty)
+    }
+
+    func testMailExplainsPlatformLimitWithoutPermission() async throws {
+        let result = try await LocalDeviceData.read(action: "read_mail", query: "")
+        XCTAssertTrue(result.modelText.contains("Aucun mail"))
+        XCTAssertTrue(result.modelText.contains("Importez"))
+        XCTAssertTrue(result.blocks.isEmpty)
+    }
+
+    func testStructuredToolResultIsRenderedAndTextStillReachesModel() async throws {
+        actor Capture { var blocks: [NativeContentBlock] = []; func set(_ value: [NativeContentBlock]) { blocks = value } }
+        let capture = Capture()
+        let location = NativeContentBlock.Location(latitude: 43.6, longitude: 1.44, accuracy: 12, measuredAt: Date())
+        let workspace = LocalAgentWorkspace(conversations: [], documents: [], event: { _ in }, saveDocument: { _ in },
+            readDevice: { _, _ in LocalToolResult("Position lisible par le modèle", blocks: [.location(location)]) },
+            render: { await capture.set($0) }, allowedDeviceActions: ["current_location"])
+        let text = try await workspace.execute(action: "current_location", query: "", documentID: "", text: "", lhs: 0, rhs: 0)
+        XCTAssertEqual(text, "Position lisible par le modèle")
+        let rendered = await capture.blocks
+        XCTAssertEqual(rendered, [.location(location)])
+    }
+
+    func testGuestLocalRunUsesToolsWithoutAuthenticationOrNetwork() async throws {
+        var saved: [Data] = []
+        let services = isolatedServices(writeHistory: { data, _ in saved.append(data) }, load: { nil },
+            refresh: { _ in XCTFail("Local run must not refresh credentials"); throw APIError.invalidResponse },
+            stream: { _, _, _, _ in XCTFail("Local model must never reach remote inference") },
+            readLocalHistory: { _ in throw CocoaError(.fileReadNoSuchFile) },
+            localAvailability: { nil }, localRespond: { _, workspace, output in
+                let sum = try await workspace.execute(action: "add", query: "", documentID: "", text: "", lhs: 12, rhs: 8)
+                let result = try await workspace.execute(action: "multiply", query: "", documentID: "", text: "", lhs: Double(sum)!, rhs: 3)
+                await output(result)
+            }, models: { _ in XCTFail("Guest must not request remote models"); return [] })
+        let manager = ConversationManager(services: services)
+        await manager.restore()
+        XCTAssertEqual(manager.selectedModel, LocalModel.id)
+        XCTAssertTrue(manager.send("Calcule (12+8)*3"))
+        for _ in 0..<1000 { if !manager.isStreaming { break }; await Task.yield() }
+        XCTAssertEqual(manager.current?.messages.last?.content, "60.0")
+        XCTAssertEqual(manager.current?.messages.last?.completion, .completed)
+        XCTAssertEqual(manager.current?.messages.last?.localEvents?.count, 2)
+        XCTAssertFalse(saved.isEmpty)
+        XCTAssertNil(manager.session)
+    }
+
+    func testGuestHistoryRestoresWithoutNetwork() async throws {
+        struct StoredHistory: Decodable { let conversations: [Conversation] }
+        var storage: [String: Data] = [:], settled = false
+        let completed = expectation(description: "reply and title persisted")
+        var services = isolatedServices(writeHistory: { data, url in
+            storage[url.lastPathComponent] = data
+            let snapshot = try JSONDecoder().decode(StoredHistory.self, from: data)
+            if !settled, let conversation = snapshot.conversations.first,
+               conversation.messages.last?.completion == .completed, conversation.titleGeneratedFor != nil {
+                settled = true; completed.fulfill()
+            }
+        }, load: { nil }, readLocalHistory: { url in
+            guard let data = storage[url.lastPathComponent] else { throw CocoaError(.fileReadNoSuchFile) }; return data
+        }, localAvailability: { nil }, localRespond: { _, _, output in await output("Réponse locale") },
+            summarizeTitle: { _, _ in "Salutation" })
+        services.preserveLegacyHistory = { _, _, _ in }
+        services.memoryReviewDelay = { throw CancellationError() }
+        let first = ConversationManager(services: services)
+        await first.restore()
+        XCTAssertTrue(first.send("Bonjour"))
+        await fulfillment(of: [completed], timeout: 2)
+        let expected = first.conversations
+        let second = ConversationManager(services: services)
+        await second.restore()
+        XCTAssertEqual(second.conversations, expected)
+        XCTAssertEqual(storage.keys.sorted(), ["history-guest.json"])
+    }
+
+    func testUnavailableLocalModelDoesNotCreateOrSendMessage() async {
+        let manager = ConversationManager(services: isolatedServices(writeHistory: { _, _ in }, load: { nil },
+            readLocalHistory: { _ in throw CocoaError(.fileReadNoSuchFile) }, localAvailability: { "Modèle absent" },
+            localRespond: { _, _, _ in XCTFail("Unavailable model must not run") }))
+        await manager.restore()
+        XCTAssertFalse(manager.send("Bonjour"))
+        XCTAssertEqual(manager.error, "Modèle absent")
+        XCTAssertTrue(manager.conversations.isEmpty)
+    }
+
+    func testWriteFailurePreventsInference() async {
+        let manager = ConversationManager(services: isolatedServices(writeHistory: { _, _ in throw CocoaError(.fileWriteOutOfSpace) },
+            load: { nil }, readLocalHistory: { _ in throw CocoaError(.fileReadNoSuchFile) }, localAvailability: { nil },
+            localRespond: { _, _, _ in XCTFail("Unsaved request must not execute") }))
+        await manager.restore()
+        XCTAssertFalse(manager.send("Bonjour"))
+        XCTAssertFalse(manager.isStreaming)
+    }
+
+    func testToolBudgetAndDocumentIsolation() async throws {
+        let document = LocalDocument(name: "Facture", text: "Total: 42")
+        let workspace = LocalAgentWorkspace(conversations: [], documents: [document], event: { _ in }, saveDocument: { _ in })
+        let read = try await workspace.execute(action: "read_document", query: "", documentID: document.id.uuidString, text: "", lhs: 0, rhs: 0)
+        XCTAssertTrue(read.hasSuffix("Total: 42"))
+        do {
+            _ = try await workspace.execute(action: "read_document", query: "", documentID: "/etc/passwd", text: "", lhs: 0, rhs: 0)
+            XCTFail("Arbitrary paths must not be readable")
+        } catch LocalAgentError.documentMissing {}
+        for _ in 0..<10 {
+            _ = try await workspace.execute(action: "add", query: "", documentID: "", text: "", lhs: 1, rhs: 1)
+        }
+        do {
+            _ = try await workspace.execute(action: "add", query: "", documentID: "", text: "", lhs: 1, rhs: 1)
+            XCTFail("Budget must stop further calls")
+        } catch LocalAgentError.budget {}
+    }
+}
+
+@MainActor final class OfflineHistoryTests: XCTestCase {
+    private func credentials(_ account: String, expired: Bool = false) -> NativeSession {
+        NativeSession(accessToken: "fixture", refreshToken: "fixture", expiresAt: expired ? .distantPast : .distantFuture, accountId: account)
+    }
+    func testExpiredAccountCanRunLocalWithoutRefresh() async {
+        struct StoredHistory: Decodable { let conversations: [Conversation] }
+        let account = credentials(UUID().uuidString, expired: true)
+        let refreshEntered = expectation(description: "background refresh suspended")
+        let refreshFinished = expectation(description: "offline transport finished")
+        let replySaved = expectation(description: "local reply persisted without refreshed credentials")
+        let refreshGate = OfflineFixtureRefreshGate()
+        var refreshCalls = 0, localSaved = false
+        var services = isolatedServices(writeHistory: { data, _ in
+            let snapshot = try JSONDecoder().decode(StoredHistory.self, from: data)
+            if !localSaved, snapshot.conversations.first?.messages.last?.completion == .completed {
+                localSaved = true; replySaved.fulfill()
+            }
+        }, load: { account }, refresh: { _ in
+            refreshCalls += 1; refreshEntered.fulfill()
+            defer { refreshFinished.fulfill() }
+            await refreshGate.wait()
+            throw URLError(.notConnectedToInternet)
+        }, stream: { _, _, _, _ in XCTFail("No remote inference") },
+            readLocalHistory: { _ in throw CocoaError(.fileReadNoSuchFile) }, localAvailability: { nil },
+            localRespond: { _, _, output in await output("Hors ligne") }, monitorConnectivity: false,
+            summarizeTitle: { _, _ in throw CancellationError() })
+        services.memoryReviewDelay = { throw CancellationError() }
+        let manager = ConversationManager(services: services)
+        await manager.restore(loadRemoteModels: false)
+        await fulfillment(of: [refreshEntered], timeout: 2)
+        XCTAssertTrue(manager.send("Bonjour"))
+        await fulfillment(of: [replySaved], timeout: 2)
+        XCTAssertEqual(manager.current?.messages.last?.content, "Hors ligne")
+        XCTAssertEqual(manager.session?.accountId, account.accountId)
+        XCTAssertEqual(manager.session?.accessToken, account.accessToken)
+        XCTAssertEqual(refreshCalls, 1)
+        // Local inference completed while automatic recovery still awaited the
+        // transport. Invalidate this fixture's owner before releasing it, so
+        // later tests cannot inherit pending recovery from an expired account.
+        manager.session = nil
+        refreshGate.release()
+        await fulfillment(of: [refreshFinished], timeout: 2)
+    }
+
+    func testCorruptLocalStorageCannotBeOverwrittenByNewRun() async {
+        var writes = 0
+        let manager = ConversationManager(services: isolatedServices(writeHistory: { _, _ in writes += 1 }, load: { nil },
+            readLocalHistory: { _ in Data("not JSON".utf8) }, localAvailability: { nil },
+            localRespond: { _, _, _ in XCTFail("Unreadable history must be preserved") }, monitorConnectivity: false))
+        await manager.restore()
+        XCTAssertNotNil(manager.error)
+        XCTAssertFalse(manager.send("Bonjour"))
+        XCTAssertEqual(writes, 0)
+    }
+    func testGuestImportIsExplicitAccountScopedAndIdempotent() async throws {
+        struct StoredHistory: Decodable { let conversations: [Conversation] }
+        let replySaved = expectation(description: "guest reply persisted")
+        var files: [String: Data] = [:], settled = false
+        var services = isolatedServices(writeHistory: { data, url in
+            files[url.lastPathComponent] = data
+            let snapshot = try JSONDecoder().decode(StoredHistory.self, from: data)
+            if !settled, snapshot.conversations.first?.messages.last?.completion == .completed {
+                settled = true; replySaved.fulfill()
+            }
+        }, load: { nil }, save: { _ in }, clear: {}, revoke: { _ in },
+            readLocalHistory: { url in
+                guard let data = files[url.lastPathComponent] else { throw CocoaError(.fileReadNoSuchFile) }; return data
+            }, localAvailability: { nil }, localRespond: { _, _, output in await output("Privé") }, monitorConnectivity: false, models: { _ in [] },
+            summarizeTitle: { _, _ in throw CancellationError() })
+        services.preserveLegacyHistory = { _, _, _ in }
+        services.memoryReviewDelay = { throw CancellationError() }
+        let manager = ConversationManager(services: services)
+        await manager.restore()
+        XCTAssertTrue(manager.send("Message invité"))
+        await fulfillment(of: [replySaved], timeout: 2)
+        let guest = manager.conversations
+        try await manager.accept(credentials("account-A"))
+        XCTAssertTrue(manager.conversations.isEmpty, "Login must not silently upload guest data")
+        manager.importGuestHistory()
+        XCTAssertEqual(manager.conversations.count, 1)
+        XCTAssertNotEqual(manager.conversations.first?.id, guest.first?.id)
+        manager.importGuestHistory()
+        XCTAssertEqual(manager.conversations.count, 1)
+        try await manager.accept(credentials("account-B"))
+        XCTAssertTrue(manager.conversations.isEmpty, "Account A history cannot leak into B")
+        await manager.logout()
+        XCTAssertEqual(manager.conversations, guest)
+        XCTAssertEqual(manager.selectedModel, LocalModel.id)
+    }
+    func testReconnectUploadsLocalConversationWithoutRemoteInference() async throws {
+        let account = credentials(UUID().uuidString)
+        var remote = AccountHistorySnapshot(accountId: account.accountId, revision: 0, conversations: [])
+        var writes = 0
+        let services = isolatedServices(writeHistory: { _, _ in }, load: { account },
+            readHistory: { _ in remote }, saveHistory: { snapshot, _ in writes += 1; remote = snapshot; remote.revision += 1; return remote },
+            stream: { _, _, _, _ in XCTFail("Sync cannot trigger remote inference") },
+            readLocalHistory: { _ in throw CocoaError(.fileReadNoSuchFile) }, localAvailability: { nil },
+            localRespond: { _, _, output in await output("Réponse sans réseau") }, monitorConnectivity: false,
+            syncDelay: { _ in await Task.yield() })
+        let manager = ConversationManager(services: services)
+        await manager.restore(loadRemoteModels: false)
+        manager.connectivityChanged(false)
+        manager.enableAutomaticSync()
+        XCTAssertTrue(manager.send("Bonjour"))
+        for _ in 0..<1000 { if !manager.isStreaming { break }; await Task.yield() }
+        XCTAssertEqual(writes, 0)
+        manager.connectivityChanged(true)
+        for _ in 0..<1000 { if writes > 0 && !manager.isSynchronizing { break }; await Task.yield() }
+        XCTAssertEqual(writes, 1)
+        XCTAssertEqual(remote.conversations.first?.object?["model"]?.string, LocalModel.id)
+        XCTAssertEqual(manager.current?.messages.last?.content, "Réponse sans réseau")
+        manager.disableAutomaticSync()
+    }
+    func testLocalToolTraceSurvivesServerHistoryProjection() throws {
+        let event = LocalAgentEvent(tool: "add", detail: "Étape 1 : add")
+        let original = Conversation(model: LocalModel.id, messages: [ChatMessage(role: "assistant", content: "3", localEvents: [event], completion: .completed)])
+        var snapshot = AccountHistorySnapshot(accountId: "fixture", revision: 0, conversations: [])
+        var ids: [String: UUID] = [:]
+        try snapshot.store(original, serverID: original.id.uuidString, messageIDs: &ids)
+        let restored = try snapshot.projectedConversation(at: 0, id: original.id, messageIDs: &ids)
+        XCTAssertEqual(restored.messages.first?.localEvents, [event])
+    }
+    func testStopPreventsLateToolSideEffect() async throws {
+        actor Gate {
+            var continuation: CheckedContinuation<Void, Never>?
+            var started = false
+            func wait() async { started = true; await withCheckedContinuation { continuation = $0 } }
+            func release() { continuation?.resume() }
+        }
+        let gate = Gate()
+        let manager = ConversationManager(services: isolatedServices(writeHistory: { _, _ in }, load: { nil },
+            readLocalHistory: { _ in throw CocoaError(.fileReadNoSuchFile) }, localAvailability: { nil },
+            localRespond: { _, workspace, output in
+                await gate.wait()
+                _ = try await workspace.execute(action: "create_document", query: "Must not exist", documentID: "", text: "data", lhs: 0, rhs: 0)
+                await output("Must not appear")
+            }, monitorConnectivity: false))
+        await manager.restore()
+        XCTAssertTrue(manager.send("Crée un document"))
+        for _ in 0..<1000 { if await gate.started { break }; await Task.yield() }
+        manager.stop()
+        await gate.release()
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertTrue(manager.localDocuments.isEmpty)
+        XCTAssertEqual(manager.current?.messages.last?.completion, .stopped)
+        XCTAssertEqual(manager.current?.messages.last?.content, "")
+    }
+}
+
+@MainActor final class AppleFoundationDeviceTests: XCTestCase {
+    /// Runs real Apple inference on supported hardware. Simulator/disabled models are
+    /// explicitly skipped; a skip is not evidence of a successful local model run.
+    func testRealAppleModelCompletesTwoDependentToolCalls() async throws {
+        if let reason = LocalModel.unavailableReason { throw XCTSkip(reason) }
+        actor Evidence {
+            var events: [LocalAgentEvent] = []
+            var answer = ""
+            func record(_ event: LocalAgentEvent) { events.append(event) }
+            func output(_ text: String) { answer = text }
+        }
+        let evidence = Evidence()
+        let workspace = LocalAgentWorkspace(conversations: [], documents: [], event: { await evidence.record($0) }, saveDocument: { _ in
+            XCTFail("This request does not authorize creating a document")
+        })
+        try await LocalAgent.respond(messages: [ChatMessage(role: "user", content: "Utilise obligatoirement l’outil local_workspace avec action add, lhs 137 et rhs 286. Puis utilise le résultat obtenu dans un second appel avec action multiply et rhs 7. Donne le résultat final en français.")], workspace: workspace, onText: { await evidence.output($0) })
+        let events = await evidence.events
+        let answer = await evidence.answer
+        XCTAssertTrue(events.contains { $0.tool == "add" })
+        XCTAssertTrue(events.contains { $0.tool == "multiply" })
+        XCTAssertTrue(answer.replacingOccurrences(of: " ", with: "").replacingOccurrences(of: "\u{202f}", with: "").contains("2961"), answer)
+    }
+}
+
+
+/// No test may read the user's account/guest history or touch their Keychain.
+@MainActor func isolatedServices(
+    writeHistory: @escaping (Data, URL) throws -> Void = { _, _ in },
+    load: @escaping () -> NativeSession? = { nil },
+    save: @escaping (NativeSession) throws -> Void = { _ in },
+    clear: @escaping () -> Void = {},
+    refresh: @escaping @MainActor (NativeSession) async throws -> NativeSession = { _ in throw APIError.invalidResponse },
+    revoke: @escaping @MainActor (String) async throws -> Void = { _ in },
+    readHistory: @escaping @MainActor (String) async throws -> AccountHistorySnapshot = { _ in throw APIError.invalidResponse },
+    saveHistory: @escaping @MainActor (AccountHistorySnapshot, String) async throws -> AccountHistorySnapshot = { _, _ in throw APIError.invalidResponse },
+    stream: @escaping @MainActor (String, [ChatMessage], String, @Sendable (String) async -> Void) async throws -> Void = { _, _, _, _ in throw APIError.invalidResponse },
+    readLocalHistory: @escaping @MainActor (URL) throws -> Data = { _ in throw CocoaError(.fileReadNoSuchFile) },
+    localAvailability: @escaping @MainActor () -> String? = { "Unavailable test model" },
+    localRespond: @escaping @Sendable ([ChatMessage], LocalAgentWorkspace, @escaping @Sendable (String) async -> Void) async throws -> Void = { _, _, _ in throw APIError.invalidResponse },
+    monitorConnectivity: Bool = false,
+    syncDelay: @escaping @Sendable (Int) async throws -> Void = { _ in await Task.yield() },
+    models: @escaping @MainActor (String) async throws -> [ModelOption] = { _ in [] },
+    downloadedModels: @escaping @MainActor () -> [ModelOption] = { [] },
+    lastUsedModel: @escaping @MainActor (String) -> String? = { _ in nil },
+    rememberLastUsedModel: @escaping @MainActor (String, String) -> Void = { _, _ in },
+    summarizeTitle: @escaping @Sendable (String, String) async throws -> String = { _, _ in throw APIError.invalidResponse }
+) -> SessionServices {
+    var services = SessionServices(writeHistory: writeHistory, load: load, save: save, clear: clear,
+        refresh: refresh, revoke: revoke, readHistory: readHistory, saveHistory: saveHistory,
+        stream: stream, readLocalHistory: readLocalHistory, localAvailability: localAvailability,
+        downloadedModels: downloadedModels, localRespond: localRespond,
+        memoryIndex: { _ in try MemoryIndex(url: nil) }, reviewLocalMemory: { _ in "[]" },
+        summarizeTitle: summarizeTitle,
+        monitorConnectivity: monitorConnectivity, syncDelay: syncDelay, models: models,
+        lastUsedModel: lastUsedModel, rememberLastUsedModel: rememberLastUsedModel)
+    services.preserveLegacyHistory = { _, _, _ in }
+    services.legacySnapshot = { _, _ in nil }
+    services.legacyExportSnapshot = { _, account in .init(schemaVersion: 1, accountID: account) }
+    services.hermesChanges = { _,_ in throw APIError.server(503,"fixture_agent_sync_unavailable") }
+    services.hermesConsent = { _ in throw APIError.server(503,"fixture_agent_sync_unavailable") }
+    services.hermesUpdateConsent = { _, _, _, _, _ in throw APIError.server(503,"fixture_consent_update_unavailable") }
+    services.hermesMutations = { _,_,_ in throw APIError.server(503,"fixture_agent_sync_unavailable") }
+    return services
+}
+
+@MainActor final class ConversationTitleTests: XCTestCase {
+    private func session() -> NativeSession {
+        NativeSession(accessToken: "a", refreshToken: "r", expiresAt: .distantFuture, accountId: "account-a")
+    }
+    /// Captures the title request so the test can assert what the model received.
+    actor Probe {
+        var prompts: [String] = []
+        func record(_ prompt: String) { prompts.append(prompt) }
+        func count() -> Int { prompts.count }
+        func first() -> String? { prompts.first }
+    }
+    /// Suspends the title model call until the test releases it, so a late result
+    /// can be checked against a title settled in the meantime.
+    actor TitleGate {
+        private var waiter: CheckedContinuation<Void, Never>?
+        private var released = false
+        var started = false
+        func waitForRelease() async {
+            started = true
+            guard !released else { return }
+            await withCheckedContinuation { self.waiter = $0 }
+        }
+        func finish() {
+            released = true
+            waiter?.resume(); waiter = nil
+        }
+    }
+    /// Waits for the background title attempt to settle and for the visible reply
+    /// to finish, so a following turn can be sent deterministically.
+    private func waitForTitle(_ manager: ConversationManager) async {
+        for _ in 0..<4000 where manager.current?.titleGeneratedFor == nil || manager.isStreaming { await Task.yield() }
+    }
+
+    func testPolicyNormalizesModelOutput() {
+        XCTAssertEqual(ConversationTitle.normalize("Analyse budget mensuel"), "Analyse budget mensuel")
+        XCTAssertEqual(ConversationTitle.normalize("\"Résumé du contrat\"\nExplication ensuite."), "Résumé du contrat")
+        XCTAssertEqual(ConversationTitle.normalize("Titre : Suivi du chantier."), "Suivi du chantier")
+        XCTAssertNil(ConversationTitle.normalize("   \n  "))
+        XCTAssertEqual(ConversationTitle.fallback(for: "  Bonjour\n  le   monde  "), "Bonjour le monde")
+        XCTAssertEqual(ConversationTitle.fallback(for: String(repeating: "a", count: 100)).count, ConversationTitle.maximumCharacters)
+    }
+
+    func testSuccessfulSummaryReplacesTheTruncationFallback() async {
+        let probe = Probe()
+        let services = isolatedServices(load: { self.session() },
+            localAvailability: { nil },
+            localRespond: { _, _, output in await output("Réponse") },
+            summarizeTitle: { _, prompt in
+                await probe.record(prompt)
+                return "\"Planification du chantier\""
+            })
+        let manager = ConversationManager(services: services)
+        await manager.restore(loadRemoteModels: false)
+        manager.models = [LocalModel.option]
+        manager.selectedModel = LocalModel.id
+        XCTAssertTrue(manager.send("Peux-tu m'aider à planifier le chantier de la semaine prochaine ?"))
+        await waitForTitle(manager)
+        XCTAssertEqual(manager.current?.title, "Planification du chantier")
+        let requests = await probe.count()
+        XCTAssertEqual(requests, 1, "The title request must run exactly once")
+        XCTAssertEqual(manager.current?.titleGeneratedFor, manager.current?.messages.first?.id)
+    }
+
+    func testFailureKeepsTheFallbackAndDoesNotRetry() async {
+        let probe = Probe()
+        let services = isolatedServices(load: { self.session() },
+            localAvailability: { nil },
+            localRespond: { _, _, output in await output("Réponse") },
+            summarizeTitle: { _, prompt in
+                await probe.record(prompt)
+                throw APIError.invalidResponse
+            })
+        let manager = ConversationManager(services: services)
+        await manager.restore(loadRemoteModels: false)
+        manager.models = [LocalModel.option]
+        manager.selectedModel = LocalModel.id
+        XCTAssertTrue(manager.send("Premier message utilisateur"))
+        await waitForTitle(manager)
+        XCTAssertEqual(manager.current?.title, "Premier message utilisateur")
+        XCTAssertTrue(manager.send("Deuxième message"))
+        for _ in 0..<200 where manager.isStreaming { await Task.yield() }
+        let attempts = await probe.count()
+        XCTAssertEqual(attempts, 1, "A failed attempt must not be repeated on later turns")
+    }
+
+    func testRequestIsBoundedAndCarriesTheUserPrompt() async {
+        let probe = Probe()
+        let long = String(repeating: "contexte ", count: 2_000)
+        let services = isolatedServices(load: { self.session() },
+            localAvailability: { nil },
+            localRespond: { _, _, output in await output("Réponse") },
+            summarizeTitle: { _, prompt in
+                await probe.record(prompt)
+                return "Titre court"
+            })
+        let manager = ConversationManager(services: services)
+        await manager.restore(loadRemoteModels: false)
+        manager.models = [LocalModel.option]
+        manager.selectedModel = LocalModel.id
+        XCTAssertTrue(manager.send(long))
+        await waitForTitle(manager)
+        let prompt = await probe.first() ?? ""
+        XCTAssertTrue(prompt.contains(ConversationTitle.instructions))
+        XCTAssertLessThanOrEqual(prompt.count, ConversationTitle.maximumInputCharacters + ConversationTitle.instructions.count + 64)
+    }
+
+    func testLateSummaryNeverOverwritesATitleTheUserAlreadySettled() async {
+        let recorder = TitleGate()
+        let services = isolatedServices(load: { self.session() },
+            localAvailability: { nil },
+            localRespond: { _, _, output in await output("Réponse") },
+            summarizeTitle: { _, _ in await recorder.waitForRelease(); return "Titre tardif" })
+        let manager = ConversationManager(services: services)
+        await manager.restore(loadRemoteModels: false)
+        manager.models = [LocalModel.option]
+        manager.selectedModel = LocalModel.id
+        XCTAssertTrue(manager.send("Message initial"))
+        // Wait until the background request is actually suspended in the model call.
+        while !(await recorder.started) { await Task.yield() }
+        // A title settled during the in-flight request must win.
+        let id = manager.current!.id
+        let index = manager.conversations.firstIndex { $0.id == id }!
+        manager.conversations[index].title = "Titre manuel"
+        await recorder.finish()
+        await waitForTitle(manager)
+        XCTAssertEqual(manager.current?.title, "Titre manuel")
+    }
+}
+
+@MainActor final class InternetConsentTests: XCTestCase {
+    actor FetchRecorder {
+        var count = 0
+        func fetch(_ url: URL, _ method: String) -> LocalWebResponse {
+            count += 1
+            return LocalWebResponse(url: url, status: 200, contentType: "text/plain", text: "Public information")
+        }
+    }
+    private func waitForPrompt(_ manager: ConversationManager) async {
+        for _ in 0..<2000 { if manager.internetApproval != nil || !manager.isStreaming { break }; await Task.yield() }
+    }
+    private func waitForCompletion(_ manager: ConversationManager) async {
+        for _ in 0..<2000 { if !manager.isStreaming { break }; await Task.yield() }
+    }
+    func testAllowAsksOnceAcrossToolCallsAndTurnsAndPersists() async throws {
+        var storage: Data?
+        let fetched = FetchRecorder()
+        var services = isolatedServices(writeHistory: { data, _ in storage = data },
+            readLocalHistory: { _ in guard let storage else { throw CocoaError(.fileReadNoSuchFile) }; return storage },
+            localAvailability: { nil })
+        services.localRespond = { _, workspace, output in
+            for url in ["https://example.com/one", "https://example.org/two"] {
+                _ = try await workspace.execute(action: "fetch_website", query: url, documentID: "", text: "", lhs: 0, rhs: 0)
+            }
+            await output("Finished")
+        }
+        services.webFetch = { await fetched.fetch($0, $1) }
+        let manager = ConversationManager(services: services)
+        await manager.restore()
+        XCTAssertTrue(manager.send("Consulte deux sites"))
+        await waitForPrompt(manager)
+        XCTAssertNotNil(manager.internetApproval)
+        let before = await fetched.count
+        XCTAssertEqual(before, 0, "No HTTP request before consent")
+        manager.resolveInternetApproval(allow: true)
+        await waitForCompletion(manager)
+        XCTAssertFalse(manager.isStreaming)
+        XCTAssertNil(manager.internetApproval)
+        XCTAssertEqual(manager.current?.internetPermission, .allowed)
+        XCTAssertTrue(manager.send("Encore"))
+        await waitForCompletion(manager)
+        XCTAssertNil(manager.internetApproval)
+        let after = await fetched.count
+        XCTAssertEqual(after, 4)
+        let restored = ConversationManager(services: services)
+        await restored.restore()
+        XCTAssertEqual(restored.conversations.first?.internetPermission, .allowed)
+        manager.newConversation()
+        XCTAssertTrue(manager.send("Autre conversation"))
+        await waitForPrompt(manager)
+        XCTAssertNotNil(manager.internetApproval)
+        manager.stop()
+    }
+    func testDenyIsRememberedAndNoRequestsAreMade() async throws {
+        var services = isolatedServices(localAvailability: { nil }, localRespond: { _, workspace, output in
+            let result = try await workspace.execute(action: "fetch_website", query: "https://example.com", documentID: "", text: "", lhs: 0, rhs: 0)
+            await output(result)
+        })
+        services.webFetch = { _, _ in XCTFail("Denied conversation must never fetch"); throw APIError.invalidResponse }
+        let manager = ConversationManager(services: services)
+        await manager.restore()
+        XCTAssertTrue(manager.send("Consulte ce site"))
+        await waitForPrompt(manager)
+        XCTAssertNotNil(manager.internetApproval)
+        manager.resolveInternetApproval(allow: false)
+        await waitForCompletion(manager)
+        XCTAssertEqual(manager.current?.internetPermission, .denied)
+        XCTAssertTrue(manager.send("Essaie encore"))
+        await waitForCompletion(manager)
+        XCTAssertNil(manager.internetApproval)
+        XCTAssertFalse(manager.isStreaming)
+        XCTAssertTrue(manager.current?.messages.last?.content.contains("refusé") == true)
+    }
+    func testStopDismissesPendingConsentWithoutPersistingADecision() async {
+        let manager = ConversationManager(services: isolatedServices(localAvailability: { nil }, localRespond: { _, workspace, output in
+            _ = try await workspace.execute(action: "fetch_website", query: "https://example.com", documentID: "", text: "", lhs: 0, rhs: 0)
+            await output("Should not appear")
+        }))
+        await manager.restore()
+        XCTAssertTrue(manager.send("Consulte ce site"))
+        await waitForPrompt(manager)
+        XCTAssertNotNil(manager.internetApproval)
+        manager.stop()
+        await waitForCompletion(manager)
+        XCTAssertNil(manager.internetApproval)
+        XCTAssertNil(manager.current?.internetPermission)
+        XCTAssertEqual(manager.current?.messages.last?.completion, .stopped)
+    }
+    func testPermissionDoesNotTravelThroughServerHistory() throws {
+        let conversation = Conversation(internetPermission: .allowed, model: LocalModel.id)
+        var snapshot = AccountHistorySnapshot(accountId: "fixture", revision: 0, conversations: [])
+        var ids: [String: UUID] = [:]
+        try snapshot.store(conversation, serverID: conversation.id.uuidString, messageIDs: &ids)
+        let restored = try snapshot.projectedConversation(at: 0, id: conversation.id, messageIDs: &ids)
+        XCTAssertNil(restored.internetPermission)
+    }
+    func testConcurrentCallsShareOneApprovalAndPersistFailureNeverAllowsNetwork() async {
+        var failWrites = false
+        var services = isolatedServices(writeHistory: { _, _ in if failWrites { throw CocoaError(.fileWriteOutOfSpace) } },
+            localAvailability: { nil }, localRespond: { _, workspace, output in
+                async let first = workspace.execute(action: "fetch_website", query: "https://example.com/a", documentID: "", text: "", lhs: 0, rhs: 0)
+                async let second = workspace.execute(action: "fetch_website", query: "https://example.com/b", documentID: "", text: "", lhs: 0, rhs: 0)
+                let values = try await [first, second]
+                await output(values.joined(separator: "\n"))
+            })
+        services.webFetch = { _, _ in XCTFail("Unsaved approval cannot authorize HTTP"); throw APIError.invalidResponse }
+        let manager = ConversationManager(services: services)
+        await manager.restore()
+        XCTAssertTrue(manager.send("Deux pages"))
+        await waitForPrompt(manager)
+        let requestID = manager.internetApproval?.id
+        for _ in 0..<30 { await Task.yield() }
+        XCTAssertEqual(manager.internetApproval?.id, requestID)
+        failWrites = true
+        manager.resolveInternetApproval(allow: true)
+        await waitForCompletion(manager)
+        XCTAssertNil(manager.internetApproval)
+        XCTAssertNil(manager.current?.internetPermission)
+        XCTAssertFalse(manager.isStreaming)
+    }
+    func testHTTPPolicyAndHTMLExtraction() throws {
+        for url in ["http://example.com", "file:///etc/passwd", "https://user:pass@example.com", "https://127.0.0.1", "https://192.168.1.149", "https://device.local", "https://localhost", "https://[::1]", "https://example.com:8200"] {
+            XCTAssertThrowsError(try LocalWebFetch.validatedURL(url), url)
+        }
+        XCTAssertEqual(try LocalWebFetch.validatedURL("https://example.com/page?q=hello").host, "example.com")
+        let text = LocalWebFetch.readableHTML("<html><script>secret()</script><style>hidden</style><p>Hello &amp; world</p></html>")
+        XCTAssertEqual(text, "Hello & world")
+    }
+}
+
+final class PublicWebFetchDeviceTests: XCTestCase {
+    func testNativeHTTPSGetAndHeadReadPublicWebsite() async throws {
+        #if targetEnvironment(simulator)
+        throw XCTSkip("Public HTTP integration is exercised on the physical device")
+        #else
+        let url = try LocalWebFetch.validatedURL("https://example.com")
+        let get = try await LocalWebFetch.fetch(url: url, method: "GET")
+        XCTAssertEqual(get.status, 200)
+        XCTAssertTrue(get.text.contains("Example Domain"))
+        XCTAssertFalse(get.text.contains("<html"))
+        let head = try await LocalWebFetch.fetch(url: url, method: "HEAD")
+        XCTAssertEqual(head.status, 200)
+        XCTAssertTrue(head.text.contains("Content-Type:"))
+        #endif
+    }
+}
+
+@MainActor private final class OfflineFixtureRefreshGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    func wait() async { await withCheckedContinuation { continuation = $0 } }
+    func release() { continuation?.resume(); continuation = nil }
+}

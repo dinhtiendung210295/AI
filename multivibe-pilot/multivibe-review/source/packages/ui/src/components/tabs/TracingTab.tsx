@@ -1,0 +1,758 @@
+import { TraceRangePicker } from "../TraceRangePicker";
+import React, { useState } from "react";
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Cell,
+  Legend,
+  Line,
+  LineChart,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import { TTFT_BUCKET_ORDER, TTFT_CONTEXT_LABELS, fmt, formatLatency, metricCount, formatTokenCount, formatTokenRate, maskEmail, maskId, pct, routeLabel, usd } from "../../lib/ui";
+import type { TtftBucket } from "../../lib/ui";
+import { HostHarnessCards } from "../../host/HostHarnessCarousel";
+import {
+  runtimeIdentityForAccount,
+  runtimeIdentityForProvider,
+} from "../../lib/runtimeCatalog";
+import { Metric } from "../Metric";
+import { TtftComparisonChart } from "../TtftComparisonChart";
+import { WidgetGrid } from "../WidgetGrid";
+import { TracingSessions } from "./TracingSessions";
+import type { ActivityView, Account, ProjectUsageStats, SessionTurn, SessionsResponse, StoreSettings, Trace, TracePagination, TraceRange, TraceStats } from "../../types";
+
+type Props = {
+  accounts: Account[];
+  traceStats: TraceStats;
+  traceStatsLoading: boolean;
+  tokensTimeseries: Array<any>;
+  modelChartData: Array<any>;
+  modelCostChartData: Array<any>;
+  tracePagination: TracePagination;
+  gotoTracePage: (page: number) => Promise<void>;
+  traceRange: TraceRange;
+  setTraceRange: (range: TraceRange) => void;
+  exportTracesZip: () => Promise<void>;
+  traceExportInProgress: boolean;
+  traces: Trace[];
+  projectUsageStats: ProjectUsageStats;
+  sessionStats: SessionsResponse;
+  sessionStatsLoading: boolean;
+  expandedSessionKey: string | null;
+  sessionTurns: SessionTurn[];
+  sessionTurnsLoading: boolean;
+  sessionTurnsTotal?: number;
+  sessionTurnsOffset?: number;
+  loadSessionTurnsPage?: (offset: number) => void;
+  toggleSession: (sessionKey: string) => void;
+  expandedTraceId: string | null;
+  expandedTrace: Trace | null;
+  expandedTraceLoading: boolean;
+  toggleExpandedTrace: (id: string) => Promise<void>;
+  sanitized: boolean;
+  settings: StoreSettings;
+  patchSettings: (body: Partial<StoreSettings>) => Promise<void>;
+  activeView?: ActivityView;
+  onActiveViewChange?: (view: ActivityView) => void;
+};
+
+function formatTtftDuration(value: number): string {
+  if (!Number.isFinite(value) || value < 0) return "—";
+  if (value >= 10_000) return `${(value / 1000).toFixed(value >= 100_000 ? 0 : 1)}s`;
+  return `${Math.round(value)}ms`;
+}
+
+export function TtftLatencyBoard({ traceStats }: { traceStats: TraceStats }) {
+  const groups = traceStats.ttftByProviderModel;
+  const activeBucket = groups.some((group) => group.inputTokenBucket === "1k-8k")
+    ? "1k-8k"
+    : TTFT_BUCKET_ORDER.find((bucket) => groups.some((group) => group.inputTokenBucket === bucket)) ?? "1k-8k";
+  const [selectedBucket, setSelectedBucket] = useState<TtftBucket>(activeBucket);
+  const selectedGroups = groups.filter((group) => group.inputTokenBucket === selectedBucket);
+  const [chartView, setChartView] = useState<"range" | "line">("range");
+  const chartRows = [...selectedGroups].sort((a, b) =>
+    a.ttftP50Ms - b.ttftP50Ms || a.provider.localeCompare(b.provider) || a.model.localeCompare(b.model));
+  const scaleMax = Math.max(2_000, ...selectedGroups.map((group) => group.ttftP95Ms));
+  const totalSamples = selectedGroups.reduce((sum, group) => sum + group.samples, 0);
+  const fastest = selectedGroups.reduce((fastest, group) => Math.min(fastest, group.ttftP50Ms), Number.POSITIVE_INFINITY);
+  const lowSamples = selectedGroups.filter((group) => group.confidence === "low").length;
+  const bucketCounts = TTFT_BUCKET_ORDER.map((bucket) => ({
+    bucket,
+    label: TTFT_CONTEXT_LABELS[bucket],
+    samples: groups.filter((group) => group.inputTokenBucket === bucket).reduce((sum, group) => sum + group.samples, 0),
+  })).filter((entry) => entry.samples > 0);
+
+  React.useEffect(() => {
+    if (groups.length && !groups.some((group) => group.inputTokenBucket === selectedBucket)) {
+      setSelectedBucket(activeBucket);
+    }
+  }, [activeBucket, groups, selectedBucket]);
+
+  if (!groups.length) {
+    return (
+      <section className="panel ttft-board">
+        <div className="section-split-header">
+          <div>
+            <h2>Time to first token</h2>
+          </div>
+          <span className="badge">No measurements</span>
+        </div>
+        <div className="ttft-empty">No measured TTFT in this range yet.</div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="panel ttft-board">
+      <div className="section-split-header">
+        <div>
+          <h2>Time to first token</h2>
+        </div>
+        <div className="ttft-context-picker" role="tablist" aria-label="Input context range">
+          {bucketCounts.map(({ bucket, label, samples }) => (
+            <button
+              key={bucket}
+              type="button"
+              role="tab"
+              aria-selected={bucket === selectedBucket}
+              className={`ttft-context-pill${bucket === selectedBucket ? " active" : ""}`}
+              onClick={() => setSelectedBucket(bucket)}
+            >
+              <span>{label}</span>
+              <small>{samples}</small>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="ttft-kpis" aria-label="Selected context summary">
+        <div><small>Models</small><strong>{new Set(selectedGroups.map((row) => `${row.provider}:${row.model}`)).size}</strong></div>
+        <div><small>Requests</small><strong>{totalSamples.toLocaleString()}</strong></div>
+        <div><small>Fastest p50</small><strong>{Number.isFinite(fastest) ? formatTtftDuration(fastest) : "—"}</strong></div>
+        <div><small>Scale</small><strong>0–{formatTtftDuration(scaleMax)}</strong></div>
+        <div><small>Low confidence</small><strong>{lowSamples}</strong></div>
+      </div>
+
+      <div className="ttft-chart-toolbar">
+        <span className="muted">{chartView === "range" ? "Range chart" : "Line chart"} · Models ordered by p50</span>
+        <div className="ttft-view-switch" role="group" aria-label="TTFT chart view">
+          <button type="button" className={`btn ghost icon-button${chartView === "range" ? " active" : ""}`}
+            aria-label="Range chart" title="Range chart" aria-pressed={chartView === "range"} onClick={() => setChartView("range")}>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M8 12h12M3 18h12M4 3v6M8 9v6M3 15v6M14 3v6M20 9v6M15 15v6" /></svg>
+          </button>
+          <button type="button" className={`btn ghost icon-button${chartView === "line" ? " active" : ""}`}
+            aria-label="Line chart" title="Line chart" aria-pressed={chartView === "line"} onClick={() => setChartView("line")}>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3v18h18M6 15l4-6 5 3 6-7" /></svg>
+          </button>
+        </div>
+      </div>
+      {chartRows.length ? (
+        <TtftComparisonChart rows={chartRows} scaleMax={scaleMax} view={chartView} />
+      ) : (
+        <div className="ttft-empty">No measured TTFT in {TTFT_CONTEXT_LABELS[selectedBucket]} in this range yet.</div>
+      )}
+
+    </section>
+  );
+}
+
+function TtftLatencyDetails({ traceStats }: { traceStats: TraceStats }) {
+  return (
+    <section className="panel ttft-details-panel">
+      <details className="ttft-details">
+        <summary>Full TTFT metrics and rankings</summary>
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr><th>Rank</th><th>Provider</th><th>Model</th><th>Input bucket</th><th>Samples</th><th>p50 TTFT</th><th>p95 TTFT</th><th>Median input</th><th>Cached input</th><th>Confidence</th></tr>
+            </thead>
+            <tbody>
+              {traceStats.ttftByProviderModel.map((group) => {
+                const runtimeIdentity = runtimeIdentityForProvider(group.provider);
+                return (
+                  <tr key={`${group.provider}:${group.model}:${group.inputTokenBucket}`}>
+                    <td>{group.rank ?? "—"}</td>
+                    <td>
+                      <span className="provider-badge">
+                        <img className="provider-icon" src={runtimeIdentity.iconUrl} alt="" loading="lazy" />
+                        {runtimeIdentity.label}
+                      </span>
+                    </td>
+                    <td className="mono">{group.model}</td>
+                    <td>{TTFT_CONTEXT_LABELS[group.inputTokenBucket as TtftBucket] ?? "Unknown"}</td>
+                    <td>{group.samples}</td>
+                    <td>{formatTtftDuration(group.ttftP50Ms)}</td>
+                    <td>{formatTtftDuration(group.ttftP95Ms)}</td>
+                    <td>{group.medianInputTokens === undefined ? "—" : formatTokenCount(group.medianInputTokens)}</td>
+                    <td>{group.cachedInputRatio === undefined ? "—" : pct(group.cachedInputRatio)}</td>
+                    <td><span className={group.confidence === "low" ? "badge badge-warn" : "badge badge-live"}>{group.confidence === "low" ? "Low" : "Sufficient"}</span></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </details>
+    </section>
+  );
+}
+
+export function TracingTab(props: Props) {
+  return <TracingTabContent {...props} />;
+}
+
+function TracingTabContent(props: Props) {
+  const {
+    accounts,
+    traceStats,
+    traceStatsLoading,
+    tokensTimeseries,
+    modelChartData,
+    modelCostChartData,
+    tracePagination,
+    gotoTracePage,
+    traceRange,
+    setTraceRange,
+    exportTracesZip,
+    traceExportInProgress,
+    traces,
+    projectUsageStats,
+    sessionStats,
+    sessionStatsLoading,
+    expandedSessionKey,
+    sessionTurns,
+    sessionTurnsLoading,
+    sessionTurnsTotal,
+    sessionTurnsOffset,
+    loadSessionTurnsPage,
+    toggleSession,
+    expandedTraceId,
+    expandedTrace,
+    expandedTraceLoading,
+    toggleExpandedTrace,
+    sanitized,
+    settings,
+    patchSettings,
+  } = props;
+  const accountRuntimeById = React.useMemo(
+    () => new Map(accounts.map((account) => [account.id, runtimeIdentityForAccount(account)])),
+    [accounts],
+  );
+  const [sharingBusy, setSharingBusy] = React.useState(false);
+  const [sharingNotice, setSharingNotice] = React.useState<string | null>(null);
+
+  const setAnonymousUsageSharing = async (enabled: boolean) => {
+    setSharingBusy(true);
+    setSharingNotice(null);
+    try {
+      await patchSettings({ anonymousUsageSharingEnabled: enabled });
+      setSharingNotice(enabled ? "Anonymous model demand sharing is enabled for future usage." : "Sharing stopped and unsent data was deleted.");
+    } catch (error: any) {
+      setSharingNotice(error?.message ?? String(error));
+    } finally {
+      setSharingBusy(false);
+    }
+  };
+
+  const setCommunityBenchmarksSharing = async (enabled: boolean) => {
+    setSharingBusy(true);
+    setSharingNotice(null);
+    try {
+      await patchSettings({ communityBenchmarksSharingEnabled: enabled });
+      setSharingNotice(enabled
+        ? "Community benchmarks sharing is enabled. The first report covers the next completed day."
+        : "Community benchmarks sharing stopped and unsent data was deleted.");
+    } catch (error: any) {
+      setSharingNotice(error?.message ?? String(error));
+    } finally {
+      setSharingBusy(false);
+    }
+  };
+
+  const formatTokenChartValue = (value: number | string | null | undefined) => formatTokenCount(value == null ? null : Number(value));
+
+  const formatTooltipValue = (value: any) => formatTokenChartValue(value?.[0] ?? value);
+
+  const formatPieTokenLabel = ({ value }: { value?: number }) => formatTokenChartValue(value);
+  const chartColors = [
+    "var(--chart-1)",
+    "var(--chart-2)",
+    "var(--chart-3)",
+    "var(--chart-4)",
+    "var(--chart-5)",
+  ];
+  const accountSelectionSummary = traceStats.accountSelection;
+  const [localActiveView, setLocalActiveView] = React.useState<ActivityView>("overview");
+  const activeView = props.activeView ?? localActiveView;
+  const setActiveView = props.onActiveViewChange ?? setLocalActiveView;
+  const requestCount = traceStats.totals.requests;
+  const providerAttemptCount = traceStats.totals.upstreamAttempts;
+  const errorCount = traceStats.totals.errors;
+  const usageCoverage = providerAttemptCount > 0 ? traceStats.totals.requestsWithUsage / providerAttemptCount : 0;
+  const pricingCoverage = providerAttemptCount > 0 ? traceStats.totals.requestsWithCost / providerAttemptCount : 0;
+  const rangeLabel = typeof traceRange === "object"
+    ? `${traceRange.startDate} – ${traceRange.endDate}`
+    : traceRange === "24h"
+    ? "Last 24 hours"
+    : traceRange === "7d"
+      ? "Last 7 days"
+      : traceRange === "30d"
+        ? "Last 30 days"
+        : "All recorded time";
+  const viewOptions = [
+    { id: "overview" as const, label: "Overview", description: "Health and routing" },
+    { id: "performance" as const, label: "Performance", description: "Latency and TTFT" },
+    { id: "sessions" as const, label: "Sessions", description: "Contexts and cache" },
+    { id: "usage" as const, label: "Usage & cost", description: "Tokens and projects" },
+    { id: "requests" as const, label: "Requests", description: `${tracePagination.total} traces` },
+  ];
+
+  return (
+    <>
+      <section className="panel trace-workspace-header">
+        <div className="trace-workspace-toolbar">
+        <nav className="trace-view-tabs" role="tablist" aria-label="Tracing views">
+          {viewOptions.map((view) => (
+            <button
+              key={view.id}
+              type="button"
+              role="tab"
+              id={`trace-tab-${view.id}`}
+              aria-selected={activeView === view.id}
+              aria-controls={`trace-view-${view.id}`}
+              className={`trace-view-tab${activeView === view.id ? " active" : ""}`}
+              onClick={() => setActiveView(view.id)}
+            >
+              <strong>{view.label}</strong>
+              <small>{view.description}</small>
+            </button>
+          ))}
+        </nav>
+        <div className="trace-workspace-controls">
+          <div className="trace-range-controls">
+            <TraceRangePicker range={traceRange} onChange={setTraceRange} />
+            <button className="btn secondary trace-export-button" type="button" title="Export all recorded traces as a ZIP archive" onClick={() => void exportTracesZip()} disabled={traceExportInProgress}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M5 16v4h14v-4" /></svg>
+              <span>{traceExportInProgress ? "Exporting…" : "Export all"}</span>
+              <span className="trace-export-format">ZIP</span>
+            </button>
+          </div>
+        </div>
+        </div>
+        <div className="trace-sharing-setting">
+          <div className="trace-sharing-controls">
+            <label className="inline" htmlFor="anonymous-usage-sharing-enabled">
+              <input
+                id="anonymous-usage-sharing-enabled"
+                type="checkbox"
+                checked={settings.anonymousUsageSharingEnabled !== false}
+                disabled={sharingBusy}
+                aria-describedby="trace-sharing-summary"
+                onChange={(event) => void setAnonymousUsageSharing(event.target.checked)}
+              />
+              <span>Share anonymous demand</span>
+            </label>
+            <label className="inline" htmlFor="community-benchmarks-sharing-enabled">
+              <input
+                id="community-benchmarks-sharing-enabled"
+                type="checkbox"
+                checked={settings.communityBenchmarksSharingEnabled === true}
+                disabled={sharingBusy}
+                aria-describedby="trace-sharing-summary"
+                onChange={(event) => void setCommunityBenchmarksSharing(event.target.checked)}
+              />
+              <span>Share community benchmarks <small className="muted">(off by default)</small></span>
+            </label>
+          </div>
+          <p id="trace-sharing-summary" className="muted">
+            Anonymous daily totals. No prompts or responses. Turning off deletes unsent data.
+          </p>
+          <details className="trace-sharing-details">
+            <summary>Privacy details</summary>
+            <p id="anonymous-usage-sharing-description" className="muted">
+              MultiVibe shares only anonymous daily model usage totals—never your prompts, responses, or personal data.
+            </p>
+            <p id="community-benchmarks-description" className="muted">
+              Off by default. When enabled, MultiVibe reports one daily aggregate for this machine: the model IDs you ran
+              locally, request and token counts, latency and time-to-first-token distributions, the context sizes you used,
+              plus already-measured synthetic runtime benchmark results. It never includes prompts, responses, project or
+              account names, host names, serial numbers or an installation identifier. Your machine is reduced to a public
+              hardware profile before anything is stored, and results are published only in aggregate.
+            </p>
+          </details>
+          <span className="muted trace-sharing-notice" role="status" aria-live="polite">{sharingNotice}</span>
+        </div>
+      </section>
+
+      {activeView === "overview" && (
+        <div id="trace-view-overview" role="tabpanel" aria-labelledby="trace-tab-overview" className="trace-view-content">
+          <WidgetGrid storageKey="activity" label="Activity metrics">
+            <Metric loading={traceStatsLoading} widgetId="client-requests" title="Client requests" value={`${requestCount}`} detail={`${providerAttemptCount} provider attempts · ${rangeLabel}`} />
+            <Metric loading={traceStatsLoading} widgetId="client-error-rate" title="Client error rate" value={pct(traceStats.totals.errorRate)} detail={`${errorCount} final failures`} tone={traceStats.totals.errorRate > 0.05 ? "warning" : "default"} />
+            <Metric loading={traceStatsLoading} widgetId="avg-latency" title="Avg latency" value={formatLatency(traceStats.totals.latencyAvgMs)} detail="End-to-end response time" />
+            <Metric loading={traceStatsLoading} widgetId="total-cost" title={traceStats.totals.requestsWithCost < providerAttemptCount ? "Recorded cost" : "Total cost"} value={usd(traceStats.totals.costUsd)} detail={`No-cache estimate: ${usd(traceStats.totals.costUsdWithoutCache)} · ${traceStats.totals.requestsWithCost}/${providerAttemptCount} attempts priced · missing costs excluded`} tone={traceStats.totals.unpricedRequests > 0 ? "warning" : "default"} />
+          </WidgetGrid>
+
+          <section className="grid trace-overview-grid">
+            <section className="panel trace-quality-panel">
+              <div className="section-split-header">
+                <div>
+                  <h2>Data coverage</h2>
+                </div>
+                <span className={`badge ${requestCount > 0 && usageCoverage === 1 && pricingCoverage === 1 ? "badge-live" : "badge-warn"}`}>
+                  {requestCount === 0 ? "No data" : usageCoverage === 1 && pricingCoverage === 1 ? "Complete" : "Partial"}
+                </span>
+              </div>
+              <div className="trace-coverage-list">
+                <div className="trace-coverage-item">
+                  <div><strong>Token usage</strong><span>{traceStats.totals.requestsWithUsage} of {providerAttemptCount} provider attempts</span></div>
+                  <strong>{pct(usageCoverage)}</strong>
+                  <div className="trace-coverage-track"><span style={{ width: `${Math.min(100, usageCoverage * 100)}%` }} /></div>
+                </div>
+                <div className="trace-coverage-item">
+                  <div><strong>Cost pricing</strong><span>{traceStats.totals.requestsWithCost} of {providerAttemptCount} provider attempts</span></div>
+                  <strong>{pct(pricingCoverage)}</strong>
+                  <div className="trace-coverage-track"><span style={{ width: `${Math.min(100, pricingCoverage * 100)}%` }} /></div>
+                </div>
+              </div>
+              <dl className="trace-compact-stats">
+                <div><dt>Input tokens</dt><dd>{formatTokenCount(traceStats.totals.tokensInput)}</dd></div>
+                <div><dt>Output tokens</dt><dd>{formatTokenCount(traceStats.totals.tokensOutput)}</dd></div>
+                <div><dt>Inference speed</dt><dd>{formatTokenRate(traceStats.totals.inferenceTokensPerSecond)}</dd></div>
+                <div><dt>Unpriced</dt><dd>{traceStats.totals.unpricedRequests}</dd></div>
+              </dl>
+            </section>
+
+            <section className="panel trace-routing-panel">
+              <div className="section-split-header">
+                <div>
+                  <h2>Account routing</h2>
+                  <p className="muted">How the proxy selected and rotated accounts for this traffic.</p>
+                </div>
+                <span className="badge">{accountSelectionSummary.attempts} attempts</span>
+              </div>
+              <div className="trace-routing-summary">
+                <div><span>Account swaps</span><strong>{accountSelectionSummary.rotations}</strong><small>Moved to another account</small></div>
+                <div><span>Sticky</span><strong>{accountSelectionSummary.reasonCounts.sticky}</strong><small>Session affinity kept</small></div>
+                <div><span>Quota-led</span><strong>{accountSelectionSummary.reasonCounts["quota-headroom"]}</strong><small>Selected by headroom</small></div>
+                <div><span>Avg headroom</span><strong>{typeof accountSelectionSummary.averageHeadroom === "number" ? `${Math.round(accountSelectionSummary.averageHeadroom)}%` : "—"}</strong><small>Max near-limit: {accountSelectionSummary.maxNearLimit}</small></div>
+              </div>
+              <div className="trace-routing-notes">
+                <span>Policy preferred <strong>{accountSelectionSummary.reasonCounts["policy-preferred"]}</strong></span>
+                <span>Quota headroom <strong>{accountSelectionSummary.reasonCounts["quota-headroom"]}</strong></span>
+                <span>Retried requests <strong>{metricCount(traceStats.totals.retriedRequests)}</strong></span>
+                <span>Recovered retries <strong>{metricCount(traceStats.totals.recoveredRequests)}</strong></span>
+              </div>
+            </section>
+          </section>
+        </div>
+      )}
+
+      {activeView === "performance" && (
+        <div id="trace-view-performance" role="tabpanel" aria-labelledby="trace-tab-performance" className="trace-view-content">
+          <TtftLatencyBoard traceStats={traceStats} />
+          <TtftLatencyDetails traceStats={traceStats} />
+
+          <section className="grid cards2 trace-chart-grid">
+            <section className="panel">
+              <div className="section-split-header">
+                <div><h2>End-to-end latency</h2><p className="muted">Median and tail response time by hour.</p></div>
+                <span className="badge">p50 / p95</span>
+              </div>
+              <div className="chart-wrap">
+                <ResponsiveContainer width="100%" height={260}>
+                  <LineChart data={tokensTimeseries}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" />
+                    <XAxis dataKey="label" minTickGap={24} />
+                    <YAxis />
+                    <Tooltip />
+                    <Legend />
+                    <Line isAnimationActive={false} type="monotone" dataKey="latencyP50Ms" name="p50" stroke="var(--chart-3)" strokeWidth={2} dot={false} />
+                    <Line isAnimationActive={false} type="monotone" dataKey="latencyP95Ms" name="p95" stroke="var(--danger)" strokeWidth={2} dot={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </section>
+            <section className="panel">
+              <div className="section-split-header">
+                <div><h2>Inference speed</h2><p className="muted">Output tokens divided by full request duration.</p></div>
+                <span className="badge">tokens / second</span>
+              </div>
+              <div className="chart-wrap">
+                <ResponsiveContainer width="100%" height={260}>
+                  <LineChart data={tokensTimeseries}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" />
+                    <XAxis dataKey="label" minTickGap={24} />
+                    <YAxis tickFormatter={formatTokenRate} />
+                    <Tooltip formatter={(value: any) => formatTokenRate(Number(value) || 0)} />
+                    <Legend />
+                    <Line isAnimationActive={false} type="monotone" dataKey="inferenceTokensPerSecond" name="tokens/s" stroke="var(--accent)" strokeWidth={2} dot={false} connectNulls={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </section>
+            <section className="panel">
+              <div className="section-split-header">
+                <div><h2>Error trend</h2><p className="muted">Failures shown against total request volume.</p></div>
+                <span className={`badge ${errorCount > 0 ? "badge-warn" : "badge-live"}`}>{errorCount} errors</span>
+              </div>
+              <div className="chart-wrap">
+                <ResponsiveContainer width="100%" height={260}>
+                  <LineChart data={tokensTimeseries}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" />
+                    <XAxis dataKey="label" minTickGap={24} />
+                    <YAxis />
+                    <Tooltip />
+                    <Legend />
+                    <Line isAnimationActive={false} type="monotone" dataKey="errors" name="errors" stroke="var(--danger)" strokeWidth={2} dot={false} />
+                    <Line isAnimationActive={false} type="monotone" dataKey="requests" name="requests" stroke="var(--chart-4)" strokeWidth={2} dot={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </section>
+            <section className="panel">
+              <div className="section-split-header">
+                <div><h2>Token traffic</h2><p className="muted">Input and generated volume by hour.</p></div>
+                <span className="badge">hourly</span>
+              </div>
+              <div className="chart-wrap">
+                <ResponsiveContainer width="100%" height={260}>
+                  <LineChart data={tokensTimeseries}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" />
+                    <XAxis dataKey="label" minTickGap={24} />
+                    <YAxis tickFormatter={formatTokenChartValue} />
+                    <Tooltip formatter={formatTooltipValue} />
+                    <Legend />
+                    <Line isAnimationActive={false} type="monotone" dataKey="tokensInput" name="input" stroke="var(--chart-1)" strokeWidth={2} dot={false} />
+                    <Line isAnimationActive={false} type="monotone" dataKey="tokensOutput" name="output" stroke="var(--chart-2)" strokeWidth={2} dot={false} />
+                    <Line isAnimationActive={false} type="monotone" dataKey="tokensTotal" name="total" stroke="var(--chart-3)" strokeWidth={2} dot={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </section>
+          </section>
+        </div>
+      )}
+
+      {activeView === "sessions" && (
+        <div id="trace-view-sessions" role="tabpanel" aria-labelledby="trace-tab-sessions" className="trace-view-content">
+          <TracingSessions
+            sessionStats={sessionStats}
+            sessionStatsLoading={sessionStatsLoading}
+            expandedSessionKey={expandedSessionKey}
+            sessionTurns={sessionTurns}
+            sessionTurnsLoading={sessionTurnsLoading}
+            sessionTurnsTotal={sessionTurnsTotal}
+            sessionTurnsOffset={sessionTurnsOffset}
+            loadSessionTurnsPage={loadSessionTurnsPage}
+            toggleSession={toggleSession}
+          />
+        </div>
+      )}
+
+      {activeView === "usage" && (
+        <div id="trace-view-usage" role="tabpanel" aria-labelledby="trace-tab-usage" className="trace-view-content">
+          <WidgetGrid storageKey="activity-usage" label="Usage metrics">
+            <Metric loading={traceStatsLoading} widgetId="input-tokens" title="Input tokens" value={formatTokenCount(traceStats.totals.tokensInput)} detail={`${traceStats.totals.requestsWithUsage}/${providerAttemptCount} attempts measured`} tone={usageCoverage < 1 ? "warning" : "default"} />
+            <Metric loading={traceStatsLoading} widgetId="output-tokens" title="Output tokens" value={formatTokenCount(traceStats.totals.tokensOutput)} detail="Generated by providers" />
+            <Metric loading={traceStatsLoading} widgetId="total-cost" title={traceStats.totals.requestsWithCost < providerAttemptCount ? "Recorded cost" : "Total cost"} value={usd(traceStats.totals.costUsd)} detail={`No-cache estimate: ${usd(traceStats.totals.costUsdWithoutCache)} · ${traceStats.totals.requestsWithCost}/${providerAttemptCount} attempts priced · missing costs excluded`} tone={pricingCoverage < 1 ? "warning" : "default"} />
+            <Metric loading={traceStatsLoading} widgetId="inference-speed" title="Inference speed" value={formatTokenRate(traceStats.totals.inferenceTokensPerSecond)} detail={`${metricCount(traceStats.totals.inferenceRequests)} measurable requests`} />
+          </WidgetGrid>
+
+          <section className="grid cards2 trace-chart-grid">
+            <section className="panel">
+              <div className="section-split-header"><div><h2>Cost over time</h2><p className="muted">Hourly spend across all priced requests.</p></div><span className="badge">USD</span></div>
+              <div className="chart-wrap">
+                <ResponsiveContainer width="100%" height={260}>
+                  <LineChart data={tokensTimeseries}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" />
+                    <XAxis dataKey="label" minTickGap={24} />
+                    <YAxis />
+                    <Tooltip formatter={(v: any) => usd(Number(v) || 0)} />
+                    <Legend />
+                    <Line isAnimationActive={false} type="monotone" dataKey="costUsd" name="cost usd" stroke="var(--chart-3)" strokeWidth={2} dot={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </section>
+            <section className="panel">
+              <div className="section-split-header"><div><h2>Cost by model</h2><p className="muted">Models ranked by estimated spend.</p></div><span className="badge">USD</span></div>
+              <div className="chart-wrap">
+                <ResponsiveContainer width="100%" height={260}>
+                  <BarChart data={modelCostChartData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" />
+                    <XAxis dataKey="label" interval={0} angle={-15} textAnchor="end" height={56} />
+                    <YAxis />
+                    <Tooltip formatter={(v: any) => usd(Number(v) || 0)} />
+                    <Legend />
+                    <Bar isAnimationActive={false} dataKey="costUsd" name="cost usd" fill="var(--chart-3)" radius={[5, 5, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </section>
+            <section className="panel">
+              <div className="section-split-header"><div><h2>Provider attempts by model</h2><p className="muted">Which models handled the most upstream attempts.</p></div><span className="badge">attempts</span></div>
+              <div className="chart-wrap">
+                <ResponsiveContainer width="100%" height={260}>
+                  <BarChart data={modelChartData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" />
+                    <XAxis dataKey="label" interval={0} angle={-15} textAnchor="end" height={56} />
+                    <YAxis />
+                    <Tooltip />
+                    <Legend />
+                    <Bar isAnimationActive={false} dataKey="count" name="attempts" fill="var(--chart-1)" radius={[5, 5, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </section>
+            <section className="panel">
+              <div className="section-split-header"><div><h2>Token share by model</h2><p className="muted">How total token volume is distributed.</p></div><span className="badge">tokens</span></div>
+              <div className="chart-wrap">
+                <ResponsiveContainer width="100%" height={260}>
+                  <PieChart>
+                    <Pie isAnimationActive={false} data={modelChartData} dataKey="tokensTotal" nameKey="label" outerRadius={90} label={formatPieTokenLabel}>
+                      {modelChartData.map((entry, idx) => (
+                        <Cell key={`${entry.label}-${idx}`} fill={chartColors[idx % chartColors.length]} />
+                      ))}
+                    </Pie>
+                    <Tooltip formatter={(value: any) => formatTokenChartValue(value)} />
+                    <Legend />
+                  </PieChart>
+                </ResponsiveContainer>
+              </div>
+            </section>
+          </section>
+
+          <HostHarnessCards />
+          <section className="panel trace-project-panel">
+            <div className="section-split-header">
+              <div><h2>Usage by project</h2><p className="muted">Codex-attributed consumption with model-level details on demand.</p></div>
+              <div className="project-attribution-actions">
+                <span className="badge">Codex session attribution</span>
+
+              </div>
+            </div>
+            <div className="table-wrap">
+              <table className="data-table">
+                <thead>
+                  <tr><th>Project</th><th>Attempts</th><th>Attempt errors</th><th>Input tokens</th><th>Output tokens</th><th>Total tokens</th><th>Cost</th><th>Avg latency</th><th>p95 latency</th></tr>
+                </thead>
+                <tbody>
+                  {projectUsageStats.byProject.map((project) => (
+                    <React.Fragment key={project.projectId}>
+                      <tr>
+                        <td>
+                          <div className="mono">{project.projectId === "unattributed" ? "Unattributed" : sanitized ? "*" : project.projectName ?? project.projectId}</div>
+                          {!sanitized && project.projectRemote && <div className="muted mono">{project.projectRemote}</div>}
+                          <div className="muted">{project.requestsWithCost}/{project.requests} priced attempts</div>
+                        </td>
+                        <td>{project.requests}</td><td>{project.errors}</td><td>{formatTokenCount(project.tokens.input)}</td><td>{formatTokenCount(project.tokens.output)}</td><td>{formatTokenCount(project.tokens.total)}</td><td>{usd(project.costUsd)}</td><td>{formatLatency(project.avgLatencyMs)}</td><td>{formatLatency(project.latencyP95Ms)}</td>
+                      </tr>
+                      <tr className="project-model-details-row">
+                        <td colSpan={9}>
+                          <details>
+                            <summary>{project.models.length} model{project.models.length === 1 ? "" : "s"} — usage and cost details</summary>
+                            <div className="table-wrap project-model-table-wrap">
+                              <table className="data-table project-model-table">
+                                <thead><tr><th>Model</th><th>Attempts</th><th>Attempt errors</th><th>Input</th><th>Cached input</th><th>Output</th><th>Total</th><th>Cost</th><th>Avg latency</th><th>p50</th><th>p95</th></tr></thead>
+                                <tbody>
+                                  {project.models.map((model) => (
+                                    <tr key={model.model}>
+                                      <td className="mono">{model.model}</td><td>{model.requests}</td><td>{model.errors}</td><td>{formatTokenCount(model.tokens.input)}</td><td>{formatTokenCount(model.tokens.cachedInput)}</td><td>{formatTokenCount(model.tokens.output)}</td><td>{formatTokenCount(model.tokens.total)}</td>
+                                      <td>{usd(model.costUsd)}<div className="muted">{model.requestsWithCost}/{model.requests} priced attempts</div></td>
+                                      <td>{formatLatency(model.avgLatencyMs)}</td><td>{formatLatency(model.latencyP50Ms)}</td><td>{formatLatency(model.latencyP95Ms)}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          </details>
+                        </td>
+                      </tr>
+                    </React.Fragment>
+                  ))}
+                  {!projectUsageStats.byProject.length && <tr><td colSpan={9} className="muted">No project-attributed usage in this range.</td></tr>}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {activeView === "requests" && (
+        <div id="trace-view-requests" role="tabpanel" aria-labelledby="trace-tab-requests" className="trace-view-content">
+          <section className="panel trace-request-panel">
+            <div className="section-split-header trace-request-header">
+              <div>
+                <h2>Recorded requests</h2>
+                <p className="muted">Newest first · select Inspect for the full trace.</p>
+              </div>
+              <div className="trace-pagination" aria-label="Trace pages">
+                <button className="btn ghost" onClick={() => void gotoTracePage(tracePagination.page - 1)} disabled={!tracePagination.hasPrev} aria-label="Previous trace page">Previous</button>
+                <span><strong>{tracePagination.total}</strong> traces · Page {tracePagination.page} of {tracePagination.totalPages}</span>
+                <button className="btn ghost" onClick={() => void gotoTracePage(tracePagination.page + 1)} disabled={!tracePagination.hasNext} aria-label="Next trace page">Next</button>
+              </div>
+            </div>
+            <div className="table-wrap">
+              <table className="data-table trace-request-table">
+                <thead><tr><th>Request</th><th>Source</th><th>Target</th><th>Outcome</th><th>Performance</th><th>Usage</th><th><span className="sr-only">Details</span></th></tr></thead>
+                <tbody>
+                  {traces.map((t) => {
+                    const isExpanded = expandedTraceId === t.id;
+                    const rowCost = t.costUsd;
+                    const provider = t.provider ?? (t.accountId ? accounts.find((account) => account.id === t.accountId)?.provider : undefined);
+                    const runtimeIdentity = t.accountId
+                      ? accountRuntimeById.get(t.accountId)
+                      : undefined;
+                    const targetIdentity = runtimeIdentity ?? runtimeIdentityForProvider(provider);
+                    const accountLabel = sanitized ? maskEmail(t.accountEmail) || maskId(t.accountId) : t.accountEmail ?? t.accountId ?? "—";
+                    const modelLabel = t.requestedModel && t.resolvedModel ? `${t.requestedModel} → ${t.resolvedModel}` : (t.model ?? "—");
+                    const hasError = t.isError || t.status >= 400;
+                    return (
+                      <React.Fragment key={t.id}>
+                        <tr className={`trace-row${hasError ? " trace-row-error" : ""}`}>
+                          <td><div className="trace-cell-stack"><strong>{fmt(t.at)}</strong><span className="mono">{routeLabel(t.route)}</span><span className="muted">{t.traceKind === "client-request" ? `Client outcome · ${t.providerAttempts ?? 0} provider attempts` : t.traceKind === "upstream-attempt" ? `Provider attempt ${t.upstreamAttempt ?? "—"}` : t.traceKind === "diagnostic" ? "Proxy diagnostic" : "Legacy trace"}</span></div></td>
+                          <td><div className="trace-cell-stack"><strong className="mono">{t.application ?? "Unspecified app"}</strong><span className="mono">{t.projectId ? sanitized ? "Private project" : t.projectName ?? t.projectId : "No project"}</span></div></td>
+                          <td><div className="trace-cell-stack"><strong className="mono">{modelLabel}</strong><span className="trace-target-account">{(provider || runtimeIdentity) && <span className="provider-badge"><img className="provider-icon" src={targetIdentity.iconUrl} alt="" loading="lazy" />{targetIdentity.label}</span>}<span className="mono">{accountLabel}</span></span></div></td>
+                          <td><div className="trace-cell-stack"><span><span className={`badge ${hasError ? "badge-warn" : "badge-live"}`}>{t.status}</span></span><span className={hasError ? "trace-error-copy" : "muted"}>{t.error?.slice(0, 72) ?? (hasError ? "Request failed" : "Completed")}</span></div></td>
+                          <td><div className="trace-cell-stack"><strong>{formatLatency(t.latencyMs)} total</strong><span>{typeof t.ttftMs === "number" ? `${Math.round(t.ttftMs)}ms TTFT` : "TTFT not measured"}</span></div></td>
+                          <td><div className="trace-cell-stack"><strong>{typeof (t.tokensTotal ?? t.usage?.total_tokens) === "number" ? formatTokenCount(t.tokensTotal ?? t.usage?.total_tokens) : "—"} tokens</strong><span className="mono">{usd(rowCost)}</span></div></td>
+                          <td><button type="button" className="trace-expand-button" onClick={() => void toggleExpandedTrace(t.id)} aria-expanded={isExpanded}>{isExpanded ? "Hide" : "Inspect"}</button></td>
+                        </tr>
+                        {isExpanded && (
+                          <tr className="trace-expanded-row">
+                            <td colSpan={7}>
+                              <div className="expanded-trace">
+                                <div className="expanded-trace-heading"><div><span className="eyebrow">Trace detail</span><strong className="mono">{t.id}</strong></div><span className="badge">Sanitized</span></div>
+                                {expandedTraceLoading && <div className="muted trace-loading">Loading trace details...</div>}
+                                {!expandedTraceLoading && expandedTrace && expandedTrace.id === t.id && (
+                                  <>
+                                    {expandedTrace.hasRequestBody && <details open><summary>Request body</summary><pre className="mono pre">{JSON.stringify(expandedTrace.requestBody, null, 2)}</pre></details>}
+                                    {expandedTrace.hasRequestHeaders && <details><summary>Request headers (sanitized)</summary><pre className="mono pre">{JSON.stringify(expandedTrace.requestHeaders, null, 2)}</pre></details>}
+                                    <details><summary>Full trace object</summary><pre className="mono pre">{JSON.stringify(expandedTrace, null, 2)}</pre></details>
+                                  </>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
+                  {!traces.length && <tr><td colSpan={7} className="trace-empty-state">No traces recorded in this range.</td></tr>}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      )}
+    </>
+  );
+}

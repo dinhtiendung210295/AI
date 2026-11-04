@@ -1,0 +1,2399 @@
+import { TraceAnalyticsClient } from "./trace-analytics-client.js";
+import {
+  estimateCostUsd,
+  estimateImageCostUsd,
+  estimateTraceCostUsd,
+  estimateCostUsdWithoutCache,
+  MODEL_PRICING_VERSION,
+} from "./model-pricing.js";
+import { createReadStream } from "node:fs";
+import fs from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+import { createInterface } from "node:readline";
+import { normalizeTraceHeaders } from "./trace-headers.js";
+import { sessionKeyFor } from "./session-identity.js";
+import type { CommunityReportTrace } from "./community-report.js";
+import type { CodexProjectAttribution } from "./codex-projects.js";
+import type {
+  AccountSelectionReason,
+  AccountSelectionSummary,
+  AccountSelectionTelemetry,
+  ProviderId,
+} from "./types.js";
+
+function normalizeSelectionProvider(value: unknown): ProviderId {
+  return value === "openai" ||
+    value === "openai-compatible" ||
+    value === "opencode" ||
+    value === "mistral" ||
+    value === "zai" ||
+    value === "github-copilot" ||
+    value === "xai"
+    ? value
+    : "openai";
+}
+
+export type TraceEntry = {
+  id: string;
+  at: number;
+  route: string;
+  /** Correlates every upstream attempt with one inbound client request. */
+  clientRequestId?: string;
+  traceKind?: "client-request" | "upstream-attempt" | "diagnostic";
+  /** One-based account/provider attempt within the inbound client request. */
+  upstreamAttempt?: number;
+  /** Total provider attempts observed before the client response completed. */
+  providerAttempts?: number;
+  /** A failed provider attempt was recovered before responding to the client. */
+  recoveredRetry?: boolean;
+  application?: string;
+  codexSessionId?: string;
+  /** Privacy-preserving session fingerprint retained in long-term stats. */
+  sessionKey?: string;
+  /** Untrusted request context used only for registry fallback resolution. */
+  codexProjectRoot?: string;
+  /** Stable execution-host context paired with codexProjectRoot. */
+  codexProjectHost?: string;
+  projectId?: string;
+  projectName?: string;
+  projectRemote?: string;
+  projectRoot?: string;
+  projectHost?: string;
+  accountId?: string;
+  accountEmail?: string;
+  provider?: ProviderId;
+  accountSelection?: AccountSelectionTelemetry;
+  model?: string;
+  requestedModel?: string;
+  resolvedModel?: string;
+  priority?: "critical" | "interactive" | "standard" | "batch";
+  routingDecision?: "local" | "personal-cluster" | "cloud" | "queued" | "rejected";
+  routingRule?: string;
+  routingScores?: Array<{
+    model: string;
+    accountId: string;
+    score: number;
+    rejectedReasons: string[];
+  }>;
+  admissionWaitMs?: number;
+  jobId?: string;
+  executionLocation?: "local" | "personal-cluster" | "cloud";
+  capacityVersion?: number;
+  status: number;
+  isError: boolean;
+  stream: boolean;
+  latencyMs: number;
+  ttftMs?: number;
+  tokensInput?: number;
+  tokensInputCached?: number;
+  tokensInputCacheWrite?: number;
+  tokensOutput?: number;
+  tokensReasoning?: number;
+  tokensTotal?: number;
+  costUsd?: number;
+  pricingVersion?: string;
+  usageStatus?: "measured" | "missing";
+  costStatus?: "estimated" | "unpriced" | "unknown";
+  usage?: any;
+  requestBody?: any;
+  requestHeaders?: Record<string, string>;
+  error?: string;
+  upstreamError?: string;
+  upstreamContentType?: string;
+  upstreamEmptyBody?: boolean;
+  imageTrace?: any;
+  latencyBreakdown?: {
+    preparationMs: number;
+    upstreamHeadersMs: number;
+  };
+  usageRefresh?: {
+    background: number;
+    blocking: number;
+    shared: number;
+  };
+  modelCatalogRefresh?: {
+    background: number;
+    blocking: number;
+    shared: number;
+  };
+  accountPreparation?: {
+    skipped: number;
+    asynchronous: number;
+  };
+  inputContext?: {
+    compactionItemCount: number;
+    itemsBeforeLatestCompaction: number;
+  };
+  assistantEmptyOutput?: boolean;
+  assistantFinishReason?: string;
+  responseStreamDiagnostics?: ResponseStreamDiagnostics;
+  lifecycleState?: "started" | "completed" | "interrupted";
+  startedAt?: number;
+  completedAt?: number;
+  clientDisconnected?: boolean;
+};
+
+function estimateTraceCostWithoutCache(trace: TraceEntry): number | undefined {
+  if (trace.costStatus === "unpriced" && typeof trace.costUsd !== "number") return undefined;
+  if (trace.route.includes("/images/")) {
+    return trace.costUsd ?? estimateImageCostUsd(trace.resolvedModel ?? trace.model, trace.usage);
+  }
+  const cachedInput = Math.max(0, trace.tokensInputCached ?? 0);
+  if (cachedInput === 0 && typeof trace.costUsd === "number") {
+    return trace.costUsd;
+  }
+  const hasMeasuredUsage =
+    trace.usageStatus === "measured" ||
+    Boolean(trace.usage) ||
+    typeof trace.tokensInput === "number" ||
+    typeof trace.tokensOutput === "number" ||
+    typeof trace.tokensTotal === "number";
+  if (trace.usageStatus === "missing" || !hasMeasuredUsage) return undefined;
+  return estimateCostUsdWithoutCache(
+    trace.model,
+    trace.tokensInput ?? 0,
+    trace.tokensOutput ?? 0,
+    trace.tokensInputCacheWrite ?? 0,
+  );
+}
+
+export type ResponseStreamDiagnostics = {
+  eventCount: number;
+  eventTypes: Record<string, number>;
+  customToolCalls: CustomToolCallDiagnostic[];
+  invalidDataPayloadCount: number;
+  outputTextDeltaCount: number;
+  outputTextDoneCount: number;
+  reasoningEventCount: number;
+  refusalEventCount: number;
+  functionCallCount: number;
+  hiddenFunctionCallCount: number;
+  sanitizerDroppedEventCount: number;
+  sanitizerDroppedTextEventCount: number;
+  /** A terminal Responses event observed before the upstream stream ended. */
+  terminalEventType?:
+    | "response.completed"
+    | "response.failed"
+    | "response.incomplete"
+    | "error";
+  /** Bounded upstream error details, retained without the complete SSE payload. */
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  sawResponseCompleted: boolean;
+  sawChatCompletionChunk: boolean;
+};
+
+function hasTraceFailure(trace: {
+  status: number;
+  isError?: boolean;
+  error?: string;
+  upstreamError?: string;
+  responseStreamDiagnostics?: ResponseStreamDiagnostics;
+}): boolean {
+  const diagnostics = trace.responseStreamDiagnostics;
+  return trace.status >= 400 || trace.isError === true || Boolean(trace.error) ||
+    Boolean(trace.upstreamError) || ["response.failed", "response.incomplete", "error"].some(
+      (event) => diagnostics?.terminalEventType === event ||
+        (diagnostics?.eventTypes?.[event] ?? 0) > 0,
+    );
+}
+
+export type CustomToolCallDiagnostic = {
+  _key?: string;
+  itemIdPresent: boolean;
+  callIdPresent: boolean;
+  name?: string;
+  status?: string;
+  inputDeltaCount: number;
+  inputBytes: number;
+  sawInputDone: boolean;
+  sawOutputItemAdded: boolean;
+  sawOutputItemDone: boolean;
+};
+
+export type TraceListEntry = Omit<TraceEntry, "requestBody" | "requestHeaders"> & {
+  hasRequestBody: boolean;
+  hasRequestHeaders: boolean;
+};
+
+export type TraceTotals = {
+  requests: number;
+  upstreamAttempts: number;
+  retriedRequests: number;
+  recoveredRequests: number;
+  requestsWithUsage: number;
+  requestsWithCost: number;
+  unpricedRequests: number;
+  errors: number;
+  errorRate: number;
+  tokensInput: number;
+  tokensInputCached: number;
+  tokensOutput: number;
+  tokensTotal: number;
+  inferenceTokensPerSecond: number;
+  inferenceRequests: number;
+  costUsd: number;
+  costUsdWithoutCache: number;
+  latencyAvgMs: number;
+};
+
+export type TraceModelStats = {
+  model: string;
+  count: number;
+  okCount: number;
+  tokensInput: number;
+  tokensInputCached: number;
+  tokensOutput: number;
+  tokensTotal: number;
+  costUsd: number;
+};
+
+export type TraceTimeseriesBucket = {
+  at: number;
+  requests: number;
+  upstreamAttempts: number;
+  retriedRequests: number;
+  recoveredRequests: number;
+  errors: number;
+  tokensInput: number;
+  tokensInputCached: number;
+  tokensOutput: number;
+  tokensTotal: number;
+  inferenceTokensPerSecond: number;
+  inferenceRequests: number;
+  costUsd: number;
+  latencyP50Ms: number;
+  latencyP95Ms: number;
+};
+
+export const TTFT_INPUT_TOKEN_BUCKETS = [
+  "lt1k",
+  "1k-8k",
+  "8k-32k",
+  "32k-64k",
+  "64k-128k",
+  "128k-plus",
+] as const;
+
+export type TtftInputTokenBucket =
+  | (typeof TTFT_INPUT_TOKEN_BUCKETS)[number]
+  | "unknown";
+
+export type TraceTtftStats = {
+  provider: ProviderId;
+  model: string;
+  inputTokenBucket: TtftInputTokenBucket;
+  samples: number;
+  ttftP50Ms: number;
+  ttftP95Ms: number;
+  medianInputTokens?: number;
+  cachedInputRatio?: number;
+  confidence: "low" | "sufficient";
+  rank?: number;
+};
+
+export type TraceStats = {
+  totals: TraceTotals;
+  models: TraceModelStats[];
+  timeseries: TraceTimeseriesBucket[];
+  ttftByProviderModel: TraceTtftStats[];
+  accountSelection: AccountSelectionSummary;
+};
+
+export type UsageTokenTotals = {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+};
+
+export type UsageAggregate = {
+  requests: number;
+  ok: number;
+  errors: number;
+  stream: number;
+  latencyMsTotal: number;
+  requestsWithUsage: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  statusCounts: Record<string, number>;
+  firstAt?: number;
+  lastAt?: number;
+};
+
+export type TraceManagerConfig = {
+  onCompleted?: (trace: TraceEntry) => void | Promise<void>;
+  filePath: string;
+  historyFilePath?: string;
+  /** Another process appends traces; consume its journal without rewriting it. */
+  externalWriter?: boolean;
+  /** Durable analytics index; queries and ingestion run off the HTTP event loop. */
+  indexedHistoryPath?: string;
+  /** Shared models.dev cache; enables runtime pricing and the one-time cost backfill. */
+  pricingCachePath?: string;
+  retentionMax?: number;
+  pageSizeMax?: number;
+  legacyLimitMax?: number;
+  resolveCodexProject?: (
+    sessionId: string | undefined,
+    projectRoot?: string,
+    projectHost?: string,
+  ) => CodexProjectAttribution | undefined;
+};
+
+export type AnonymousModelOutputTotal = {
+  modelId: string;
+  outputTokens: number;
+};
+
+export type TraceBucketAggregate = {
+  at: number;
+  requests: number;
+  upstreamAttempts: number;
+  retriedRequests: number;
+  recoveredRequests: number;
+  requestsWithUsage: number;
+  requestsWithCost: number;
+  unpricedRequests: number;
+  errors: number;
+  tokensInput: number;
+  tokensInputCached: number;
+  tokensOutput: number;
+  tokensTotal: number;
+  costUsd: number;
+  costUsdWithoutCache: number;
+  latencyMsTotal: number;
+  latencies: number[];
+  inferenceSpeedTotal: number;
+  inferenceSpeedCount: number;
+  models: Map<string, TraceModelStats>;
+  ttftGroups: Map<string, MutableTraceTtftStats>;
+  accountSelection: MutableAccountSelectionSummary;
+};
+
+type MutableAccountSelectionSummary = {
+  attempts: number;
+  rotations: number;
+  maxNearLimit: number;
+  headroomTotal: number;
+  headroomSamples: number;
+  reasonCounts: Record<AccountSelectionReason, number>;
+};
+
+const ACCOUNT_SELECTION_REASONS: AccountSelectionReason[] = [
+  "sticky",
+  "policy-preferred",
+  "quota-headroom",
+];
+
+function createAccountSelectionSummary(): MutableAccountSelectionSummary {
+  return {
+    attempts: 0,
+    rotations: 0,
+    maxNearLimit: 0,
+    headroomTotal: 0,
+    headroomSamples: 0,
+    reasonCounts: {
+      sticky: 0,
+      "policy-preferred": 0,
+      "quota-headroom": 0,
+    },
+  };
+}
+
+function addAccountSelection(
+  summary: MutableAccountSelectionSummary,
+  selection: AccountSelectionTelemetry | undefined,
+) {
+  if (!selection) return;
+  summary.attempts += 1;
+  if (selection.rotated) summary.rotations += 1;
+  summary.maxNearLimit = Math.max(summary.maxNearLimit, selection.nearLimitCount);
+  summary.reasonCounts[selection.reason] += 1;
+  if (typeof selection.selectedHeadroomPercent === "number") {
+    summary.headroomTotal += selection.selectedHeadroomPercent;
+    summary.headroomSamples += 1;
+  }
+}
+
+function mergeAccountSelection(
+  target: MutableAccountSelectionSummary,
+  source: MutableAccountSelectionSummary,
+) {
+  target.attempts += source.attempts;
+  target.rotations += source.rotations;
+  target.maxNearLimit = Math.max(target.maxNearLimit, source.maxNearLimit);
+  target.headroomTotal += source.headroomTotal;
+  target.headroomSamples += source.headroomSamples;
+  for (const reason of ACCOUNT_SELECTION_REASONS) {
+    target.reasonCounts[reason] += source.reasonCounts[reason];
+  }
+}
+
+function finalizeAccountSelection(
+  summary: MutableAccountSelectionSummary,
+): AccountSelectionSummary {
+  return {
+    attempts: summary.attempts,
+    rotations: summary.rotations,
+    maxNearLimit: summary.maxNearLimit,
+    averageHeadroom: summary.headroomSamples
+      ? summary.headroomTotal / summary.headroomSamples
+      : undefined,
+    reasonCounts: summary.reasonCounts,
+  };
+}
+
+type MutableTraceTtftStats = {
+  provider: ProviderId;
+  model: string;
+  inputTokenBucket: TtftInputTokenBucket;
+  samples: number;
+  ttftSamples: number[];
+  inputTokenSamples: number[];
+  cachedInputTokens: number;
+  totalInputTokens: number;
+};
+
+const DEFAULT_RETENTION_MAX = 1000;
+const DEFAULT_PAGE_SIZE_MAX = 100;
+const DEFAULT_LEGACY_LIMIT_MAX = 2000;
+const HOUR_MS = 3_600_000;
+const MAX_LATENCY_SAMPLES_PER_BUCKET = 2000;
+const TRACE_COMPACTION_RATIO = 1.5;
+
+function safeNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
+}
+
+function normalizeTokenFields(
+  usage: any,
+  fallback?: {
+    input?: number;
+    cachedInput?: number;
+    cacheWriteInput?: number;
+    output?: number;
+    reasoning?: number;
+    total?: number;
+  },
+) {
+  const input =
+    safeNumber(usage?.input_tokens) ??
+    safeNumber(usage?.prompt_tokens) ??
+    fallback?.input;
+  const output =
+    safeNumber(usage?.output_tokens) ??
+    safeNumber(usage?.completion_tokens) ??
+    fallback?.output;
+  const total =
+    safeNumber(usage?.total_tokens) ??
+    fallback?.total ??
+    (typeof input === "number" || typeof output === "number"
+      ? (input ?? 0) + (output ?? 0)
+      : undefined);
+  const cachedInput =
+    safeNumber(usage?.input_tokens_details?.cached_tokens) ??
+    safeNumber(usage?.prompt_tokens_details?.cached_tokens) ??
+    safeNumber(usage?.cached_input_tokens) ??
+    safeNumber(usage?.input_cached_tokens) ??
+    safeNumber(usage?.prompt_cached_tokens) ??
+    safeNumber((usage as any)?.cached_tokens) ??
+    fallback?.cachedInput ??
+    0;
+  const cacheWriteInput =
+    safeNumber(usage?.input_tokens_details?.cache_write_tokens) ??
+    safeNumber(usage?.prompt_tokens_details?.cache_write_tokens) ??
+    safeNumber((usage as any)?.cache_write_tokens) ??
+    fallback?.cacheWriteInput ??
+    0;
+  const reasoning =
+    safeNumber(usage?.output_tokens_details?.reasoning_tokens) ??
+    safeNumber(usage?.completion_tokens_details?.reasoning_tokens) ??
+    safeNumber((usage as any)?.reasoning_tokens) ??
+    fallback?.reasoning ??
+    0;
+  return {
+    tokensInput: input,
+    tokensInputCached: cachedInput,
+    tokensInputCacheWrite: cacheWriteInput,
+    tokensOutput: output,
+    tokensReasoning: reasoning,
+    tokensTotal: total,
+  };
+}
+
+export function normalizeTrace(raw: any): TraceEntry | null {
+  if (!raw || typeof raw !== "object") return null;
+  const at = safeNumber(raw.at);
+  const route = typeof raw.route === "string" ? raw.route : "";
+  const status = safeNumber(raw.status);
+  const latencyMs = safeNumber(raw.latencyMs);
+  const rawTtftMs = safeNumber(raw.ttftMs);
+  if (
+    !at ||
+    !route ||
+    typeof status === "undefined" ||
+    typeof latencyMs === "undefined"
+  )
+    return null;
+
+  const fallbackModel =
+    typeof raw.requestBody?.model === "string"
+      ? raw.requestBody.model
+      : undefined;
+  const model =
+    typeof raw.model === "string" && raw.model.trim()
+      ? raw.model.trim()
+      : fallbackModel;
+  const normalizedTokens = normalizeTokenFields(raw.usage, {
+    input: safeNumber(raw.tokensInput),
+    cachedInput: safeNumber(raw.tokensInputCached),
+    cacheWriteInput: safeNumber(raw.tokensInputCacheWrite),
+    output: safeNumber(raw.tokensOutput),
+    reasoning: safeNumber(raw.tokensReasoning),
+    total: safeNumber(raw.tokensTotal),
+  });
+  const storedCostUsd = safeNumber(raw.costUsd);
+  const legacySyntheticZero =
+    typeof raw.usageStatus !== "string" &&
+    !raw.usage &&
+    safeNumber(raw.tokensTotal) === 0 &&
+    (safeNumber(raw.tokensInput) ?? 0) === 0 &&
+    (safeNumber(raw.tokensOutput) ?? 0) === 0 &&
+    (storedCostUsd === undefined || storedCostUsd === 0);
+  const hasMeasuredTokens = [
+    normalizedTokens.tokensInput,
+    normalizedTokens.tokensOutput,
+    normalizedTokens.tokensTotal,
+  ].some((value) => typeof value === "number");
+  const usageStatus =
+    raw.usageStatus === "measured" || raw.usageStatus === "missing"
+      ? raw.usageStatus
+      : !legacySyntheticZero && (Boolean(raw.usage) || hasMeasuredTokens)
+        ? "measured"
+        : "missing";
+  const preservedCostUsd = legacySyntheticZero ? undefined : storedCostUsd;
+  const estimatedCostUsd =
+    usageStatus === "measured"
+      ? route.includes("/images/")
+        ? estimateImageCostUsd(typeof raw.resolvedModel === "string" ? raw.resolvedModel : model, raw.usage)
+        : estimateCostUsd(
+          typeof raw.resolvedModel === "string" && raw.resolvedModel.trim() ? raw.resolvedModel.trim() : model,
+          normalizedTokens.tokensInput ?? 0,
+          normalizedTokens.tokensOutput ?? 0,
+          normalizedTokens.tokensInputCached ?? 0,
+          normalizedTokens.tokensInputCacheWrite ?? 0,
+        )
+      : undefined;
+  const costUsd = preservedCostUsd ?? estimatedCostUsd;
+
+  return {
+    id:
+      typeof raw.id === "string" && raw.id
+        ? raw.id
+        : `${at}-${route}-${status}`,
+    at,
+    route,
+    clientRequestId:
+      typeof raw.clientRequestId === "string" && raw.clientRequestId.trim()
+        ? raw.clientRequestId.trim()
+        : undefined,
+    traceKind:
+      raw.traceKind === "client-request" ||
+      raw.traceKind === "upstream-attempt" ||
+      raw.traceKind === "diagnostic"
+        ? raw.traceKind
+        : undefined,
+    upstreamAttempt: (() => {
+      const value = safeNumber(raw.upstreamAttempt);
+      return typeof value === "number" && value >= 1
+        ? Math.floor(value)
+        : undefined;
+    })(),
+    providerAttempts: (() => {
+      const value = safeNumber(raw.providerAttempts);
+      return typeof value === "number" && value >= 0
+        ? Math.floor(value)
+        : undefined;
+    })(),
+    recoveredRetry:
+      typeof raw.recoveredRetry === "boolean"
+        ? raw.recoveredRetry
+        : undefined,
+    application:
+      typeof raw.application === "string" && raw.application.trim()
+        ? raw.application.trim()
+        : undefined,
+    codexSessionId:
+      typeof raw.codexSessionId === "string" && raw.codexSessionId.trim()
+        ? raw.codexSessionId.trim()
+        : undefined,
+    sessionKey:
+      typeof raw.sessionKey === "string" &&
+      /^[0-9a-f]{8,64}$/.test(raw.sessionKey.trim())
+        ? raw.sessionKey.trim()
+        : undefined,
+    projectId:
+      typeof raw.projectId === "string" && raw.projectId.trim()
+        ? raw.projectId.trim()
+        : undefined,
+    projectName:
+      typeof raw.projectName === "string" && raw.projectName.trim()
+        ? raw.projectName.trim()
+        : undefined,
+    projectRemote:
+      typeof raw.projectRemote === "string" && raw.projectRemote.trim()
+        ? raw.projectRemote.trim()
+        : undefined,
+    projectRoot:
+      typeof raw.projectRoot === "string" && raw.projectRoot.trim()
+        ? raw.projectRoot.trim()
+        : undefined,
+    projectHost:
+      typeof raw.projectHost === "string" && raw.projectHost.trim()
+        ? raw.projectHost.trim()
+        : undefined,
+    accountId: typeof raw.accountId === "string" ? raw.accountId : undefined,
+    accountEmail:
+      typeof raw.accountEmail === "string" ? raw.accountEmail : undefined,
+    provider:
+      raw.provider === "openai" ||
+      raw.provider === "openai-compatible" ||
+      raw.provider === "opencode" ||
+      raw.provider === "mistral" ||
+      raw.provider === "zai" ||
+      raw.provider === "github-copilot" ||
+      raw.provider === "xai"
+        ? raw.provider
+        : undefined,
+    accountSelection:
+      raw.accountSelection && typeof raw.accountSelection === "object"
+        ? {
+            reason:
+              raw.accountSelection.reason === "sticky" ||
+              raw.accountSelection.reason === "policy-preferred" ||
+              raw.accountSelection.reason === "quota-headroom"
+                ? raw.accountSelection.reason
+                : "quota-headroom",
+            provider: normalizeSelectionProvider(raw.accountSelection.provider),
+            candidateCount:
+              safeNumber(raw.accountSelection.candidateCount) ?? 0,
+            eligibleCount:
+              safeNumber(raw.accountSelection.eligibleCount) ?? 0,
+            nearLimitCount:
+              safeNumber(raw.accountSelection.nearLimitCount) ?? 0,
+            rotated: Boolean(raw.accountSelection.rotated),
+            selectedHeadroomPercent: safeNumber(
+              raw.accountSelection.selectedHeadroomPercent,
+            ),
+            selectedWeeklyRemainingPercent: safeNumber(
+              raw.accountSelection.selectedWeeklyRemainingPercent,
+            ),
+            selectedFiveHourRemainingPercent: safeNumber(
+              raw.accountSelection.selectedFiveHourRemainingPercent,
+            ),
+          }
+        : undefined,
+    model,
+    requestedModel:
+      typeof raw.requestedModel === "string" ? raw.requestedModel : undefined,
+    resolvedModel:
+      typeof raw.resolvedModel === "string" ? raw.resolvedModel : undefined,
+    status,
+    isError: hasTraceFailure({ ...raw, status }),
+    stream: Boolean(raw.stream),
+    latencyMs,
+    ttftMs:
+      typeof rawTtftMs === "number" && rawTtftMs >= 0
+        ? rawTtftMs
+        : undefined,
+    tokensInput: normalizedTokens.tokensInput,
+    tokensInputCached: normalizedTokens.tokensInputCached,
+    tokensInputCacheWrite: normalizedTokens.tokensInputCacheWrite,
+    tokensOutput: normalizedTokens.tokensOutput,
+    tokensReasoning: normalizedTokens.tokensReasoning,
+    tokensTotal: normalizedTokens.tokensTotal,
+    costUsd,
+    pricingVersion:
+      typeof raw.pricingVersion === "string"
+        ? raw.pricingVersion
+        : preservedCostUsd !== undefined
+          ? "legacy-recorded"
+          : estimatedCostUsd !== undefined
+            ? MODEL_PRICING_VERSION
+            : undefined,
+    usageStatus,
+    costStatus:
+      costUsd !== undefined
+        ? "estimated"
+        : raw.costStatus === "unpriced" || raw.costStatus === "unknown"
+          ? raw.costStatus
+          : usageStatus === "measured" && model
+            ? "unpriced"
+            : "unknown",
+    usage: raw.usage,
+    requestBody: raw.requestBody,
+    requestHeaders: normalizeTraceHeaders(raw.requestHeaders),
+    error: typeof raw.error === "string" ? raw.error : undefined,
+    upstreamError:
+      typeof raw.upstreamError === "string" ? raw.upstreamError : undefined,
+    upstreamContentType:
+      typeof raw.upstreamContentType === "string"
+        ? raw.upstreamContentType
+        : undefined,
+    upstreamEmptyBody:
+      typeof raw.upstreamEmptyBody === "boolean"
+        ? raw.upstreamEmptyBody
+        : undefined,
+    imageTrace: raw.imageTrace,
+    latencyBreakdown:
+      raw.latencyBreakdown &&
+      typeof raw.latencyBreakdown === "object"
+        ? {
+            preparationMs:
+              safeNumber(raw.latencyBreakdown.preparationMs) ?? 0,
+            upstreamHeadersMs:
+              safeNumber(raw.latencyBreakdown.upstreamHeadersMs) ?? 0,
+          }
+        : undefined,
+    usageRefresh:
+      raw.usageRefresh &&
+      typeof raw.usageRefresh === "object"
+        ? {
+            background: safeNumber(raw.usageRefresh.background) ?? 0,
+            blocking: safeNumber(raw.usageRefresh.blocking) ?? 0,
+            shared: safeNumber(raw.usageRefresh.shared) ?? 0,
+          }
+        : undefined,
+    modelCatalogRefresh:
+      raw.modelCatalogRefresh &&
+      typeof raw.modelCatalogRefresh === "object"
+        ? {
+            background: safeNumber(raw.modelCatalogRefresh.background) ?? 0,
+            blocking: safeNumber(raw.modelCatalogRefresh.blocking) ?? 0,
+            shared: safeNumber(raw.modelCatalogRefresh.shared) ?? 0,
+          }
+        : undefined,
+    accountPreparation:
+      raw.accountPreparation &&
+      typeof raw.accountPreparation === "object"
+        ? {
+            skipped: safeNumber(raw.accountPreparation.skipped) ?? 0,
+            asynchronous:
+              safeNumber(raw.accountPreparation.asynchronous) ?? 0,
+          }
+        : undefined,
+    inputContext:
+      raw.inputContext &&
+      typeof raw.inputContext === "object"
+        ? {
+            compactionItemCount:
+              safeNumber(raw.inputContext.compactionItemCount) ?? 0,
+            itemsBeforeLatestCompaction:
+              safeNumber(raw.inputContext.itemsBeforeLatestCompaction) ?? 0,
+          }
+        : undefined,
+    assistantEmptyOutput:
+      typeof raw.assistantEmptyOutput === "boolean"
+        ? raw.assistantEmptyOutput
+        : undefined,
+    assistantFinishReason:
+      typeof raw.assistantFinishReason === "string"
+        ? raw.assistantFinishReason
+        : undefined,
+    responseStreamDiagnostics:
+      raw.responseStreamDiagnostics &&
+      typeof raw.responseStreamDiagnostics === "object"
+        ? raw.responseStreamDiagnostics
+        : undefined,
+    lifecycleState:
+      raw.lifecycleState === "started" ||
+      raw.lifecycleState === "completed" ||
+      raw.lifecycleState === "interrupted"
+        ? raw.lifecycleState
+        : undefined,
+    startedAt: safeNumber(raw.startedAt),
+    completedAt: safeNumber(raw.completedAt),
+    clientDisconnected:
+      typeof raw.clientDisconnected === "boolean"
+        ? raw.clientDisconnected
+        : undefined,
+  };
+}
+
+function percentile(values: number[], p: number): number {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const idx = Math.min(
+    sorted.length - 1,
+    Math.max(0, Math.ceil((p / 100) * sorted.length) - 1),
+  );
+  return sorted[idx];
+}
+
+function average(values: number[]): number {
+  return values.length
+    ? values.reduce((sum, value) => sum + value, 0) / values.length
+    : 0;
+}
+
+export function ttftInputTokenBucket(
+  tokensInput: number | undefined,
+): TtftInputTokenBucket {
+  if (
+    typeof tokensInput !== "number" ||
+    !Number.isFinite(tokensInput) ||
+    tokensInput < 0
+  ) {
+    return "unknown";
+  }
+  if (tokensInput < 1_000) return "lt1k";
+  if (tokensInput < 8_000) return "1k-8k";
+  if (tokensInput < 32_000) return "8k-32k";
+  if (tokensInput < 64_000) return "32k-64k";
+  if (tokensInput < 128_000) return "64k-128k";
+  return "128k-plus";
+}
+
+function isTtftAggregateCandidate(trace: TraceEntry): boolean {
+  return (
+    trace.lifecycleState === "completed" &&
+    trace.stream &&
+    !trace.isError &&
+    trace.status >= 200 &&
+    trace.status < 400 &&
+    typeof trace.provider === "string" &&
+    Boolean(trace.model) &&
+    typeof trace.ttftMs === "number" &&
+    Number.isFinite(trace.ttftMs) &&
+    trace.ttftMs >= 0
+  );
+}
+
+function addTtftSample(
+  groups: Map<string, MutableTraceTtftStats>,
+  trace: TraceEntry,
+): void {
+  if (!isTtftAggregateCandidate(trace)) return;
+  const provider = trace.provider!;
+  const model = trace.model!;
+  const inputTokenBucket = ttftInputTokenBucket(trace.tokensInput);
+  const key = JSON.stringify([provider, model, inputTokenBucket]);
+  const group = groups.get(key) ?? {
+    provider,
+    model,
+    inputTokenBucket,
+    samples: 0,
+    ttftSamples: [],
+    inputTokenSamples: [],
+    cachedInputTokens: 0,
+    totalInputTokens: 0,
+  };
+  group.samples += 1;
+  if (group.ttftSamples.length < MAX_LATENCY_SAMPLES_PER_BUCKET) {
+    group.ttftSamples.push(trace.ttftMs!);
+  } else {
+    group.ttftSamples[group.samples % MAX_LATENCY_SAMPLES_PER_BUCKET] =
+      trace.ttftMs!;
+  }
+  if (
+    typeof trace.tokensInput === "number" &&
+    Number.isFinite(trace.tokensInput)
+  ) {
+    if (group.inputTokenSamples.length < MAX_LATENCY_SAMPLES_PER_BUCKET) {
+      group.inputTokenSamples.push(trace.tokensInput);
+    } else {
+      group.inputTokenSamples[group.samples % MAX_LATENCY_SAMPLES_PER_BUCKET] =
+        trace.tokensInput;
+    }
+    group.totalInputTokens += trace.tokensInput;
+    group.cachedInputTokens += Math.max(0, trace.tokensInputCached ?? 0);
+  }
+  groups.set(key, group);
+}
+
+function mergeTtftGroup(
+  groups: Map<string, MutableTraceTtftStats>,
+  incoming: MutableTraceTtftStats,
+): void {
+  const key = JSON.stringify([
+    incoming.provider,
+    incoming.model,
+    incoming.inputTokenBucket,
+  ]);
+  const group = groups.get(key) ?? {
+    provider: incoming.provider,
+    model: incoming.model,
+    inputTokenBucket: incoming.inputTokenBucket,
+    samples: 0,
+    ttftSamples: [],
+    inputTokenSamples: [],
+    cachedInputTokens: 0,
+    totalInputTokens: 0,
+  };
+  group.samples += incoming.samples;
+  group.ttftSamples.push(...incoming.ttftSamples);
+  group.inputTokenSamples.push(...incoming.inputTokenSamples);
+  if (group.ttftSamples.length > MAX_LATENCY_SAMPLES_PER_BUCKET) {
+    group.ttftSamples = group.ttftSamples.slice(-MAX_LATENCY_SAMPLES_PER_BUCKET);
+  }
+  if (group.inputTokenSamples.length > MAX_LATENCY_SAMPLES_PER_BUCKET) {
+    group.inputTokenSamples = group.inputTokenSamples.slice(
+      -MAX_LATENCY_SAMPLES_PER_BUCKET,
+    );
+  }
+  group.cachedInputTokens += incoming.cachedInputTokens;
+  group.totalInputTokens += incoming.totalInputTokens;
+  groups.set(key, group);
+}
+
+function finalizeTtftGroups(
+  groups: Map<string, MutableTraceTtftStats>,
+): TraceTtftStats[] {
+  const finalized: TraceTtftStats[] = Array.from(groups.values()).map((group) => ({
+    provider: group.provider,
+    model: group.model,
+    inputTokenBucket: group.inputTokenBucket,
+    samples: group.samples,
+    ttftP50Ms: percentile(group.ttftSamples, 50),
+    ttftP95Ms: percentile(group.ttftSamples, 95),
+    medianInputTokens: group.inputTokenSamples.length
+      ? percentile(group.inputTokenSamples, 50)
+      : undefined,
+    cachedInputRatio:
+      group.totalInputTokens > 0
+        ? Math.max(0, Math.min(1, group.cachedInputTokens / group.totalInputTokens))
+        : undefined,
+    confidence: group.samples >= 10 ? ("sufficient" as const) : ("low" as const),
+  }));
+
+  for (const bucket of TTFT_INPUT_TOKEN_BUCKETS) {
+    finalized
+      .filter(
+        (group) =>
+          group.inputTokenBucket === bucket && group.confidence === "sufficient",
+      )
+      .sort((left, right) => left.ttftP50Ms - right.ttftP50Ms)
+      .forEach((group, index) => {
+        group.rank = index + 1;
+      });
+  }
+
+  return finalized.sort((left, right) => {
+    if (left.inputTokenBucket !== right.inputTokenBucket) {
+      return left.inputTokenBucket.localeCompare(right.inputTokenBucket);
+    }
+    if (left.rank !== undefined || right.rank !== undefined) {
+      return (left.rank ?? Number.POSITIVE_INFINITY) -
+        (right.rank ?? Number.POSITIVE_INFINITY);
+    }
+    return left.ttftP50Ms - right.ttftP50Ms;
+  });
+}
+
+function traceDurationMs(
+  trace: Pick<TraceEntry, "at" | "startedAt" | "completedAt" | "latencyMs">,
+): number | undefined {
+  const startedAt = safeNumber(trace.startedAt);
+  const completedAt = safeNumber(trace.completedAt) ?? safeNumber(trace.at);
+  if (
+    typeof startedAt === "number" &&
+    typeof completedAt === "number" &&
+    completedAt > startedAt
+  ) {
+    return completedAt - startedAt;
+  }
+
+  const latencyMs = safeNumber(trace.latencyMs);
+  return typeof latencyMs === "number" && latencyMs > 0 ? latencyMs : undefined;
+}
+
+function traceInferenceTokensPerSecond(
+  trace: Pick<
+    TraceEntry,
+    | "at"
+    | "startedAt"
+    | "completedAt"
+    | "latencyMs"
+    | "tokensOutput"
+    | "lifecycleState"
+  >,
+): number | undefined {
+  if (trace.lifecycleState === "started") return undefined;
+  const outputTokens = safeNumber(trace.tokensOutput);
+  const durationMs = traceDurationMs(trace);
+  if (
+    typeof outputTokens !== "number" ||
+    outputTokens <= 0 ||
+    typeof durationMs !== "number" ||
+    durationMs <= 0
+  ) {
+    return undefined;
+  }
+  return (outputTokens * 1000) / durationMs;
+}
+
+function usageToTokens(
+  usage: any,
+  fallback?: Pick<TraceEntry, "tokensInput" | "tokensOutput" | "tokensTotal">,
+): UsageTokenTotals {
+  const promptTokens =
+    safeNumber(usage?.prompt_tokens) ??
+    safeNumber(usage?.input_tokens) ??
+    fallback?.tokensInput ??
+    0;
+  const completionTokens =
+    safeNumber(usage?.completion_tokens) ??
+    safeNumber(usage?.output_tokens) ??
+    fallback?.tokensOutput ??
+    0;
+  const totalTokens =
+    safeNumber(usage?.total_tokens) ??
+    fallback?.tokensTotal ??
+    promptTokens + completionTokens;
+  return { promptTokens, completionTokens, totalTokens };
+}
+
+export function createUsageAggregate(): UsageAggregate {
+  return {
+    requests: 0,
+    ok: 0,
+    errors: 0,
+    stream: 0,
+    latencyMsTotal: 0,
+    requestsWithUsage: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    statusCounts: {},
+  };
+}
+
+export function addTraceToAggregate(agg: UsageAggregate, trace: TraceEntry) {
+  const status = Number(trace.status);
+  const statusKey = Number.isFinite(status) ? String(status) : "unknown";
+  const tokens = usageToTokens(trace.usage, trace);
+
+  agg.requests += 1;
+  if (status >= 200 && status < 400) agg.ok += 1;
+  else agg.errors += 1;
+  if (trace.stream) agg.stream += 1;
+
+  agg.latencyMsTotal += Number.isFinite(trace.latencyMs) ? trace.latencyMs : 0;
+  agg.statusCounts[statusKey] = (agg.statusCounts[statusKey] ?? 0) + 1;
+
+  if (trace.usageStatus === "measured" || trace.usage) {
+    agg.requestsWithUsage += 1;
+    agg.promptTokens += tokens.promptTokens;
+    agg.completionTokens += tokens.completionTokens;
+    agg.totalTokens += tokens.totalTokens;
+  }
+
+  if (typeof trace.at === "number") {
+    agg.firstAt =
+      typeof agg.firstAt === "number"
+        ? Math.min(agg.firstAt, trace.at)
+        : trace.at;
+    agg.lastAt =
+      typeof agg.lastAt === "number"
+        ? Math.max(agg.lastAt, trace.at)
+        : trace.at;
+  }
+}
+
+export function finalizeAggregate(agg: UsageAggregate) {
+  const avgLatencyMs = agg.requests
+    ? Math.round((agg.latencyMsTotal / agg.requests) * 100) / 100
+    : 0;
+  const successRate = agg.requests
+    ? Math.round((agg.ok / agg.requests) * 10000) / 100
+    : 0;
+  const streamingRate = agg.requests
+    ? Math.round((agg.stream / agg.requests) * 10000) / 100
+    : 0;
+
+  return {
+    requests: agg.requests,
+    ok: agg.ok,
+    errors: agg.errors,
+    successRate,
+    stream: agg.stream,
+    streamingRate,
+    latencyMsTotal: agg.latencyMsTotal,
+    avgLatencyMs,
+    requestsWithUsage: agg.requestsWithUsage,
+    tokens: {
+      prompt: agg.promptTokens,
+      completion: agg.completionTokens,
+      total: agg.totalTokens,
+    },
+    statusCounts: agg.statusCounts,
+    firstAt: agg.firstAt,
+    lastAt: agg.lastAt,
+  };
+}
+
+function isClientRequestTrace(trace: TraceEntry): boolean {
+  // Legacy traces predate explicit kinds and retain their historical behavior.
+  return trace.traceKind === undefined || trace.traceKind === "client-request";
+}
+
+function isUpstreamAttemptTrace(trace: TraceEntry): boolean {
+  return trace.traceKind === undefined || trace.traceKind === "upstream-attempt";
+}
+
+export function buildTraceStats(traces: TraceEntry[]): TraceStats {
+  const clientTraces = traces.filter(isClientRequestTrace);
+  const attemptTraces = traces.filter(isUpstreamAttemptTrace);
+  const requests = clientTraces.length;
+  const upstreamAttempts = attemptTraces.length;
+  const retriedRequests = clientTraces.filter(
+    (trace) => (trace.providerAttempts ?? 0) > 1,
+  ).length;
+  const recoveredRequests = clientTraces.filter(
+    (trace) => trace.recoveredRetry,
+  ).length;
+  const requestsWithUsage = attemptTraces.filter(
+    (trace) => trace.usageStatus === "measured" || Boolean(trace.usage),
+  ).length;
+  const requestsWithCost = attemptTraces.filter(
+    (trace) => typeof trace.costUsd === "number",
+  ).length;
+  const unpricedRequests = attemptTraces.filter(
+    (trace) => trace.costStatus === "unpriced",
+  ).length;
+  const errors = clientTraces.filter((trace) => trace.isError).length;
+  const tokensInput = attemptTraces.reduce(
+    (sum, trace) => sum + (trace.tokensInput ?? 0),
+    0,
+  );
+  const tokensInputCached = attemptTraces.reduce(
+    (sum, t) => sum + (t.tokensInputCached ?? 0),
+    0,
+  );
+  const tokensOutput = attemptTraces.reduce(
+    (sum, t) => sum + (t.tokensOutput ?? 0),
+    0,
+  );
+  const tokensTotal = attemptTraces.reduce(
+    (sum, t) =>
+      sum + (t.tokensTotal ?? (t.tokensInput ?? 0) + (t.tokensOutput ?? 0)),
+    0,
+  );
+  const inferenceSpeeds = attemptTraces
+    .map(traceInferenceTokensPerSecond)
+    .filter((speed): speed is number => typeof speed === "number");
+  const costUsd = attemptTraces.reduce((sum, t) => {
+    if (typeof t.costUsd === "number") return sum + t.costUsd;
+    return (
+      sum +
+      (estimateTraceCostUsd(t) ?? 0)
+    );
+  }, 0);
+  const costUsdWithoutCache = attemptTraces.reduce(
+    (sum, trace) => sum + (estimateTraceCostWithoutCache(trace) ?? 0),
+    0,
+  );
+  const latencyAvgMs = requests
+    ? clientTraces.reduce((sum, trace) => sum + trace.latencyMs, 0) / requests
+    : 0;
+  const errorRate = requests ? errors / requests : 0;
+  const ttftGroups = new Map<string, MutableTraceTtftStats>();
+  for (const trace of attemptTraces) addTtftSample(ttftGroups, trace);
+  const accountSelection = createAccountSelectionSummary();
+  for (const trace of attemptTraces) {
+    addAccountSelection(accountSelection, trace.accountSelection);
+  }
+
+  const modelMap = new Map<string, TraceModelStats>();
+  for (const trace of attemptTraces) {
+    const key = trace.model || "unknown";
+    const existing = modelMap.get(key);
+    const traceCost =
+      typeof trace.costUsd === "number"
+        ? trace.costUsd
+        : (estimateTraceCostUsd(trace) ?? 0);
+    if (!existing) {
+      modelMap.set(key, {
+        model: key,
+        count: 1,
+        okCount: trace.isError ? 0 : 1,
+        tokensInput: trace.tokensInput ?? 0,
+        tokensInputCached: trace.tokensInputCached ?? 0,
+        tokensOutput: trace.tokensOutput ?? 0,
+        tokensTotal: trace.tokensTotal ?? 0,
+        costUsd: traceCost,
+      });
+    } else {
+      existing.count += 1;
+      if (!trace.isError) existing.okCount += 1;
+      existing.tokensInput += trace.tokensInput ?? 0;
+      existing.tokensInputCached += trace.tokensInputCached ?? 0;
+      existing.tokensOutput += trace.tokensOutput ?? 0;
+      existing.tokensTotal += trace.tokensTotal ?? 0;
+      existing.costUsd += traceCost;
+    }
+  }
+  const models = Array.from(modelMap.values()).sort(
+    (a, b) => b.count - a.count,
+  );
+
+  const bucketMap = new Map<
+    number,
+    {
+      requests: number;
+      upstreamAttempts: number;
+      retriedRequests: number;
+      recoveredRequests: number;
+      errors: number;
+      tokensInput: number;
+      tokensInputCached: number;
+      tokensOutput: number;
+      tokensTotal: number;
+      costUsd: number;
+      latencies: number[];
+      inferenceSpeedTotal: number;
+  inferenceSpeedCount: number;
+    }
+  >();
+  for (const trace of traces) {
+    const bucketAt = Math.floor(trace.at / 3_600_000) * 3_600_000;
+    const bucket = bucketMap.get(bucketAt) ?? {
+      requests: 0,
+      upstreamAttempts: 0,
+      retriedRequests: 0,
+      recoveredRequests: 0,
+      errors: 0,
+      tokensInput: 0,
+      tokensInputCached: 0,
+      tokensOutput: 0,
+      tokensTotal: 0,
+      costUsd: 0,
+      latencies: [],
+      inferenceSpeedTotal: 0,
+      inferenceSpeedCount: 0,
+    };
+    if (isClientRequestTrace(trace)) {
+      bucket.requests += 1;
+      if (trace.isError) bucket.errors += 1;
+      if ((trace.providerAttempts ?? 0) > 1) bucket.retriedRequests += 1;
+      if (trace.recoveredRetry) bucket.recoveredRequests += 1;
+      bucket.latencies.push(trace.latencyMs);
+    }
+    if (isUpstreamAttemptTrace(trace)) {
+      bucket.upstreamAttempts += 1;
+      bucket.tokensInput += trace.tokensInput ?? 0;
+      bucket.tokensInputCached += trace.tokensInputCached ?? 0;
+      bucket.tokensOutput += trace.tokensOutput ?? 0;
+      bucket.tokensTotal += trace.tokensTotal ?? 0;
+      const inferenceSpeed = traceInferenceTokensPerSecond(trace);
+      if (typeof inferenceSpeed === "number") {
+        bucket.inferenceSpeedTotal += inferenceSpeed;
+    bucket.inferenceSpeedCount += 1;
+      }
+      bucket.costUsd +=
+        typeof trace.costUsd === "number"
+          ? trace.costUsd
+          : (estimateTraceCostUsd(trace) ?? 0);
+    }
+    bucketMap.set(bucketAt, bucket);
+  }
+  const timeseries = Array.from(bucketMap.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([at, bucket]) => {
+      return {
+        at,
+        requests: bucket.requests,
+        upstreamAttempts: bucket.upstreamAttempts,
+        retriedRequests: bucket.retriedRequests,
+        recoveredRequests: bucket.recoveredRequests,
+        errors: bucket.errors,
+        tokensInput: bucket.tokensInput,
+        tokensInputCached: bucket.tokensInputCached,
+        tokensOutput: bucket.tokensOutput,
+        tokensTotal: bucket.tokensTotal,
+        inferenceTokensPerSecond: bucket.inferenceSpeedCount ? bucket.inferenceSpeedTotal / bucket.inferenceSpeedCount : 0,
+        inferenceRequests: bucket.inferenceSpeedCount,
+        costUsd: bucket.costUsd,
+        latencyP50Ms: percentile(bucket.latencies, 50),
+        latencyP95Ms: percentile(bucket.latencies, 95),
+      };
+    });
+
+  return {
+    totals: {
+      requests,
+      upstreamAttempts,
+      retriedRequests,
+      recoveredRequests,
+      requestsWithUsage,
+      requestsWithCost,
+      unpricedRequests,
+      errors,
+      errorRate,
+      tokensInput,
+      tokensInputCached,
+      tokensOutput,
+      tokensTotal,
+      inferenceTokensPerSecond: average(inferenceSpeeds),
+      inferenceRequests: inferenceSpeeds.length,
+      costUsd,
+      costUsdWithoutCache,
+      latencyAvgMs,
+    },
+    models,
+    timeseries,
+    ttftByProviderModel: finalizeTtftGroups(ttftGroups),
+    accountSelection: finalizeAccountSelection(accountSelection),
+  };
+}
+
+export function createEmptyBucket(at: number): TraceBucketAggregate {
+  return {
+    at,
+    requests: 0,
+    upstreamAttempts: 0,
+    retriedRequests: 0,
+    recoveredRequests: 0,
+    requestsWithUsage: 0,
+    requestsWithCost: 0,
+    unpricedRequests: 0,
+    errors: 0,
+    tokensInput: 0,
+    tokensInputCached: 0,
+    tokensOutput: 0,
+    tokensTotal: 0,
+    costUsd: 0,
+    costUsdWithoutCache: 0,
+    latencyMsTotal: 0,
+    latencies: [],
+    inferenceSpeedTotal: 0,
+    inferenceSpeedCount: 0,
+    models: new Map(),
+    ttftGroups: new Map(),
+    accountSelection: createAccountSelectionSummary(),
+  };
+}
+
+function addLatencySample(bucket: TraceBucketAggregate, latencyMs: number) {
+  if (!Number.isFinite(latencyMs)) return;
+  const sampleCount = bucket.latencies.length;
+  if (sampleCount < MAX_LATENCY_SAMPLES_PER_BUCKET) {
+    bucket.latencies.push(latencyMs);
+    return;
+  }
+
+  // Deterministic down-sampling keeps hourly percentile estimates bounded
+  // while preserving coverage across the whole bucket window.
+  const replaceAt = bucket.requests % MAX_LATENCY_SAMPLES_PER_BUCKET;
+  bucket.latencies[replaceAt] = latencyMs;
+}
+
+export function addTraceToBucket(bucket: TraceBucketAggregate, trace: TraceEntry) {
+  if (isClientRequestTrace(trace)) {
+    bucket.requests += 1;
+    if (trace.isError) bucket.errors += 1;
+    if ((trace.providerAttempts ?? 0) > 1) bucket.retriedRequests += 1;
+    if (trace.recoveredRetry) bucket.recoveredRequests += 1;
+    bucket.latencyMsTotal += Number.isFinite(trace.latencyMs)
+      ? trace.latencyMs
+      : 0;
+    addLatencySample(bucket, trace.latencyMs);
+  }
+
+  if (!isUpstreamAttemptTrace(trace)) return;
+
+  const model = trace.model || "unknown";
+  const traceCost =
+    typeof trace.costUsd === "number"
+      ? trace.costUsd
+      : (estimateTraceCostUsd(trace) ?? 0);
+  const traceCostWithoutCache = estimateTraceCostWithoutCache(trace);
+  const traceTokensTotal =
+    trace.tokensTotal ?? (trace.tokensInput ?? 0) + (trace.tokensOutput ?? 0);
+
+  bucket.upstreamAttempts += 1;
+  if (trace.usageStatus === "measured" || trace.usage) {
+    bucket.requestsWithUsage += 1;
+  }
+  if (typeof trace.costUsd === "number") bucket.requestsWithCost += 1;
+  if (trace.costStatus === "unpriced") bucket.unpricedRequests += 1;
+  bucket.tokensInput += trace.tokensInput ?? 0;
+  bucket.tokensInputCached += trace.tokensInputCached ?? 0;
+  bucket.tokensOutput += trace.tokensOutput ?? 0;
+  bucket.tokensTotal += traceTokensTotal;
+  const inferenceSpeed = traceInferenceTokensPerSecond(trace);
+  if (typeof inferenceSpeed === "number") {
+    bucket.inferenceSpeedTotal += inferenceSpeed;
+    bucket.inferenceSpeedCount += 1;
+  }
+  bucket.costUsd += traceCost;
+  bucket.costUsdWithoutCache += traceCostWithoutCache ?? 0;
+  addTtftSample(bucket.ttftGroups, trace);
+  addAccountSelection(bucket.accountSelection, trace.accountSelection);
+
+  const existing = bucket.models.get(model);
+  if (existing) {
+    existing.count += 1;
+    if (!trace.isError) existing.okCount += 1;
+    existing.tokensInput += trace.tokensInput ?? 0;
+    existing.tokensInputCached += trace.tokensInputCached ?? 0;
+    existing.tokensOutput += trace.tokensOutput ?? 0;
+    existing.tokensTotal += traceTokensTotal;
+    existing.costUsd += traceCost;
+    return;
+  }
+
+  bucket.models.set(model, {
+    model,
+    count: 1,
+    okCount: trace.isError ? 0 : 1,
+    tokensInput: trace.tokensInput ?? 0,
+    tokensInputCached: trace.tokensInputCached ?? 0,
+    tokensOutput: trace.tokensOutput ?? 0,
+    tokensTotal: traceTokensTotal,
+    costUsd: traceCost,
+  });
+}
+
+export type TraceManager = ReturnType<typeof createTraceManager>;
+
+function tracePath(route: string | undefined): string {
+  const normalized = String(route ?? "").trim();
+  if (!normalized) return "";
+  const routeWithoutMethod = normalized.replace(
+    /^[!#$%&'*+\-.^_`|~0-9A-Z]+\s+/i,
+    "",
+  );
+  return routeWithoutMethod.split("?")[0];
+}
+
+export function isInferenceTraceRoute(route: string | undefined): boolean {
+  const pathOnly = tracePath(route);
+  return (
+    pathOnly === "/responses" ||
+    pathOnly === "/responses/compact" ||
+    pathOnly === "/chat/completions" ||
+    pathOnly === "/messages" ||
+    pathOnly === "/v1/responses" ||
+    pathOnly === "/v1/responses/compact" ||
+    pathOnly === "/v1/chat/completions" ||
+    pathOnly === "/v1/messages"
+  );
+}
+
+export function isHiddenTraceRoute(route: string | undefined): boolean {
+  const pathOnly = tracePath(route);
+  if (!pathOnly) return false;
+  return (
+    pathOnly === "/" ||
+    pathOnly === "/health" ||
+    pathOnly === "/favicon.ico" ||
+    pathOnly === "/admin" ||
+    pathOnly.startsWith("/admin/") ||
+    pathOnly.startsWith("/assets/") ||
+    pathOnly === "/models" ||
+    /^\/models\/[^/]+$/.test(pathOnly) ||
+    pathOnly === "/v1/models" ||
+    /^\/v1\/models\/[^/]+$/.test(pathOnly) ||
+    pathOnly === "/api/v1/models" ||
+    /^\/api\/v1\/models\/[^/]+$/.test(pathOnly) ||
+    pathOnly === "/api/tags" ||
+    pathOnly === "/version" ||
+    pathOnly === "/props" ||
+    pathOnly === "/v1/props"
+  );
+}
+
+export function buildBucketTraceStats(buckets: Iterable<TraceBucketAggregate>, totalStored: number, sinceMs?: number, untilMs?: number): { totalStored: number; matched: number; stats: TraceStats } {
+    function* selectedBuckets() {
+      for (const bucket of buckets) {
+        if (typeof sinceMs === "number" && Number.isFinite(sinceMs) && bucket.at + HOUR_MS <= sinceMs) continue;
+        if (typeof untilMs === "number" && Number.isFinite(untilMs) && bucket.at > untilMs) continue;
+        yield bucket;
+      }
+    }
+
+    const modelMap = new Map<string, TraceModelStats>();
+    const ttftGroups = new Map<string, MutableTraceTtftStats>();
+    const accountSelection = createAccountSelectionSummary();
+    let requests = 0;
+    let upstreamAttempts = 0;
+    let retriedRequests = 0;
+    let recoveredRequests = 0;
+    let requestsWithUsage = 0;
+    let requestsWithCost = 0;
+    let unpricedRequests = 0;
+    let errors = 0;
+    let tokensInput = 0;
+    let tokensInputCached = 0;
+    let tokensOutput = 0;
+    let tokensTotal = 0;
+    let inferenceSpeedTotal = 0;
+    let inferenceRequests = 0;
+    let costUsd = 0;
+    let costUsdWithoutCache = 0;
+    let latencyWeightedTotal = 0;
+
+    const timeseries: TraceTimeseriesBucket[] = [];
+    for (const bucket of selectedBuckets()) {
+      requests += bucket.requests;
+      upstreamAttempts += bucket.upstreamAttempts;
+      retriedRequests += bucket.retriedRequests;
+      recoveredRequests += bucket.recoveredRequests;
+      requestsWithUsage += bucket.requestsWithUsage;
+      requestsWithCost += bucket.requestsWithCost;
+      unpricedRequests += bucket.unpricedRequests;
+      errors += bucket.errors;
+      tokensInput += bucket.tokensInput;
+      tokensInputCached += bucket.tokensInputCached;
+      tokensOutput += bucket.tokensOutput;
+      tokensTotal += bucket.tokensTotal;
+      inferenceSpeedTotal += bucket.inferenceSpeedTotal;
+      inferenceRequests += bucket.inferenceSpeedCount;
+      costUsd += bucket.costUsd;
+      costUsdWithoutCache += bucket.costUsdWithoutCache;
+      latencyWeightedTotal += bucket.latencyMsTotal;
+      for (const group of bucket.ttftGroups.values()) {
+        mergeTtftGroup(ttftGroups, group);
+      }
+      mergeAccountSelection(accountSelection, bucket.accountSelection);
+
+      for (const model of bucket.models.values()) {
+        const existing = modelMap.get(model.model);
+        if (existing) {
+          existing.count += model.count;
+          existing.okCount += model.okCount;
+          existing.tokensInput += model.tokensInput;
+          existing.tokensInputCached += model.tokensInputCached;
+          existing.tokensOutput += model.tokensOutput;
+          existing.tokensTotal += model.tokensTotal;
+          existing.costUsd += model.costUsd;
+        } else {
+          modelMap.set(model.model, { ...model });
+        }
+      }
+
+      timeseries.push({
+        at: bucket.at,
+        requests: bucket.requests,
+        upstreamAttempts: bucket.upstreamAttempts,
+        retriedRequests: bucket.retriedRequests,
+        recoveredRequests: bucket.recoveredRequests,
+        errors: bucket.errors,
+        tokensInput: bucket.tokensInput,
+        tokensInputCached: bucket.tokensInputCached,
+        tokensOutput: bucket.tokensOutput,
+        tokensTotal: bucket.tokensTotal,
+        inferenceTokensPerSecond: bucket.inferenceSpeedCount ? bucket.inferenceSpeedTotal / bucket.inferenceSpeedCount : 0,
+        inferenceRequests: bucket.inferenceSpeedCount,
+        costUsd: bucket.costUsd,
+        latencyP50Ms: percentile(bucket.latencies, 50),
+        latencyP95Ms: percentile(bucket.latencies, 95),
+      });
+    }
+    timeseries.sort((a, b) => a.at - b.at);
+
+    return {
+      totalStored,
+      matched: requests,
+      stats: {
+        totals: {
+          requests,
+          upstreamAttempts,
+          retriedRequests,
+          recoveredRequests,
+          requestsWithUsage,
+          requestsWithCost,
+          unpricedRequests,
+          errors,
+          errorRate: requests ? errors / requests : 0,
+          tokensInput,
+          tokensInputCached,
+          tokensOutput,
+          tokensTotal,
+          inferenceTokensPerSecond: inferenceRequests
+            ? inferenceSpeedTotal / inferenceRequests
+            : 0,
+          inferenceRequests,
+          costUsdWithoutCache,
+          costUsd,
+          latencyAvgMs: requests ? latencyWeightedTotal / requests : 0,
+        },
+        models: Array.from(modelMap.values()).sort((a, b) => b.count - a.count),
+        timeseries,
+        ttftByProviderModel: finalizeTtftGroups(ttftGroups),
+        accountSelection: finalizeAccountSelection(accountSelection),
+      },
+    };
+}
+
+export function toStatsHistoryEntry(entry: TraceEntry): TraceEntry {
+    const {
+      requestBody: _requestBody,
+      requestHeaders: _requestHeaders,
+      codexSessionId: _codexSessionId,
+      codexProjectRoot: _codexProjectRoot,
+      codexProjectHost: _codexProjectHost,
+      usage: _usage,
+      error: _error,
+      upstreamError: _upstreamError,
+      upstreamContentType: _upstreamContentType,
+      upstreamEmptyBody: _upstreamEmptyBody,
+      imageTrace: _imageTrace,
+      assistantEmptyOutput: _assistantEmptyOutput,
+      assistantFinishReason: _assistantFinishReason,
+      responseStreamDiagnostics: _responseStreamDiagnostics,
+      ...rest
+    } = entry;
+    const sessionKey =
+      rest.sessionKey ??
+      (entry.codexSessionId
+        ? sessionKeyFor(entry.application, entry.codexSessionId)
+        : undefined);
+    return sessionKey ? { ...rest, sessionKey } : rest;
+  }
+
+
+export function createTraceManager(config: TraceManagerConfig) {
+  const analytics = config.indexedHistoryPath ? new TraceAnalyticsClient(config) : undefined;
+  const observers = new Set<Promise<void>>();
+  function notifyCompleted(entry: TraceEntry) {
+    if (!config.onCompleted || entry.status < 200 || observers.size >= 256) return;
+    const pending = Promise.resolve().then(() => config.onCompleted!(entry)).then(() => undefined)
+      .catch(() => { console.warn("Plugin trace observer failed"); });
+    observers.add(pending);
+    void pending.finally(() => observers.delete(pending));
+  }
+
+  const {
+    filePath,
+    historyFilePath = `${filePath}.stats-history`,
+    retentionMax = DEFAULT_RETENTION_MAX,
+    pageSizeMax = DEFAULT_PAGE_SIZE_MAX,
+    legacyLimitMax = DEFAULT_LEGACY_LIMIT_MAX,
+    resolveCodexProject,
+  } = config;
+
+  let traceWriteQueue: Promise<void> = Promise.resolve();
+  let historyWriteQueue: Promise<void> = Promise.resolve();
+  const traceCache: TraceEntry[] = [];
+  const statsBuckets = new Map<number, TraceBucketAggregate>();
+  const statsHistoryIds = new Set<string>();
+  let totalStored = 0;
+  let physicalTraceLineCount = 0;
+  let traceCompactionQueued = false;
+  let cacheInit: Promise<void> | null = null;
+  let lastWriteError: { at: number; message: string } | undefined;
+  const traceCompactionThreshold = Math.max(
+    retentionMax + 1,
+    Math.ceil(retentionMax * TRACE_COMPACTION_RATIO),
+  );
+  const trackedHistoryIdLimit = Math.max(retentionMax * 2, 2_000);
+
+  function rememberStatsHistoryId(id: string) {
+    statsHistoryIds.delete(id);
+    statsHistoryIds.add(id);
+    while (!config.externalWriter && statsHistoryIds.size > trackedHistoryIdLimit) {
+      const oldest = statsHistoryIds.values().next().value;
+      if (typeof oldest !== "string") break;
+      statsHistoryIds.delete(oldest);
+    }
+  }
+
+  function setLastWriteError(error: unknown) {
+    lastWriteError = {
+      at: Date.now(),
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  async function ensureParentDir(file: string) {
+    await fs.mkdir(path.dirname(file), { recursive: true });
+  }
+
+  function trimTraceCache() {
+    if (traceCache.length <= retentionMax) return;
+
+    const completedSlots = Math.max(
+      0,
+      retentionMax -
+        traceCache.reduce(
+          (count, trace) =>
+            count + (trace.lifecycleState === "started" ? 1 : 0),
+          0,
+        ),
+    );
+    let completedToKeep = completedSlots;
+    const keep = new Array<boolean>(traceCache.length).fill(false);
+    for (let i = traceCache.length - 1; i >= 0; i -= 1) {
+      if (traceCache[i].lifecycleState === "started") {
+        keep[i] = true;
+      } else if (completedToKeep > 0) {
+        keep[i] = true;
+        completedToKeep -= 1;
+      }
+    }
+    const trimmed = traceCache.filter((_trace, index) => keep[index]);
+    traceCache.splice(0, traceCache.length, ...trimmed);
+  }
+
+  async function readTraceFileFromDisk(): Promise<{
+    traces: TraceEntry[];
+    physicalLineCount: number;
+  }> {
+    try {
+      const raw = await fs.readFile(filePath, "utf8");
+      const latestById = new Map<string, TraceEntry>();
+      let physicalLineCount = 0;
+      for (const line of raw.split("\n")) {
+        if (!line.trim()) continue;
+        physicalLineCount += 1;
+        try {
+          const normalized = normalizeTrace(JSON.parse(line));
+          if (!normalized) continue;
+          // A completed lifecycle trace is appended with the same id as its
+          // durable "started" record. Delete first so Map iteration reflects
+          // the position of the latest physical record.
+          latestById.delete(normalized.id);
+          latestById.set(normalized.id, normalized);
+        } catch {}
+      }
+      return {
+        traces: Array.from(latestById.values()),
+        physicalLineCount,
+      };
+    } catch {
+      return { traces: [], physicalLineCount: 0 };
+    }
+  }
+
+  async function scanStatsHistory<T>(
+    onTrace: (trace: TraceEntry) => void,
+    shouldCollect?: (trace: TraceEntry) => boolean,
+  ): Promise<T extends true ? TraceEntry[] : void>;
+  async function scanStatsHistory(
+    onTrace: (trace: TraceEntry) => void,
+    shouldCollect?: (trace: TraceEntry) => boolean,
+  ): Promise<TraceEntry[] | void> {
+    try {
+      const collected: TraceEntry[] = [];
+      const input = createReadStream(historyFilePath, { encoding: "utf8" });
+      const lines = createInterface({ input, crlfDelay: Infinity });
+      for await (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const normalized = normalizeTrace(JSON.parse(line));
+          if (!normalized) continue;
+          onTrace(normalized);
+          if (shouldCollect?.(normalized)) collected.push(normalized);
+        } catch {}
+      }
+      return shouldCollect ? collected : undefined;
+    } catch {
+      return shouldCollect ? [] : undefined;
+    }
+  }
+
+  function ingestStatsTrace(trace: TraceEntry) {
+    if (isHiddenTraceRoute(trace.route) || trace.traceKind === "diagnostic") return;
+    totalStored += 1;
+    const bucketAt = Math.floor(trace.at / HOUR_MS) * HOUR_MS;
+    const bucket = statsBuckets.get(bucketAt) ?? createEmptyBucket(bucketAt);
+    addTraceToBucket(bucket, trace);
+    statsBuckets.set(bucketAt, bucket);
+  }
+
+  function ingestPersistedStatsTrace(trace: TraceEntry) {
+    if (statsHistoryIds.has(trace.id)) return;
+    rememberStatsHistoryId(trace.id);
+    ingestStatsTrace(trace);
+  }
+
+  async function ensureCacheReady() {
+    if (cacheInit) {
+      await cacheInit;
+      return;
+    }
+    cacheInit = (async () => {
+      await Promise.all([ensureParentDir(filePath), ensureParentDir(historyFilePath)]);
+      const [{ traces, physicalLineCount }] = await Promise.all([
+        config.externalWriter
+          ? Promise.resolve({ traces: [], physicalLineCount: 0 })
+          : readTraceFileFromDisk(),
+        analytics ? analytics.initialize() : scanStatsHistory(ingestPersistedStatsTrace),
+      ]);
+      traceCache.splice(0, traceCache.length, ...traces);
+      trimTraceCache();
+      physicalTraceLineCount = physicalLineCount;
+    })();
+    await cacheInit;
+  }
+
+  let externalOffset = 0;
+  let externalIdentity: string | undefined;
+  let externalSync: Promise<void> | undefined;
+
+  async function syncExternalTraces(): Promise<void> {
+    await ensureCacheReady();
+    if (!config.externalWriter || analytics) return;
+    if (externalSync) return externalSync;
+    externalSync = queueTraceWrite(async () => {
+      let handle;
+      try {
+        handle = await fs.open(filePath, "r");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+      }
+      try {
+        const stat = await handle.stat();
+        const identity = `${stat.dev}:${stat.ino}`;
+        if (identity !== externalIdentity || stat.size < externalOffset) {
+          externalOffset = 0;
+          externalIdentity = identity;
+        }
+        if (stat.size <= externalOffset) return;
+        const input = handle.createReadStream({
+          start: externalOffset, end: stat.size - 1, autoClose: false,
+        });
+        let pending = Buffer.alloc(0);
+        for await (const chunk of input) {
+          pending = Buffer.concat([pending, chunk as Buffer]);
+          let newline: number;
+          while ((newline = pending.indexOf(10)) >= 0) {
+            const line = pending.subarray(0, newline).toString("utf8");
+            let entry: TraceEntry | null = null;
+            try { entry = normalizeTrace(JSON.parse(line)); } catch {}
+            if (entry) {
+              const index = traceCache.findIndex((trace) => trace.id === entry!.id);
+              if (index >= 0) traceCache.splice(index, 1);
+              traceCache.push(entry);
+              trimTraceCache();
+              if (entry.lifecycleState !== "started") await appendStatsHistory(entry);
+            }
+            // Commit the cursor only after durable history persistence. A final
+            // partial line is retried on the next read, including split UTF-8.
+            externalOffset += newline + 1;
+            pending = pending.subarray(newline + 1);
+          }
+        }
+      } finally {
+        await handle.close();
+      }
+    });
+    try { await externalSync; } finally { externalSync = undefined; }
+  }
+
+  async function initialize(): Promise<void> {
+    await syncExternalTraces();
+  }
+
+  async function writeTraceWindow(entries: TraceEntry[]): Promise<void> {
+    if (config.externalWriter) throw new Error("Cannot rewrite an externally written trace journal");
+    const tmp = `${filePath}.tmp-${randomUUID()}`;
+    const BATCH_SIZE = 1000;
+    const MAX_ENTRY_SIZE = 1024 * 1024; // 1MB per entry max
+    const fileHandle = await fs.open(tmp, 'w');
+    let writtenEntries = 0;
+    try {
+      for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+        const batch = entries.slice(i, i + BATCH_SIZE);
+        const batchLines = [];
+        for (const entry of batch) {
+          const json = JSON.stringify(entry);
+          if (json.length > MAX_ENTRY_SIZE) {
+            console.warn(`Skipping oversized trace entry (${json.length} bytes)`);
+            continue;
+          }
+          batchLines.push(json);
+          writtenEntries += 1;
+        }
+        if (batchLines.length > 0) {
+          const batchContent = batchLines.join('\n') + '\n';
+          await fileHandle.writeFile(batchContent);
+        }
+      }
+    } finally {
+      await fileHandle.close();
+    }
+    await fs.rename(tmp, filePath);
+    physicalTraceLineCount = writtenEntries;
+  }
+
+  function queueTraceWrite(operation: () => Promise<void>): Promise<void> {
+    const run = traceWriteQueue.then(operation);
+    traceWriteQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  async function appendTraceRecord(entry: TraceEntry): Promise<void> {
+    const index = traceCache.findIndex((trace) => trace.id === entry.id);
+    if (index >= 0) traceCache.splice(index, 1);
+    traceCache.push(entry);
+    trimTraceCache();
+    await ensureParentDir(filePath);
+    await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf8");
+    physicalTraceLineCount += 1;
+  }
+
+  function queueTraceCompactionIfNeeded() {
+    if (
+      config.externalWriter ||
+      traceCompactionQueued ||
+      physicalTraceLineCount <= traceCompactionThreshold
+    ) {
+      return;
+    }
+
+    traceCompactionQueued = true;
+    const run = queueTraceWrite(async () => {
+      try {
+        if (physicalTraceLineCount > traceCompactionThreshold) {
+          await writeTraceWindow(traceCache);
+        }
+      } finally {
+        traceCompactionQueued = false;
+      }
+    });
+    void run.catch((err) => {
+      setLastWriteError(err);
+      console.error("trace compaction failed", err);
+    });
+  }
+
+
+  function toNormalizedHistoryEntry(entry: TraceEntry): TraceEntry | null {
+    return normalizeTrace(toStatsHistoryEntry(entry));
+  }
+
+  async function appendStatsHistory(entry: TraceEntry): Promise<void> {
+    await ensureCacheReady();
+    if (entry.traceKind === "diagnostic") return;
+    if (analytics) { await analytics.call("append", { entries: [toStatsHistoryEntry(entry)] }); return; }
+    const normalized = toNormalizedHistoryEntry(entry);
+    const line = `${JSON.stringify(toStatsHistoryEntry(entry))}\n`;
+    const run = historyWriteQueue.then(async () => {
+      if (normalized && statsHistoryIds.has(normalized.id)) return;
+      await ensureParentDir(historyFilePath);
+      await fs.appendFile(historyFilePath, line, "utf8");
+      if (normalized) {
+        rememberStatsHistoryId(normalized.id);
+        ingestStatsTrace(normalized);
+      }
+    });
+    historyWriteQueue = run.catch(() => undefined);
+    await run;
+  }
+
+  async function readTraceWindow(): Promise<TraceEntry[]> {
+    if (analytics && config.externalWriter) return analytics.call("recent", {});
+    await syncExternalTraces();
+    return traceCache.slice();
+  }
+
+  async function readTraceById(id: string): Promise<TraceEntry | null> {
+    if (analytics && config.externalWriter) return analytics.call("trace", { id });
+    await syncExternalTraces();
+    return traceCache.find((trace) => trace.id === id) ?? null;
+  }
+
+  function toTraceListEntry(entry: TraceEntry): TraceListEntry {
+    const {
+      requestBody: _requestBody,
+      requestHeaders: _requestHeaders,
+      ...rest
+    } = entry;
+    return {
+      ...rest,
+      hasRequestBody: typeof entry.requestBody !== "undefined",
+      hasRequestHeaders: typeof entry.requestHeaders !== "undefined",
+    };
+  }
+
+  async function readTraceListWindow(): Promise<TraceListEntry[]> {
+    if (analytics && config.externalWriter) return (await readTraceWindow()).map(toTraceListEntry);
+    await syncExternalTraces();
+    return traceCache.map(toTraceListEntry);
+  }
+
+  async function readStatsHistory(): Promise<TraceEntry[]> {
+    if (analytics) return analytics.call("range", {});
+    await syncExternalTraces();
+    const traces = await scanStatsHistory<true>(() => undefined, () => true);
+    return traces ?? [];
+  }
+
+  async function readStatsHistoryRange(
+    sinceMs?: number,
+    untilMs?: number,
+  ): Promise<TraceEntry[]> {
+    if (analytics) return analytics.call("range", { sinceMs, untilMs });
+    await syncExternalTraces();
+    const traces = await scanStatsHistory<true>(
+      () => undefined,
+      (t) => {
+        if (
+          typeof sinceMs === "number" &&
+          Number.isFinite(sinceMs) &&
+          t.at < sinceMs
+        ) {
+          return false;
+        }
+        if (
+          typeof untilMs === "number" &&
+          Number.isFinite(untilMs) &&
+          t.at > untilMs
+        ) {
+          return false;
+        }
+        return true;
+      },
+    );
+    return traces ?? [];
+  }
+
+  async function aggregateAnonymousOutputTokens(
+    sinceMs: number,
+    untilMs: number,
+    modelAllowlist: Readonly<Record<string, string>>,
+  ): Promise<AnonymousModelOutputTotal[]> {
+    if (analytics) return analytics.call("anonymous", { sinceMs, untilMs, modelAllowlist });
+    await syncExternalTraces();
+    const totals = new Map<string, number>();
+    await scanStatsHistory((trace) => {
+      const completedAt = trace.completedAt ?? trace.at;
+      if (
+        trace.lifecycleState !== "completed" ||
+        trace.isError ||
+        completedAt < sinceMs ||
+        completedAt >= untilMs
+      ) {
+        return;
+      }
+      const publicModelId = trace.requestedModel ?? trace.model;
+      if (!publicModelId) return;
+      const canonicalModelId = modelAllowlist[publicModelId];
+      if (!canonicalModelId) return;
+      const outputTokens = Number.isFinite(trace.tokensOutput)
+        ? Math.max(0, Math.floor(trace.tokensOutput ?? 0))
+        : 0;
+      if (!outputTokens) return;
+      totals.set(
+        canonicalModelId,
+        Math.min(1_000_000_000, (totals.get(canonicalModelId) ?? 0) + outputTokens),
+      );
+    });
+    return [...totals]
+      .map(([modelId, outputTokens]) => ({ modelId, outputTokens }))
+      .sort((left, right) => right.outputTokens - left.outputTokens || left.modelId.localeCompare(right.modelId));
+  }
+
+  /**
+   * Projects the completed traces of one window for the opt-in community
+   * report. It returns only bounded aggregate inputs, never prompts, outputs,
+   * projects or account identifiers.
+   */
+  async function collectCommunityReportTraces(
+    sinceMs: number,
+    untilMs: number,
+    limit = 50_000,
+  ): Promise<CommunityReportTrace[]> {
+    if (analytics) return analytics.call("community", { sinceMs, untilMs, limit });
+    await syncExternalTraces();
+    const selected: CommunityReportTrace[] = [];
+    await scanStatsHistory((trace) => {
+      if (selected.length >= limit) return;
+      const completedAt = trace.completedAt ?? trace.at;
+      if (trace.lifecycleState !== "completed" || completedAt < sinceMs || completedAt >= untilMs) return;
+      if (trace.executionLocation !== "local" && trace.executionLocation !== "personal-cluster") return;
+      selected.push({
+        lifecycleState: trace.lifecycleState,
+        isError: trace.isError,
+        provider: trace.provider,
+        model: trace.model,
+        requestedModel: trace.requestedModel,
+        resolvedModel: trace.resolvedModel,
+        executionLocation: trace.executionLocation,
+        latencyMs: trace.latencyMs,
+        ttftMs: trace.ttftMs,
+        tokensInput: trace.tokensInput,
+        tokensOutput: trace.tokensOutput,
+        tokensInputCached: trace.tokensInputCached,
+        tokensReasoning: trace.tokensReasoning,
+      });
+    });
+    return selected;
+  }
+
+  async function seedStatsHistoryIfMissing() {
+    if (analytics && config.externalWriter) return;
+    await syncExternalTraces();
+    for (const entry of traceCache) {
+      if (entry.lifecycleState === "started" || statsHistoryIds.has(entry.id)) {
+        continue;
+      }
+      await appendStatsHistory(entry);
+    }
+  }
+
+  async function compactTraceStorageIfNeeded() {
+    if (config.externalWriter) return;
+    await ensureCacheReady();
+    if (physicalTraceLineCount <= traceCompactionThreshold) return;
+    await queueTraceWrite(async () => {
+      if (physicalTraceLineCount > traceCompactionThreshold) {
+        trimTraceCache();
+        await writeTraceWindow(traceCache);
+      }
+    });
+  }
+
+  async function getTraceStats(
+    sinceMs?: number,
+    untilMs?: number,
+  ): Promise<{ totalStored: number; matched: number; stats: TraceStats }> {
+    await syncExternalTraces();
+    if (analytics) return analytics.call("stats", { sinceMs, untilMs });
+    return buildBucketTraceStats([...statsBuckets.values()].sort((a, b) => a.at - b.at), totalStored, sinceMs, untilMs);
+  }
+
+  async function appendTrace(
+    entry: Omit<
+      TraceEntry,
+      | "id"
+      | "isError"
+      | "tokensInput"
+      | "tokensInputCached"
+      | "tokensInputCacheWrite"
+      | "tokensOutput"
+      | "tokensReasoning"
+      | "tokensTotal"
+    >,
+  ) {
+    const finalEntry = materializeTrace(entry);
+
+    // Fire trace file write asynchronously - don't block on this
+    const run = queueTraceWrite(async () => {
+      await ensureCacheReady();
+      await appendTraceRecord(finalEntry);
+    });
+    const traceWrite = run.then(queueTraceCompactionIfNeeded);
+
+    try {
+      await Promise.all([traceWrite, appendStatsHistory(finalEntry)]);
+      notifyCompleted(finalEntry);
+      lastWriteError = undefined;
+    } catch (error) {
+      setLastWriteError(error);
+      throw error;
+    }
+  }
+
+  type TraceInput = Omit<
+    TraceEntry,
+    | "id"
+    | "isError"
+    | "tokensInput"
+    | "tokensInputCached"
+    | "tokensInputCacheWrite"
+    | "tokensOutput"
+    | "tokensReasoning"
+    | "tokensTotal"
+  >;
+
+  function materializeTrace(entry: TraceInput, id: string = randomUUID()): TraceEntry {
+    const project = entry.projectId
+      ? undefined
+      : resolveCodexProject?.(
+          entry.codexSessionId,
+          entry.codexProjectRoot,
+          entry.codexProjectHost,
+        );
+    const {
+      codexProjectRoot: _codexProjectRoot,
+      codexProjectHost: _codexProjectHost,
+      ...traceEntry
+    } = entry;
+    const normalizedTokens = normalizeTokenFields(entry.usage);
+    const hasMeasuredTokens = [
+      normalizedTokens.tokensInput,
+      normalizedTokens.tokensOutput,
+      normalizedTokens.tokensTotal,
+    ].some((value) => typeof value === "number");
+    const usageStatus =
+      entry.usageStatus === "measured" || hasMeasuredTokens
+        ? "measured"
+        : "missing";
+    const costUsd =
+      usageStatus === "measured"
+        ? entry.route.includes("/images/")
+        ? estimateImageCostUsd(entry.resolvedModel ?? entry.model, entry.usage)
+        : estimateCostUsd(
+            entry.model,
+            normalizedTokens.tokensInput ?? 0,
+            normalizedTokens.tokensOutput ?? 0,
+            normalizedTokens.tokensInputCached ?? 0,
+            normalizedTokens.tokensInputCacheWrite ?? 0,
+          )
+        : undefined;
+    const completedAt =
+      entry.completedAt ??
+      (entry.lifecycleState === "started" ? undefined : entry.at);
+    const startedAt =
+      entry.startedAt ??
+      (typeof completedAt === "number"
+        ? completedAt - Math.max(0, entry.latencyMs)
+        : undefined);
+    return {
+      ...traceEntry,
+      ...project,
+      id,
+      isError: hasTraceFailure(entry),
+      startedAt,
+      completedAt,
+      tokensInput: normalizedTokens.tokensInput,
+      tokensInputCached: normalizedTokens.tokensInputCached,
+      tokensInputCacheWrite: normalizedTokens.tokensInputCacheWrite,
+      tokensOutput: normalizedTokens.tokensOutput,
+      tokensReasoning: normalizedTokens.tokensReasoning,
+      tokensTotal: normalizedTokens.tokensTotal,
+      costUsd,
+      pricingVersion: costUsd !== undefined ? MODEL_PRICING_VERSION : undefined,
+      usageStatus,
+      costStatus:
+        costUsd !== undefined
+          ? "estimated"
+          : usageStatus === "measured" && entry.model
+            ? "unpriced"
+            : "unknown",
+    };
+  }
+
+  async function beginTrace(entry: TraceInput): Promise<string> {
+    const initial = materializeTrace({
+      ...entry,
+      lifecycleState: "started",
+      startedAt: entry.startedAt ?? entry.at,
+    });
+    const run = queueTraceWrite(async () => {
+      await ensureCacheReady();
+      await appendTraceRecord(initial);
+    });
+    try {
+      await run;
+      lastWriteError = undefined;
+      queueTraceCompactionIfNeeded();
+      return initial.id;
+    } catch (error) {
+      setLastWriteError(error);
+      throw error;
+    }
+  }
+
+  async function completeTrace(id: string, entry: TraceInput): Promise<void> {
+    const finalEntry = materializeTrace(
+      {
+        ...entry,
+        lifecycleState:
+          entry.lifecycleState ?? (entry.clientDisconnected ? "interrupted" : "completed"),
+        completedAt: entry.completedAt ?? entry.at,
+      },
+      id,
+    );
+    const run = queueTraceWrite(async () => {
+      await ensureCacheReady();
+      await appendTraceRecord(finalEntry);
+    });
+    try {
+      await run;
+      queueTraceCompactionIfNeeded();
+      await appendStatsHistory(finalEntry);
+      notifyCompleted(finalEntry);
+      lastWriteError = undefined;
+    } catch (error) {
+      setLastWriteError(error);
+      throw error;
+    }
+  }
+
+  function recordTrace(
+    entry: Omit<
+      TraceEntry,
+      | "id"
+      | "isError"
+      | "tokensInput"
+      | "tokensInputCached"
+      | "tokensInputCacheWrite"
+      | "tokensOutput"
+      | "tokensReasoning"
+      | "tokensTotal"
+    >,
+  ) {
+    void appendTrace(entry).catch((err) => {
+      console.error("trace append failed", err);
+    });
+  }
+
+  async function flushPendingWrites(): Promise<void> {
+    await Promise.all([traceWriteQueue, historyWriteQueue]);
+    await Promise.all([...observers]);
+    if (lastWriteError) {
+      throw new Error(`trace persistence failed: ${lastWriteError.message}`);
+    }
+  }
+
+  function getPersistenceStatus() {
+    return {
+      lastError: lastWriteError,
+      analytics: analytics?.status,
+    };
+  }
+
+  async function readTracesLegacy(limit = 200): Promise<TraceEntry[]> {
+    if (analytics && config.externalWriter) return (await readTraceWindow()).slice(-Math.max(1, Math.min(limit, legacyLimitMax)));
+    await syncExternalTraces();
+    const sliced = traceCache.slice(
+      -Math.max(1, Math.min(limit, legacyLimitMax)),
+    );
+    return sliced;
+  }
+
+  return {
+    initialize,
+    queryAnalytics: analytics ? (action: string, args: Record<string, unknown>) => analytics.call(action, args) : undefined,
+    close: async () => { await flushPendingWrites(); await analytics?.close(); },
+    readTraceWindow,
+    readTraceById,
+    readTraceListWindow,
+    writeTraceWindow,
+    readStatsHistory,
+    readStatsHistoryRange,
+    aggregateAnonymousOutputTokens,
+    collectCommunityReportTraces,
+    seedStatsHistoryIfMissing,
+    compactTraceStorageIfNeeded,
+    getTraceStats,
+    appendTrace,
+    recordTrace,
+    beginTrace,
+    completeTrace,
+    flushPendingWrites,
+    getPersistenceStatus,
+    readTracesLegacy,
+    buildTraceStats,
+    createUsageAggregate,
+    addTraceToAggregate,
+    finalizeAggregate,
+    usageToTokens,
+    pageSizeMax,
+    retentionMax,
+    legacyLimitMax,
+  };
+}

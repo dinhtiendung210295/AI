@@ -1,0 +1,458 @@
+import AVFoundation
+import Foundation
+import MediaPlayer
+import Observation
+import UIKit
+
+@MainActor @Observable final class RealtimeVoiceController {
+    enum Phase: String { case idle, connecting, listening, thinking, speaking, reconnecting, awaitingConfirmation, ended }
+    var phase: Phase = .idle
+    var partialUser = ""
+    var partialAssistant = ""
+    var muted = false
+    var error: String?
+    var route = ""
+    var inputAudioLevel = 0.0
+    var outputAudioLevel = 0.0
+    var orbAudioLevel: Double { max(inputAudioLevel, outputAudioLevel) }
+    private var socket: URLSessionWebSocketTask?
+    private var webRTC: VoiceWebRTCTransport?
+    private var capture = AVAudioEngine()
+    private var playback = AVAudioEngine()
+    private var player = AVAudioPlayerNode()
+    private var session: VoiceSession?
+    private var accountToken = ""
+    private var receiveTask: Task<Void, Never>?
+    private var expiryTask: Task<Void, Never>?
+    private var observers: [NSObjectProtocol] = []
+    private var remoteCommands: [(MPRemoteCommand, Any)] = []
+    private var ledger = VoiceTranscriptLedger()
+    private var captureTapInstalled = false
+    private var playbackMeterTapInstalled = false
+    private var pendingAudio: [String: Int] = [:]
+    private var audioFramers: [String: VoicePCM16Framer] = [:]
+    private var audioGeneration = 0
+    private var onTurn: (@MainActor (String, String, String) async -> Bool)?
+    private var sessionClosed = false
+    private var closing = false
+    private var cueEngine: AVAudioEngine?
+    private var cuePlayer: AVAudioPlayerNode?
+
+    func start(session: VoiceSession, history: [ChatMessage], accountToken: String, backgroundAudio: Bool, headers: [String: String] = [:],
+               onTurn: @escaping @MainActor (String, String, String) async -> Bool) async {
+        endAudio()
+        self.session = session; self.accountToken = accountToken; self.onTurn = onTurn
+        sessionClosed = false; ledger = VoiceTranscriptLedger()
+        route = session.route; error = nil; phase = .connecting
+        do {
+            guard session.expiresAt > Date() else { throw URLError(.userAuthenticationRequired) }
+            let audio = AVAudioSession.sharedInstance()
+            try audio.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetoothHFP])
+            try audio.setPreferredIOBufferDuration(0.02)
+            try audio.setActive(true)
+            installLifecycle(backgroundAudio: backgroundAudio)
+            expiryTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(max(0, session.expiresAt.timeIntervalSinceNow)))
+                guard !Task.isCancelled else { return }
+                self?.fail("La session vocale a expiré. Vous pouvez en ouvrir une nouvelle.")
+            }
+            if session.credential.transport == "webrtc" {
+                let transport = VoiceWebRTCTransport()
+                webRTC = transport
+                transport.onEvent = { [weak self] data in Task { @MainActor in await self?.receive(data) } }
+                transport.onDisconnect = { [weak self] in self?.fail("La connexion audio est interrompue. Ouvrez une nouvelle session.") }
+                transport.onAudioLevels = { [weak self] input, output in
+                    guard let self else { return }
+                    self.inputAudioLevel = self.muted ? 0 : VoiceAudioLevel.smoothed(current: self.inputAudioLevel, target: input)
+                    self.outputAudioLevel = VoiceAudioLevel.smoothed(current: self.outputAudioLevel, target: output)
+                }
+                try await transport.connect(session.credential)
+            } else {
+                guard session.credential.transport == "websocket", session.credential.endpoint.scheme == "wss" else { throw URLError(.unsupportedURL) }
+                var request = URLRequest(url: session.credential.endpoint)
+                request.setValue("Bearer \(session.credential.token)", forHTTPHeaderField: "Authorization")
+                for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
+                let configuration = URLSessionConfiguration.ephemeral
+                configuration.httpCookieStorage = nil; configuration.urlCache = nil
+                let task = URLSession(configuration: configuration, delegate: VoiceSocketRedirectPolicy(), delegateQueue: nil).webSocketTask(with: request)
+                socket = task; task.resume()
+                playback.attach(player)
+                playback.connect(player, to: playback.mainMixerNode, format: outputFormat)
+                playback.mainMixerNode.installTap(onBus: 0, bufferSize: 2_048, format: nil,
+                                                   block: Self.playbackMeterTap(controller: self))
+                playbackMeterTapInstalled = true
+                try playback.start(); player.play()
+            }
+            try Task.checkCancellation()
+            guard phase != .ended else { return }
+            var input: [String: Any] = ["turn_detection": ["type": "server_vad", "interrupt_response": true],
+                                         "transcription": ["model": "gpt-4o-mini-transcribe"]]
+            var output: [String: Any] = [:]
+            if webRTC == nil {
+                input["format"] = ["type": "audio/pcm", "rate": 24000]
+                output["format"] = ["type": "audio/pcm", "rate": 24000]
+            }
+            try await send(["type": "session.update", "session": ["type": "realtime", "tools": [],
+                "audio": ["input": input, "output": output]]])
+            for message in history.suffix(20) where ["user", "assistant"].contains(message.role) && !message.content.isEmpty && (message.completion == nil || message.completion == .completed) {
+                try await send(["type": "conversation.item.create", "item": ["type": "message", "role": message.role,
+                    "content": [["type": message.role == "assistant" ? "output_text" : "input_text", "text": message.content]]]])
+            }
+            await playCue(.started)
+            guard phase != .ended else { return }
+            if let webRTC { webRTC.setMuted(muted) }
+            else {
+                try startCapture()
+                receiveTask = Task { [weak self] in await self?.receiveLoop() }
+            }
+            phase = .listening
+        } catch { if phase != .ended { fail("La connexion vocale a échoué. Réessayez depuis le chat.") } }
+    }
+
+    private var outputFormat: AVAudioFormat { AVAudioFormat(standardFormatWithSampleRate: 24_000, channels: 1)! }
+    private func startCapture() throws {
+        let input = capture.inputNode
+        try input.setVoiceProcessingEnabled(true)
+        let format = input.outputFormat(forBus: 0)
+        guard let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24_000, channels: 1, interleaved: false),
+              let converter = AVAudioConverter(from: format, to: target) else { throw URLError(.cannotDecodeContentData) }
+        input.installTap(onBus: 0, bufferSize: 960, format: format,
+                         block: Self.captureTap(controller: self, converter: converter, targetFormat: target))
+        captureTapInstalled = true
+        capture.prepare(); try capture.start()
+    }
+    nonisolated static func captureTap(controller: RealtimeVoiceController, converter: AVAudioConverter, targetFormat: AVAudioFormat) -> AVAudioNodeTapBlock {
+        let conversion = VoiceCaptureConversion(converter: converter, format: targetFormat)
+        return { @Sendable [weak controller] buffer, _ in
+            guard let data = Self.pcm24k(buffer, converter: conversion.converter, targetFormat: conversion.format) else { return }
+            let level = VoiceAudioLevel.normalizedPCM16(data)
+            Task { @MainActor [weak controller] in await controller?.sendCapturedAudio(data, level: level) }
+        }
+    }
+    nonisolated static func playbackMeterTap(controller: RealtimeVoiceController) -> AVAudioNodeTapBlock {
+        { @Sendable [weak controller] buffer, _ in
+            let level = VoiceAudioLevel.normalized(buffer)
+            Task { @MainActor [weak controller] in controller?.updateOutputLevel(level) }
+        }
+    }
+    private func sendCapturedAudio(_ data: Data, level: Double) async {
+        guard !muted, [.listening, .thinking, .speaking].contains(phase) else { inputAudioLevel = 0; return }
+        inputAudioLevel = VoiceAudioLevel.smoothed(current: inputAudioLevel, target: level)
+        do { try await send(["type": "input_audio_buffer.append", "audio": data.base64EncodedString()]) }
+        catch { fail("La connexion audio est interrompue.") }
+    }
+    private func updateOutputLevel(_ level: Double) {
+        guard phase != .ended else { outputAudioLevel = 0; return }
+        outputAudioLevel = VoiceAudioLevel.smoothed(current: outputAudioLevel, target: level)
+    }
+    nonisolated private static func pcm24k(_ source: AVAudioPCMBuffer, converter: AVAudioConverter, targetFormat: AVAudioFormat) -> Data? {
+        let capacity = AVAudioFrameCount(Double(source.frameLength) * 24_000 / source.format.sampleRate + 32)
+        guard let target = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return nil }
+        var supplied = false
+        let status = converter.convert(to: target, error: nil) { _, flag in
+            if supplied { flag.pointee = .noDataNow; return nil }
+            supplied = true; flag.pointee = .haveData; return source
+        }
+        guard status != .error, let samples = target.int16ChannelData?[0] else { return nil }
+        return Data(bytes: samples, count: Int(target.frameLength) * 2)
+    }
+    private func send(_ object: [String: Any]) async throws {
+        guard phase != .ended else { throw CancellationError() }
+        let data = try JSONSerialization.data(withJSONObject: object)
+        if let webRTC { try webRTC.send(data) }
+        else if let socket { try await socket.send(.string(String(decoding: data, as: UTF8.self))) }
+        else { throw URLError(.networkConnectionLost) }
+    }
+    private func receiveLoop() async {
+        do {
+            while !Task.isCancelled, let socket {
+                switch try await socket.receive() {
+                case .data(let data): await receive(data)
+                case .string(let text): await receive(Data(text.utf8))
+                @unknown default: break
+                }
+            }
+        } catch {
+            // A new provider connection is a new conversation; never replay a possibly billed turn.
+            if phase != .ended { fail("Connexion perdue. Ouvrez une nouvelle session pour continuer sans rejouer votre demande.") }
+        }
+    }
+    private func receive(_ data: Data) async {
+        guard phase != .ended, data.count <= 2_097_152,
+              let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = event["type"] as? String else { return }
+        let turns = ledger.consume(event)
+        switch type {
+        case "input_audio_buffer.speech_started":
+            stopOutput(); partialAssistant = ""; phase = .listening
+            // server_vad.interrupt_response performs cancellation atomically at the provider.
+        case "input_audio_buffer.speech_stopped": phase = .thinking
+        case "conversation.item.input_audio_transcription.delta": partialUser = String((partialUser + (event["delta"] as? String ?? "")).suffix(20_000))
+        case "conversation.item.input_audio_transcription.completed": partialUser = ""
+        case "response.output_audio_transcript.delta": partialAssistant = String((partialAssistant + (event["delta"] as? String ?? "")).suffix(20_000))
+        case "response.output_audio.delta":
+            guard let response = event["response_id"] as? String, response == ledger.activeResponse else { break }
+            if let encoded = event["delta"] as? String, let audio = Data(base64Encoded: encoded) { play(audio, response: response) }
+        case "response.output_audio.done":
+            guard let response = event["response_id"] as? String else { break }
+            if audioFramers.removeValue(forKey: response)?.isComplete == false { fail("Format audio invalide.") }
+        case "output_audio_buffer.started": phase = .speaking
+        case "output_audio_buffer.stopped": partialAssistant = ""; phase = .listening
+        case "response.done":
+            if webRTC == nil, let response = event["response"] as? [String: Any], let id = response["id"] as? String, pendingAudio[id, default: 0] == 0 {
+                await persist(ledger.playbackFinished(id)); partialAssistant = ""; phase = .listening
+            }
+        case "response.function_call_arguments.done":
+            // Tool dispatch is unavailable until connected to the existing ownership/approval boundary.
+            fail("Les outils ne sont pas encore disponibles dans ce mode vocal. Continuez dans le chat.")
+        case "multivibe.voice.input_disabled":
+            muted = true
+            error = "Le quota Relay est atteint. Vous pouvez écouter la réponse en cours."
+        case "error": fail("Le service vocal a rencontré une erreur. La session a été arrêtée.")
+        default: break
+        }
+        await persist(turns)
+    }
+    private func play(_ data: Data, response: String) {
+        guard !data.isEmpty, data.count <= 1_048_576 else { fail("Format audio invalide."); return }
+        var framer = audioFramers[response] ?? VoicePCM16Framer()
+        let framed = framer.append(data)
+        audioFramers[response] = framer
+        guard !framed.isEmpty else { return }
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: AVAudioFrameCount(framed.count / 2)),
+              let channel = buffer.floatChannelData?[0] else { fail("Format audio invalide."); return }
+        buffer.frameLength = buffer.frameCapacity
+        framed.withUnsafeBytes { raw in
+            for index in 0..<Int(buffer.frameLength) {
+                channel[index] = Float(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: index * 2, as: Int16.self))) / 32768
+            }
+        }
+        phase = .speaking
+        ledger.playbackStarted(response)
+        pendingAudio[response, default: 0] += 1
+        let generation = audioGeneration
+        player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { @Sendable [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.audioGeneration == generation, self.phase != .ended else { return }
+                self.pendingAudio[response, default: 1] -= 1
+                if self.pendingAudio[response] == 0 {
+                    self.outputAudioLevel = 0
+                    await self.persist(self.ledger.playbackFinished(response))
+                }
+            }
+        }
+    }
+    private func persist(_ turns: [VoiceTranscriptLedger.Turn]) async {
+        guard let session else { return }
+        for turn in turns {
+            // Device persistence owns the text. Cloud acknowledges IDs only; a lost response is retryable.
+            guard await onTurn?(turn.role, turn.text, session.id + ":" + turn.id) == true else {
+                fail("La transcription n’a pas pu être enregistrée. La session a été arrêtée."); return
+            }
+            if session.route != "instance" {
+                do { _ = try await ChatAPI.shared.reconcileVoiceTurn(session: session, turnID: turn.id, token: accountToken) }
+                catch { self.error = "Transcription enregistrée sur l’appareil ; réconciliation vocale indisponible." }
+            }
+        }
+    }
+    func setMuted(_ value: Bool) {
+        guard phase != .ended else { return }
+        muted = value; if value { inputAudioLevel = 0 }; webRTC?.setMuted(value)
+        Task { try? await send(["type": "input_audio_buffer.clear"]) }
+        MPNowPlayingInfoCenter.default().playbackState = value ? .paused : .playing
+    }
+    func sendText(_ text: String) async {
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, clean.count <= 20_000, [.listening, .thinking, .speaking].contains(phase) else { return }
+        do {
+            let id = "text_" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+            if phase == .speaking || phase == .thinking { ledger.interrupt(); stopOutput(); try await send(["type": "response.cancel"]) }
+            try await send(["type": "conversation.item.create", "item": ["id": id, "type": "message", "role": "user", "content": [["type": "input_text", "text": clean]]]])
+            await persist([.init(id: id, role: "user", text: clean)])
+            try await send(["type": "response.create"])
+            phase = .thinking
+        } catch { fail("Le texte n’a pas pu être transmis.") }
+    }
+    private func installLifecycle(backgroundAudio: Bool) {
+        observers.append(NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { @Sendable [weak self] notification in
+            let began = (notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt) == AVAudioSession.InterruptionType.began.rawValue
+            Task { @MainActor in
+                guard began else { return }
+                self?.fail("L’audio a été interrompu. Reprenez depuis le chat après l’appel.")
+            }
+        })
+        observers.append(NotificationCenter.default.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { @Sendable [weak self] notification in
+            let reason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            Task { @MainActor in
+                if reason == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue {
+                    self?.setMuted(true)
+                    self?.error = "La sortie audio a changé. Réactivez le micro pour continuer."
+                }
+            }
+        })
+        if !backgroundAudio {
+            observers.append(NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { @Sendable [weak self] _ in
+                Task { @MainActor in self?.end() }
+            })
+        } else {
+            let center = MPRemoteCommandCenter.shared()
+            for (command, action) in [(center.pauseCommand, 0), (center.playCommand, 1), (center.stopCommand, 2)] {
+                command.isEnabled = true
+                let target = command.addTarget { @Sendable [weak self] _ in
+                    Task { @MainActor in if action == 2 { self?.end() } else { self?.setMuted(action == 0) } }
+                    return .success
+                }
+                remoteCommands.append((command, target))
+            }
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = [MPMediaItemPropertyTitle: "Conversation MultiVibe", MPNowPlayingInfoPropertyIsLiveStream: true]
+            MPNowPlayingInfoCenter.default().playbackState = .playing
+        }
+    }
+    private func stopOutput() {
+        audioGeneration += 1; pendingAudio.removeAll(); audioFramers.removeAll()
+        outputAudioLevel = 0
+        player.stop(); player.reset()
+        if playback.isRunning { player.play() }
+    }
+    func endWithCue() async {
+        guard !closing, phase != .ended else { return }
+        closing = true
+        muted = true
+        webRTC?.setMuted(true)
+        if capture.isRunning { capture.pause() }
+        ledger.interrupt()
+        stopOutput()
+        try? await send(["type": "response.cancel"])
+        await playCue(.ended)
+        end()
+    }
+    func end() {
+        guard phase != .ended else { return }
+        phase = .ended; ledger.interrupt(); endAudio()
+        guard !sessionClosed, let session else { return }
+        sessionClosed = true
+        guard session.route != "instance" else { return }
+        let token = accountToken
+        Task { await ChatAPI.shared.closeVoiceSession(session, token: token) }
+    }
+
+    private enum SessionCue { case started, ended }
+    private func playCue(_ cue: SessionCue) async {
+        guard phase != .ended else { return }
+        let engine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
+        let duration = cue == .started ? 0.34 : 0.30
+        let frames = AVAudioFrameCount(48_000 * duration)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames),
+              let samples = buffer.floatChannelData?[0] else { return }
+        buffer.frameLength = frames
+        let frequencies: (Double, Double) = cue == .started ? (523.25, 783.99) : (659.25, 392.00)
+        for index in 0..<Int(frames) {
+            let progress = Double(index) / Double(frames)
+            let attack = min(1, progress / 0.08)
+            let release = min(1, (1 - progress) / 0.38)
+            let envelope = sin(.pi * min(1, attack)) * sin(.pi / 2 * min(1, release))
+            let frequency = frequencies.0 + (frequencies.1 - frequencies.0) * progress
+            let fundamental = sin(2 * .pi * frequency * Double(index) / 48_000)
+            let overtone = sin(2 * .pi * frequency * 2 * Double(index) / 48_000) * 0.16
+            samples[index] = Float((fundamental + overtone) * envelope * 0.12)
+        }
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: format)
+        cueEngine = engine; cuePlayer = player
+        do { try engine.start() } catch { cueEngine = nil; cuePlayer = nil; return }
+        await withCheckedContinuation { continuation in
+            player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { @Sendable _ in continuation.resume() }
+            player.play()
+        }
+        player.stop(); engine.stop()
+        if cueEngine === engine { cueEngine = nil; cuePlayer = nil }
+    }
+    private func fail(_ message: String) { error = message; end() }
+    private func endAudio() {
+        expiryTask?.cancel(); expiryTask = nil
+        receiveTask?.cancel(); receiveTask = nil
+        webRTC?.close(); webRTC = nil
+        socket?.cancel(with: .normalClosure, reason: nil); socket = nil
+        if capture.isRunning { capture.stop() }
+        if captureTapInstalled { capture.inputNode.removeTap(onBus: 0); captureTapInstalled = false }
+        stopOutput()
+        cuePlayer?.stop(); cueEngine?.stop(); cuePlayer = nil; cueEngine = nil
+        if playbackMeterTapInstalled { playback.mainMixerNode.removeTap(onBus: 0); playbackMeterTapInstalled = false }
+        if playback.isRunning { playback.stop() }
+        for observer in observers { NotificationCenter.default.removeObserver(observer) }; observers.removeAll()
+        for (command, target) in remoteCommands { command.removeTarget(target); command.isEnabled = false }
+        if !remoteCommands.isEmpty { MPNowPlayingInfoCenter.default().nowPlayingInfo = nil }
+        remoteCommands.removeAll()
+        partialUser = ""; partialAssistant = ""; inputAudioLevel = 0; outputAudioLevel = 0
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+}
+
+enum VoiceAudioLevel {
+    nonisolated static func normalizedPCM16(_ data: Data) -> Double {
+        guard data.count >= MemoryLayout<Int16>.size else { return 0 }
+        var sum = 0.0, count = 0
+        data.withUnsafeBytes { raw in
+            for offset in stride(from: 0, to: data.count - 1, by: MemoryLayout<Int16>.size) {
+                let value = Double(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int16.self))) / 32_768
+                sum += value * value; count += 1
+            }
+        }
+        return normalizedRMS(count == 0 ? 0 : sqrt(sum / Double(count)))
+    }
+
+    nonisolated static func normalized(_ buffer: AVAudioPCMBuffer) -> Double {
+        guard buffer.frameLength > 0, let channels = buffer.floatChannelData else { return 0 }
+        let channelCount = Int(buffer.format.channelCount), frames = Int(buffer.frameLength)
+        var sum = 0.0
+        for channel in 0..<channelCount {
+            for frame in 0..<frames {
+                let value = Double(channels[channel][frame]); sum += value * value
+            }
+        }
+        return normalizedRMS(sqrt(sum / Double(max(1, channelCount * frames))))
+    }
+
+    nonisolated static func normalizedRMS(_ rms: Double) -> Double {
+        guard rms.isFinite, rms > 0.002 else { return 0 }
+        let decibels = 20 * log10(min(1, rms))
+        return pow(min(1, max(0, (decibels + 52) / 46)), 1.25)
+    }
+
+    nonisolated static func smoothed(current: Double, target: Double) -> Double {
+        let boundedCurrent = min(1, max(0, current)), boundedTarget = min(1, max(0, target))
+        let coefficient = boundedTarget > boundedCurrent ? 0.58 : 0.20
+        let next = boundedCurrent + (boundedTarget - boundedCurrent) * coefficient
+        return next < 0.008 ? 0 : next
+    }
+}
+
+struct VoicePCM16Framer: Sendable {
+    private var remainder = Data()
+    var isComplete: Bool { remainder.isEmpty }
+
+    mutating func append(_ data: Data) -> Data {
+        guard !data.isEmpty else { return Data() }
+        let combined: Data
+        if remainder.isEmpty { combined = data }
+        else { combined = remainder + data }
+        let completeBytes = combined.count - combined.count % MemoryLayout<Int16>.size
+        remainder = completeBytes == combined.count ? Data() : Data(combined.suffix(combined.count - completeBytes))
+        return Data(combined.prefix(completeBytes))
+    }
+}
+
+// AVAudioEngine invokes each installed tap serially on its audio queue. The
+// converter transfers to that queue after construction and is used only there.
+private final class VoiceCaptureConversion: @unchecked Sendable {
+    let converter: AVAudioConverter
+    let format: AVAudioFormat
+    init(converter: AVAudioConverter, format: AVAudioFormat) { self.converter = converter; self.format = format }
+}
+
+private final class VoiceSocketRedirectPolicy: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) { completionHandler(nil) }
+}

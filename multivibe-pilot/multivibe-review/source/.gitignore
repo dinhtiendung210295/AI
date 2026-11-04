@@ -1,0 +1,33 @@
+node_modules
+web/node_modules
+dist
+web-dist
+target
+native/*.node
+.env
+web/*.tsbuildinfo
+packages/ui/public/assets/brand/
+data/*
+
+# Local deployment overrides hold operator credentials and must never be committed.
+docker-compose.override.yml
+
+# CCE (code-context-engine)
+# CCE local cache (per-machine, not for version control)
+.cce/
+.mcp.json
+# Claude Code local settings
+.claude/
+assets/brand/.DS_Store
+native/ios/.DS_Store
+artifacts/local-macos/*.dmg
+artifacts/.DS_Store
+
+# Swift package build and local workspace data
+.build/
+.swiftpm/
+
+# Local DSH SDK audit and isolated runtime fixtures (never publish).
+.dsh-plugin-dev/
+plugins/dsh-multivibe/*.tgz
+.DS_Store

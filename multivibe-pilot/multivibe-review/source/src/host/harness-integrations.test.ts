@@ -1,0 +1,1280 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import type { TestContext } from "node:test";
+import { exec } from "node:child_process";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
+import {
+  HOST_HARNESS_DEFINITIONS,
+  HostHarnessIntegrationManager,
+  type HostHarnessDefinition,
+} from "./harness-integrations.js";
+
+const requestedNames = [
+  "Claude Code", "OpenAI Codex", "OpenCode", "OpenClaw", "Hermes Agent", "Pi", "Goose",
+  "OpenHands", "Cline", "Aider", "Qwen Code", "Gemini CLI", "Google Antigravity",
+  "GitHub Copilot CLI / Coding Agent", "Kiro / Kiro CLI", "Warp Agent", "Amp", "Crush",
+  "Kilo Code", "Roo Code", "Continue", "mini-SWE-agent", "Mistral Vibe", "gptme", "AIChat",
+  "ShellGPT", "Fabric", "GPTScript", "Kimi Code CLI", "Pochi", "Zed Agent Panel", "JetBrains Junie",
+  "Amazon Q Developer CLI", "Sourcegraph Cody", "Tabby", "Trae", "Qoder", "CodeRabbit CLI",
+  "Qodo Merge / PR-Agent", "GPT Engineer", "AiderDesk", "PearAI", "Devika", "smol developer",
+  "SWE-smith", "SWE-ReX", "Agentless", "Open Interpreter", "SWE-agent", "AutoCodeRover",
+  "Mentat", "GPT-Pilot", "Plandex", "Cursor Agent", "Windsurf Cascade", "Devin", "Pythagora",
+  "Agent Zero", "OpenManus", "Manus", "AutoGen", "CrewAI", "LangGraph", "smolagents",
+  "Letta", "AutoGPT", "BabyAGI", "MetaGPT", "SuperAGI", "AgentGPT", "CAMEL", "PydanticAI",
+  "Mastra", "Agno", "Semantic Kernel", "LlamaIndex Agents", "LangChain Agents", "DeepSeek Harness (DSH)",
+];
+
+test("the host registry covers every requested harness exactly once", () => {
+  assert.deepEqual(
+    [...HOST_HARNESS_DEFINITIONS].map((entry) => entry.name).sort(),
+    requestedNames.sort(),
+  );
+  assert.equal(new Set(HOST_HARNESS_DEFINITIONS.map((entry) => entry.id)).size, HOST_HARNESS_DEFINITIONS.length);
+});
+
+test("DeepSeek Harness detects its real CLI without executing it or rewriting profile settings", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-dsh-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  await fs.mkdir(bin, { recursive: true });
+  const sentinel = path.join(root, "executed");
+  await fs.writeFile(path.join(bin, "dsh"), `#!/bin/sh\ntouch '${sentinel}'\n`, { mode: 0o755 });
+  const configPath = path.join(home, ".dsh", "cordis.patch.yml");
+  const original = "- id: llm-pi-ai\n  config:\n    providers:\n      existing: {}\n";
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
+  await fs.writeFile(configPath, original);
+  const definition = HOST_HARNESS_DEFINITIONS.find((entry) => entry.id === "deepseek-harness")!;
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    definitions: [{ ...definition, footprints: [".dsh"] }],
+    executableDirectories: [bin],
+  });
+  const detected = await manager.get(definition.id);
+  assert.equal(detected.name, "DeepSeek Harness (DSH)");
+  assert.equal(detected.detected, true);
+  assert.deepEqual(detected.detectedBy, ["command:dsh", "path:~/.dsh"]);
+  assert.equal(detected.canInstall, false);
+  assert.equal(detected.managed, false);
+  assert.match(detected.unavailableReason!, /Models page/);
+  await assert.rejects(manager.install(definition.id, {
+    apiKeyId: "key-dsh", apiKey: "mv_dsh", application: "harness-deepseek-harness",
+  }), /profile overlays/);
+  assert.equal(await fs.readFile(configPath, "utf8"), original);
+  await assert.rejects(fs.stat(sentinel), { code: "ENOENT" });
+});
+
+test("DeepSeek Harness detects Desktop footprints and retains legacy detection", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-dsh-desktop-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const definition = HOST_HARNESS_DEFINITIONS.find((entry) => entry.id === "deepseek-harness")!;
+  const footprints = [
+    "Library/Application Support/dsh-desktop/harness",
+    ".config/dsh-desktop/harness",
+    "AppData/Roaming/dsh-desktop/harness",
+    "Applications/DSH Desktop.app",
+    ".deepseek-harness",
+  ];
+  assert.ok(definition.footprints.includes("/Applications/DSH Desktop.app"));
+  assert.ok(definition.executables.includes("deepseek-harness"));
+  for (const [index, footprint] of footprints.entries()) {
+    assert.ok(definition.footprints.includes(footprint));
+    const home = path.join(root, String(index));
+    await fs.mkdir(path.join(home, footprint), { recursive: true });
+    const manager = new HostHarnessIntegrationManager({
+      homeDirectory: home,
+      statePath: path.join(home, ".multivibe", "harnesses.json"),
+      baseUrl: "http://127.0.0.1:1455",
+      definitions: [{ ...definition, footprints: [footprint] }],
+      executableDirectories: [],
+    });
+    const detected = await manager.get(definition.id);
+    assert.equal(detected.detected, true, footprint);
+    assert.deepEqual(detected.detectedBy, [`path:~/${footprint}`]);
+    assert.equal(detected.canInstall, false);
+  }
+  const home = path.join(root, "absolute-home");
+  const appPath = path.join(root, "DSH Desktop.app");
+  await fs.mkdir(appPath);
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    definitions: [{ ...definition, footprints: [appPath] }],
+    executableDirectories: [],
+  });
+  assert.deepEqual((await manager.get(definition.id)).detectedBy, [`path:${appPath}`]);
+});
+
+test("rejects a relative host home directory", () => {
+  assert.throws(() => new HostHarnessIntegrationManager({
+    homeDirectory: "relative-home",
+    statePath: "/tmp/multivibe-harness-state.json",
+    baseUrl: "http://127.0.0.1:1455",
+    definitions: [],
+  }), /home directory must be absolute/);
+});
+
+async function fixture() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-harness-"));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  await fs.mkdir(bin, { recursive: true });
+  await fs.writeFile(path.join(bin, "example-agent"), "#!/bin/sh\n", { mode: 0o755 });
+  const definition: HostHarnessDefinition = {
+    id: "example",
+    name: "Example Agent",
+    category: "agent",
+    executables: ["example-agent"],
+    footprints: [".example"],
+    configuration: {
+      relativePath: ".example/settings.json",
+      render(current, context) {
+        const value = current ? JSON.parse(current) : {};
+        value.multivibe = { baseUrl: `${context.baseUrl}/v1`, apiKey: context.apiKey };
+        return `${JSON.stringify(value, null, 2)}\n`;
+      },
+      isConfigured(current, baseUrl) {
+        return current.includes(`${baseUrl}/v1`);
+      },
+    },
+  };
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    definitions: [definition],
+    executableDirectories: [bin],
+  });
+  return { root, home, manager };
+}
+
+function mockCodexModelCatalog(
+  t: TestContext,
+  modelIds = ["model-a", "gpt-5.5"],
+  models: Record<string, unknown>[] = [],
+  modalities: Record<string, string[]> = {},
+  contextWindows: Record<string, number> = {},
+) {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async (_input, init) => {
+    assert.equal(new Headers(init?.headers).get("x-multivibe-client"), "openai-codex");
+    return Response.json({ data: modelIds.map((id) => ({ id, metadata: { input_modalities: modalities[id], context_window: contextWindows[id] } })), models });
+  };
+}
+
+test("detects without executing, installs privately, and restores the exact previous file", async (t) => {
+  const { root, home, manager } = await fixture();
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const configPath = path.join(home, ".example", "settings.json");
+  const original = '{\n  "theme": "dark"\n}\n';
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
+  await fs.writeFile(configPath, original, { mode: 0o644 });
+
+  const before = await manager.get("example");
+  assert.equal(before.detected, true);
+  assert.equal(before.canInstall, true);
+
+  const installed = await manager.install("example", {
+    apiKeyId: "key-1",
+    apiKey: "mv_private-test-key",
+    application: "harness-example",
+  });
+  assert.equal(installed.configured, true);
+  assert.equal(installed.managed, true);
+  assert.equal(installed.canUninstall, true);
+  assert.equal((await fs.stat(configPath)).mode & 0o777, 0o600);
+  assert.match(await fs.readFile(configPath, "utf8"), /mv_private-test-key/);
+  assert.doesNotMatch(
+    await fs.readFile(path.join(home, ".multivibe", "harnesses.json"), "utf8"),
+    /mv_private-test-key/,
+  );
+
+  const removed = await manager.uninstall("example");
+  assert.equal(removed.apiKeyId, "key-1");
+  assert.equal(await fs.readFile(configPath, "utf8"), original);
+  assert.equal((await fs.stat(configPath)).mode & 0o777, 0o644);
+});
+
+test("OpenCode installation synchronizes every safe model from MultiVibe", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-opencode-models-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  const configPath = path.join(home, ".config", "opencode", "opencode.json");
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
+  await fs.mkdir(bin, { recursive: true });
+  await fs.writeFile(path.join(bin, "opencode"), "binary", { mode: 0o755 });
+  await fs.writeFile(configPath, `${JSON.stringify({
+    model: "litellm/existing-model",
+    provider: { litellm: { name: "Keep me" } },
+  })}\n`);
+
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  let requests = 0;
+  globalThis.fetch = async (input, init) => {
+    requests += 1;
+    assert.equal(String(input), "http://127.0.0.1:1455/v1/models");
+    assert.equal(new Headers(init?.headers).get("authorization"), "Bearer mv_opencode");
+    assert.equal(init?.redirect, "error");
+    return Response.json({
+      object: "list",
+      data: [
+        { id: "gpt-5.6-luna" },
+        { id: "gpt-5.5" },
+        { id: "omlx/Qwen3.8-27B-4bit" },
+        { id: "deepseek/deepseek-flash", name: "DeepSeek V4.1 Flash" },
+        { id: "gpt-5.5" },
+        { id: "\u0000invalid" },
+      ],
+    });
+  };
+
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    definitions: HOST_HARNESS_DEFINITIONS.filter((entry) => entry.id === "opencode"),
+    executableDirectories: [bin],
+  });
+
+  await manager.install("opencode", {
+    apiKeyId: "key-opencode",
+    apiKey: "mv_opencode",
+    application: "harness-opencode",
+  });
+
+  const configured = JSON.parse(await fs.readFile(configPath, "utf8"));
+  assert.equal(configured.model, "multivibe/gpt-5.5");
+  assert.deepEqual(Object.keys(configured.provider.multivibe.models), [
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "omlx/Qwen3.8-27B-4bit",
+    "deepseek/deepseek-flash",
+  ]);
+  assert.equal(configured.provider.multivibe.models["deepseek/deepseek-flash"].name, "DeepSeek V4.1 Flash");
+  assert.equal(configured.provider.multivibe.options.baseURL, "http://127.0.0.1:1455/v1");
+  assert.deepEqual(configured.provider.litellm, { name: "Keep me" });
+  assert.equal(requests, 1);
+});
+
+test("all model-aware harnesses synchronize the live MultiVibe catalog", async (t) => {
+  const modelIds = ["gpt-5.6-luna", "gpt-5.5", "omlx/Qwen3.8-27B-4bit"];
+  const catalogHarnesses = new Set(["openclaw", "pi", "crush", "continue"]);
+  const harnessIds = [
+    "openclaw", "pi", "crush", "continue", "hermes-agent", "goose",
+    "aider", "mini-swe-agent", "gptme", "shell-gpt", "open-interpreter", "agent-zero", "autogpt",
+  ];
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  for (const id of harnessIds) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), `multivibe-${id}-models-`));
+    t.after(() => fs.rm(root, { recursive: true, force: true }));
+    const home = path.join(root, "home");
+    const bin = path.join(home, "bin");
+    const definition = HOST_HARNESS_DEFINITIONS.find((entry) => entry.id === id)!;
+    await fs.mkdir(bin, { recursive: true });
+    await fs.writeFile(path.join(bin, definition.executables[0]), "binary", { mode: 0o755 });
+
+    let requests = 0;
+    globalThis.fetch = async (input, init) => {
+      requests += 1;
+      assert.equal(String(input), "http://127.0.0.1:1455/v1/models");
+      assert.equal(new Headers(init?.headers).get("authorization"), "Bearer mv_all_harnesses");
+      return Response.json({ object: "list", data: modelIds.map((model) => ({ id: model })) });
+    };
+
+    const manager = new HostHarnessIntegrationManager({
+      homeDirectory: home,
+      statePath: path.join(home, ".multivibe", "harnesses.json"),
+      baseUrl: "http://127.0.0.1:1455",
+      definitions: [definition],
+      executableDirectories: [bin],
+    });
+    await manager.install(id, {
+      apiKeyId: `key-${id}`,
+      apiKey: "mv_all_harnesses",
+      application: `harness-${id}`,
+    });
+
+    const configPath = path.join(home, definition.configuration!.relativePath);
+    const configured = await fs.readFile(configPath, "utf8");
+    assert.equal(requests, 1, `${id} should discover the catalog once`);
+    assert.match(configured, /gpt-5\.5|gpt-5\.6-luna/);
+    if (catalogHarnesses.has(id)) {
+      for (const model of modelIds) assert.match(configured, new RegExp(model.replace("/", "\\/")));
+    }
+  }
+});
+
+test("OpenHands is detected without claiming an obsolete config.toml integration", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-openhands-current-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  await fs.mkdir(bin, { recursive: true });
+  await fs.writeFile(path.join(bin, "openhands"), "binary", { mode: 0o755 });
+  const definition = HOST_HARNESS_DEFINITIONS.find((entry) => entry.id === "openhands")!;
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    definitions: [definition],
+    executableDirectories: [bin],
+  });
+  const detected = await manager.get("openhands");
+  assert.equal(detected.detected, true);
+  assert.equal(detected.canInstall, false);
+  assert.equal(detected.managed, false);
+  assert.match(detected.unavailableReason!, /agent_settings\.json/);
+  await assert.rejects(manager.install("openhands", {
+    apiKeyId: "key-openhands", apiKey: "mv_openhands", application: "harness-openhands",
+  }), /cannot safely replace/);
+});
+
+test("mini-SWE-agent uses its platform config and preserves unrelated dotenv settings", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-mini-swe-agent-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  const definition = HOST_HARNESS_DEFINITIONS.find((entry) => entry.id === "mini-swe-agent")!;
+  const configPath = path.join(home, definition.configuration!.relativePath);
+  const original = 'MSWEA_GLOBAL_CALL_LIMIT="25"\n';
+  await fs.mkdir(bin, { recursive: true });
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
+  await fs.writeFile(path.join(bin, "mini"), "binary", { mode: 0o755 });
+  await fs.writeFile(configPath, original);
+
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => Response.json({ data: [{ id: "gpt-5.6-luna" }, { id: "gpt-5.5" }] });
+
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    definitions: [definition],
+    executableDirectories: [bin],
+  });
+  assert.equal((await manager.get("mini-swe-agent")).detectedBy.includes("command:mini"), true);
+
+  const installed = await manager.install("mini-swe-agent", {
+    apiKeyId: "key-mini-swe-agent",
+    apiKey: "mv_mini_swe_agent",
+    application: "harness-mini-swe-agent",
+  });
+  assert.equal(installed.configured, true);
+  assert.equal(installed.configPath, `~/${definition.configuration!.relativePath}`);
+  const configured = await fs.readFile(configPath, "utf8");
+  assert.match(configured, /MSWEA_GLOBAL_CALL_LIMIT="25"/);
+  assert.match(configured, /MSWEA_MODEL_NAME="openai\/gpt-5\.5"/);
+  assert.match(configured, /OPENAI_API_KEY="mv_mini_swe_agent"/);
+  assert.match(configured, /OPENAI_API_BASE="http:\/\/127\.0\.0\.1:1455\/v1"/);
+  assert.match(configured, /OPENAI_BASE_URL="http:\/\/127\.0\.0\.1:1455\/v1"/);
+  assert.match(configured, /MSWEA_COST_TRACKING="ignore_errors"/);
+
+  await manager.uninstall("mini-swe-agent");
+  assert.equal(await fs.readFile(configPath, "utf8"), original);
+});
+
+test("gptme installs a named MultiVibe provider and safely updates an existing env table", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-gptme-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  const configPath = path.join(home, ".config", "gptme", "config.toml");
+  const original = '[env]\nMODEL = "openai/gpt-4o"\nEDITOR = "vim"\n\n[[providers]]\nname = "existing"\nbase_url = "http://example.test/v1"\n';
+  await fs.mkdir(bin, { recursive: true });
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
+  await fs.writeFile(path.join(bin, "gptme"), "binary", { mode: 0o755 });
+  await fs.writeFile(configPath, original);
+
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => Response.json({ data: [{ id: "gpt-5.5" }] });
+  const definition = HOST_HARNESS_DEFINITIONS.find((entry) => entry.id === "gptme")!;
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    definitions: [definition],
+    executableDirectories: [bin],
+  });
+
+  await manager.install("gptme", { apiKeyId: "key-gptme", apiKey: "mv_gptme", application: "harness-gptme" });
+  const configured = await fs.readFile(configPath, "utf8");
+  assert.match(configured, /\[env\]\nMODEL = "multivibe\/gpt-5\.5"\nEDITOR = "vim"/);
+  assert.match(configured, /\[\[providers\]\]\nname = "existing"/);
+  assert.match(configured, /name = "multivibe"\nbase_url = "http:\/\/127\.0\.0\.1:1455\/v1"/);
+  assert.match(configured, /api_key = "mv_gptme"/);
+  await manager.uninstall("gptme");
+  assert.equal(await fs.readFile(configPath, "utf8"), original);
+});
+
+test("ShellGPT preserves its runtime settings while selecting MultiVibe", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-shell-gpt-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  const configPath = path.join(home, ".config", "shell_gpt", ".sgptrc");
+  const original = "REQUEST_TIMEOUT=90\n";
+  await fs.mkdir(bin, { recursive: true });
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
+  await fs.writeFile(path.join(bin, "sgpt"), "binary", { mode: 0o755 });
+  await fs.writeFile(configPath, original);
+
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => Response.json({ data: [{ id: "gpt-5.5" }] });
+  const definition = HOST_HARNESS_DEFINITIONS.find((entry) => entry.id === "shell-gpt")!;
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    definitions: [definition],
+    executableDirectories: [bin],
+  });
+
+  await manager.install("shell-gpt", { apiKeyId: "key-shell-gpt", apiKey: "mv_shell_gpt", application: "harness-shell-gpt" });
+  const configured = await fs.readFile(configPath, "utf8");
+  assert.match(configured, /^REQUEST_TIMEOUT=90/m);
+  assert.match(configured, /API_BASE_URL="http:\/\/127\.0\.0\.1:1455\/v1"/);
+  assert.match(configured, /DEFAULT_MODEL="gpt-5\.5"/);
+  await manager.uninstall("shell-gpt");
+  assert.equal(await fs.readFile(configPath, "utf8"), original);
+});
+
+test("marks old OpenCode installations for repair and refreshes their model catalog", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-opencode-repair-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  const configPath = path.join(home, ".config", "opencode", "opencode.json");
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
+  await fs.mkdir(path.join(home, ".multivibe"), { recursive: true });
+  await fs.mkdir(bin, { recursive: true });
+  await fs.writeFile(path.join(bin, "opencode"), "binary", { mode: 0o755 });
+  const oldConfig = `${JSON.stringify({
+    model: "multivibe/gpt-5.5",
+    provider: {
+      multivibe: {
+        npm: "@ai-sdk/openai-compatible",
+        name: "MultiVibe Host",
+        options: { baseURL: "http://127.0.0.1:1455/v1", apiKey: "mv_opencode" },
+        models: { "gpt-5.5": { name: "gpt-5.5" } },
+      },
+    },
+  })}\n`;
+  await fs.writeFile(configPath, oldConfig);
+  await fs.writeFile(
+    path.join(home, ".multivibe", "harnesses.json"),
+    `${JSON.stringify({
+      schemaVersion: "multivibe-host-harness-integrations-v1",
+      installations: {
+        opencode: {
+          configPath,
+          originalContentBase64: null,
+          originalMode: null,
+          installedSha256: createHash("sha256").update(oldConfig).digest("hex"),
+          apiKeyId: "key-opencode",
+          application: "harness-opencode",
+          installedAt: 1,
+        },
+      },
+    })}\n`,
+  );
+
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async (input) => {
+    assert.equal(String(input), "http://127.0.0.1:1455/v1/models");
+    return Response.json({ object: "list", data: [{ id: "gpt-5.6-luna" }, { id: "gpt-5.5" }] });
+  };
+
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    definitions: HOST_HARNESS_DEFINITIONS.filter((entry) => entry.id === "opencode"),
+    executableDirectories: [bin],
+  });
+  const before = await manager.get("opencode");
+  assert.equal(before.managed, true);
+  assert.equal(before.drifted, true);
+  assert.equal(before.repairable, true);
+
+  await manager.repair("opencode", {
+    apiKeyId: "key-opencode",
+    apiKey: "mv_opencode",
+    application: "harness-opencode",
+  });
+  const repaired = JSON.parse(await fs.readFile(configPath, "utf8"));
+  assert.deepEqual(Object.keys(repaired.provider.multivibe.models), ["gpt-5.6-luna", "gpt-5.5"]);
+  assert.equal((await manager.get("opencode")).drifted, false);
+});
+
+test("uninstall refuses to overwrite user changes made after installation", async (t) => {
+  const { root, home, manager } = await fixture();
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await manager.install("example", {
+    apiKeyId: "key-2",
+    apiKey: "mv_private-test-key",
+    application: "harness-example",
+  });
+  const configPath = path.join(home, ".example", "settings.json");
+  const changed = `${await fs.readFile(configPath, "utf8")}\n`;
+  await fs.writeFile(configPath, changed);
+  await assert.rejects(() => manager.uninstall("example"), /changed after MultiVibe was installed/);
+  assert.equal(await fs.readFile(configPath, "utf8"), changed);
+  assert.equal((await manager.get("example")).drifted, true);
+});
+
+test("Codex installation authenticates its provider with the proxy key and restores the original workspace", async (t) => {
+  mockCodexModelCatalog(t, ["model-a", "gpt-5.5", "vision-fallback", "omlx/Qwen3.8-27B-4bit"], [{
+    slug: "gpt-5.5",
+    display_name: "GPT-5.5",
+    description: "OpenAI model",
+    default_reasoning_level: "medium",
+    supported_reasoning_levels: [],
+    shell_type: "shell_command",
+    visibility: "list",
+    supported_in_api: true,
+    priority: 1,
+    base_instructions: "",
+    support_verbosity: true,
+    truncation_policy: { mode: "tokens", limit: 10000 },
+    context_window: 400000,
+    max_context_window: 400000,
+    supports_parallel_tool_calls: true,
+    input_modalities: ["text", "image"],
+    experimental_supported_tools: [],
+  }, {
+    slug: "omlx/Qwen3.8-27B-4bit",
+    display_name: "omlx/Qwen3.8-27B-4bit",
+    description: "OpenAI-compatible model omlx/Qwen3.8-27B-4bit",
+    supported_reasoning_levels: [],
+    shell_type: "shell_command",
+    visibility: "list",
+    supported_in_api: true,
+    priority: 100,
+    base_instructions: "",
+    support_verbosity: false,
+    truncation_policy: { mode: "tokens", limit: 10000 },
+    experimental_supported_tools: [],
+  }], { "vision-fallback": ["text", "image"], "vision-native": ["text", "image"] }, { "model-a": 65536 });
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-codex-harness-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  await fs.mkdir(path.join(home, ".codex"), { recursive: true });
+  await fs.mkdir(bin, { recursive: true });
+  await fs.writeFile(path.join(bin, "codex"), "binary", { mode: 0o755 });
+  const configPath = path.join(home, ".codex", "config.toml");
+  const original = 'model_provider = "openai"\nmodel_catalog_json = "/tmp/static-models.json"\napproval_policy = "on-request"\n\n[history]\npersistence = "none"\n';
+  await fs.writeFile(configPath, original);
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    definitions: HOST_HARNESS_DEFINITIONS.filter((entry) => entry.id === "openai-codex"),
+    executableDirectories: [bin],
+  });
+
+  await manager.install("openai-codex", { apiKeyId: "key-3", apiKey: "mv_codex", application: "harness-openai-codex" });
+  const configured = await fs.readFile(configPath, "utf8");
+  assert.match(configured, /model_provider = "multivibe"/);
+  assert.match(configured, /base_url = "http:\/\/127\.0\.0\.1:1455\/v1"/);
+  assert.match(configured, /approval_policy = "on-request"/);
+  assert.match(configured, /model_catalog_json = /);
+  assert.match(configured, /\[model_providers\.multivibe\]\nname = "MultiVibe Host"\nbase_url = "http:\/\/127\.0\.0\.1:1455\/v1"\nwire_api = "responses"\nexperimental_bearer_token = "mv_codex"/);
+  assert.doesNotMatch(configured, /openai_base_url/);
+  const firstTable = configured.search(/^\[/m);
+  const rootProvider = configured.indexOf('model_provider = "multivibe"');
+  assert.ok(rootProvider >= 0 && rootProvider < firstTable, "Codex provider must remain at the TOML root");
+  assert.equal((configured.match(/^model_provider\s*=/gm) ?? []).length, 1);
+  const catalog = JSON.parse(await fs.readFile(path.join(home, ".codex", "multivibe-models.json"), "utf8"));
+  assert.deepEqual(catalog.models.map((model: any) => model.slug), ["model-a", "gpt-5.5", "vision-fallback", "omlx/Qwen3.8-27B-4bit"]);
+  assert.equal(catalog.models.find((model: any) => model.slug === "omlx/Qwen3.8-27B-4bit").display_name, "omlx/Qwen3.8-27B-4bit");
+  for (const model of catalog.models) {
+    // Codex requires these fields when deserializing model_catalog_json.
+    assert.equal(typeof model.base_instructions, "string");
+    assert.deepEqual(model.truncation_policy, { mode: "tokens", limit: 10000 });
+  }
+  assert.deepEqual(catalog.models.find((model: any) => model.slug === "model-a").input_modalities, ["text"]);
+  assert.equal(catalog.models.find((model: any) => model.slug === "model-a").context_window, 65536);
+  assert.equal(catalog.models.find((model: any) => model.slug === "model-a").max_context_window, 65536);
+  assert.deepEqual(catalog.models.find((model: any) => model.slug === "gpt-5.5").input_modalities, ["text", "image"]);
+  assert.equal(catalog.models.find((model: any) => model.slug === "gpt-5.5").support_verbosity, true);
+  assert.deepEqual(catalog.models.find((model: any) => model.slug === "vision-fallback").input_modalities, ["text", "image"]);
+  await manager.uninstall("openai-codex");
+  assert.equal(await fs.readFile(configPath, "utf8"), original);
+  await assert.rejects(fs.readFile(path.join(home, ".codex", "multivibe-models.json"), "utf8"), /ENOENT/);
+});
+
+test("Codex detects missing or stale proxy credentials and repairs the URL-only migration", async (t) => {
+  mockCodexModelCatalog(t);
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-codex-auth-repair-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  await fs.mkdir(path.join(home, ".codex"), { recursive: true });
+  const configPath = path.join(home, ".codex", "config.toml");
+  const authPath = path.join(home, ".codex", "auth.json");
+  const originalAuth = '{"tokens":{"access_token":"existing-openai-login"}}\n';
+  await fs.writeFile(authPath, originalAuth);
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    apiKeyForId: () => "mv_expected",
+    definitions: HOST_HARNESS_DEFINITIONS.filter((entry) => entry.id === "openai-codex"),
+    executableDirectories: [],
+  });
+  const credential = { apiKeyId: "key-auth", apiKey: "mv_expected", application: "harness-openai-codex" };
+  await manager.install("openai-codex", credential);
+  const installed = await fs.readFile(configPath, "utf8");
+  for (const changed of [
+    installed.replace('experimental_bearer_token = "mv_expected"', ""),
+    installed.replace('experimental_bearer_token = "mv_expected"', 'experimental_bearer_token = "mv_stale"'),
+    `openai_base_url = "http://127.0.0.1:1455/v1"\nmodel_catalog_json = ${JSON.stringify(path.join(home, ".codex", "multivibe-models.json"))}\n`,
+  ]) {
+    await fs.writeFile(configPath, changed);
+    const view = await manager.get("openai-codex");
+    assert.equal(view.configured, false);
+    assert.equal(view.drifted, true);
+    assert.equal(view.repairable, true);
+    assert.match(view.configurationIssue ?? "", /proxy API key/);
+    assert.doesNotMatch(view.configurationIssue ?? "", /mv_expected|mv_stale/);
+    const repaired = await manager.repair("openai-codex", credential);
+    assert.equal(repaired.configured, true);
+    assert.equal(repaired.drifted, false);
+    assert.match(await fs.readFile(configPath, "utf8"), /experimental_bearer_token = "mv_expected"/);
+    assert.equal((await fs.stat(configPath)).mode & 0o777, 0o600);
+    assert.equal(await fs.readFile(authPath, "utf8"), originalAuth);
+  }
+});
+
+test("Codex synchronizes its managed catalog when MultiVibe models change at runtime", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-codex-live-catalog-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  await fs.mkdir(path.join(home, ".codex"), { recursive: true });
+  await fs.mkdir(bin, { recursive: true });
+  await fs.writeFile(path.join(bin, "codex"), "binary", { mode: 0o755 });
+  let modelIds = ["model-a"];
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => Response.json({ data: modelIds.map((id) => ({ id })) });
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    apiKeyForId: (id) => id === "key-live" ? "mv_live" : undefined,
+    definitions: HOST_HARNESS_DEFINITIONS.filter((entry) => entry.id === "openai-codex"),
+    executableDirectories: [bin],
+  });
+  await manager.install("openai-codex", { apiKeyId: "key-live", apiKey: "mv_live", application: "harness-openai-codex" });
+  const catalogPath = path.join(home, ".codex", "multivibe-models.json");
+  assert.equal(await manager.synchronizeCodexModelCatalog(), false);
+
+  modelIds = ["model-a", "new-provider/model-b"];
+  assert.equal(await manager.synchronizeCodexModelCatalog(), true);
+  const catalog = JSON.parse(await fs.readFile(catalogPath, "utf8"));
+  assert.deepEqual(catalog.models.map((model: any) => model.slug), modelIds);
+  for (const model of catalog.models) {
+    assert.equal(typeof model.base_instructions, "string");
+    assert.equal(model.support_verbosity, false);
+    assert.deepEqual(model.truncation_policy, { mode: "tokens", limit: 10000 });
+  }
+  assert.equal((await manager.get("openai-codex")).drifted, false);
+  assert.equal((await manager.uninstall("openai-codex")).apiKeyId, "key-live");
+});
+
+test("managed OpenCode, Pi and Continue catalogs update without replacing user edits or originals", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-harness-live-catalog-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  let modelIds = ["model-a"];
+  globalThis.fetch = async () => Response.json({ data: modelIds.map((id) => ({ id })) });
+  for (const id of ["opencode", "pi", "continue"]) {
+    modelIds = ["model-a"];
+    const home = path.join(root, id);
+    const definition = HOST_HARNESS_DEFINITIONS.find((entry) => entry.id === id)!;
+    const configPath = path.join(home, definition.configuration!.relativePath);
+    await fs.mkdir(path.dirname(configPath), { recursive: true });
+    const original = id === "continue" ? "# personal configuration\n" : '{"personal":true}\n';
+    await fs.writeFile(configPath, original, { mode: 0o600 });
+    const manager = new HostHarnessIntegrationManager({
+      homeDirectory: home, statePath: path.join(home, ".multivibe", "harnesses.json"),
+      baseUrl: "http://127.0.0.1:1455", apiKeyForId: () => "mv_live",
+      definitions: [definition], executableDirectories: [],
+    });
+    await manager.install(id, { apiKeyId: "key-live", apiKey: "mv_live", application: `harness-${id}` });
+    const before = await fs.stat(configPath);
+    assert.equal(await manager.synchronizeModelCatalogs(), false);
+    assert.equal((await fs.stat(configPath)).mtimeMs, before.mtimeMs);
+    modelIds = ["model-a", "gpt-6.1-sol"];
+    assert.equal(await manager.synchronizeModelCatalogs(), true);
+    const refreshed = await fs.readFile(configPath, "utf8");
+    assert.match(refreshed, /gpt-6\.1-sol/);
+    assert.equal((await manager.get(id)).drifted, false);
+    assert.equal((await fs.stat(configPath)).mode & 0o777, 0o600);
+    const edited = refreshed + (id === "continue" ? "# user edit\n" : " \n");
+    await fs.writeFile(configPath, edited);
+    modelIds = ["model-a", "gpt-6.1-sol", "new-model"];
+    assert.equal(await manager.synchronizeModelCatalogs(), false);
+    assert.equal(await fs.readFile(configPath, "utf8"), edited);
+    assert.equal((await manager.get(id)).drifted, true);
+    await fs.writeFile(configPath, refreshed);
+    await manager.uninstall(id);
+    assert.equal(await fs.readFile(configPath, "utf8"), original);
+  }
+});
+
+test("catalog synchronization leaves edits made during discovery untouched and the timer refreshes managed catalogs", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-harness-catalog-race-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const configPath = path.join(home, ".config/opencode/opencode.json");
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
+  await fs.writeFile(configPath, "{}\n");
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  let modelIds = ["model-a"];
+  let editDuringFetch = false;
+  globalThis.fetch = async () => {
+    if (editDuringFetch) await fs.writeFile(configPath, '{"user":"changed during discovery"}\n');
+    return Response.json({ data: modelIds.map((id) => ({ id })) });
+  };
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home, statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455", apiKeyForId: () => "mv_live",
+    definitions: HOST_HARNESS_DEFINITIONS.filter((entry) => entry.id === "opencode"), executableDirectories: [],
+  });
+  t.after(() => manager.stopCatalogSynchronization());
+  await manager.install("opencode", { apiKeyId: "key-live", apiKey: "mv_live", application: "harness-opencode" });
+  const installed = await fs.readFile(configPath, "utf8");
+  modelIds = ["model-a", "gpt-6.1-sol"];
+  editDuringFetch = true;
+  assert.equal(await manager.synchronizeModelCatalogs(), false);
+  assert.equal(await fs.readFile(configPath, "utf8"), '{"user":"changed during discovery"}\n');
+  editDuringFetch = false;
+  await fs.writeFile(configPath, installed);
+  manager.startCatalogSynchronization(250);
+  const deadline = Date.now() + 3_000;
+  while (!(await fs.readFile(configPath, "utf8")).includes("gpt-6.1-sol") && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  manager.stopCatalogSynchronization();
+  assert.match(await fs.readFile(configPath, "utf8"), /gpt-6\.1-sol/);
+  assert.equal((await manager.get("opencode")).drifted, false);
+});
+
+test("Codex catalog keeps the context window advertised for a native entry", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-codex-native-context-window-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  await fs.mkdir(path.join(home, ".codex"), { recursive: true });
+  await fs.mkdir(bin, { recursive: true });
+  await fs.writeFile(path.join(bin, "codex"), "binary", { mode: 0o755 });
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  // The native Codex entry ships no window for a third-party provider model,
+  // while /v1/models advertises one. Codex cannot auto-compact without a
+  // window, so the advertised value must survive the native entry.
+  globalThis.fetch = async () => Response.json({
+    data: [
+      {
+        id: "deepseek/deepseek-flash",
+        metadata: { context_window: 1_000_000, input_modalities: ["text", "image"] },
+      },
+      {
+        id: "gpt-5.6-sol",
+        metadata: { context_window: 999_999, input_modalities: ["text"] },
+      },
+    ],
+    models: [
+      {
+        slug: "deepseek/deepseek-flash",
+        display_name: "DeepSeek V4.1 Flash",
+        description: "AI SDK model DeepSeek V4.1 Flash",
+        supported_reasoning_levels: [],
+        shell_type: "shell_command",
+        visibility: "list",
+        supported_in_api: true,
+        priority: 100,
+        base_instructions: "",
+        support_verbosity: false,
+        truncation_policy: { mode: "tokens", limit: 10000 },
+        experimental_supported_tools: [],
+      },
+      {
+        slug: "gpt-5.6-sol",
+        display_name: "GPT-5.6-Sol",
+        description: "OpenAI model",
+        supported_reasoning_levels: [],
+        shell_type: "shell_command",
+        visibility: "list",
+        supported_in_api: true,
+        priority: 1,
+        base_instructions: "",
+        support_verbosity: true,
+        truncation_policy: { mode: "tokens", limit: 10000 },
+        context_window: 272000,
+        max_context_window: 872000,
+        supports_parallel_tool_calls: true,
+        input_modalities: ["text"],
+        experimental_supported_tools: [],
+      },
+    ],
+  });
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    apiKeyForId: () => "mv_live",
+    definitions: HOST_HARNESS_DEFINITIONS.filter((entry) => entry.id === "openai-codex"),
+    executableDirectories: [bin],
+  });
+  await manager.install("openai-codex", {
+    apiKeyId: "key-live",
+    apiKey: "mv_live",
+    application: "harness-openai-codex",
+  });
+  const catalog = JSON.parse(
+    await fs.readFile(path.join(home, ".codex", "multivibe-models.json"), "utf8"),
+  );
+  const providerModel = catalog.models.find((model: any) => model.slug === "deepseek/deepseek-flash");
+  assert.equal(providerModel.context_window, 1_000_000);
+  assert.equal(providerModel.max_context_window, 1_000_000);
+  assert.deepEqual(providerModel.input_modalities, ["text", "image"]);
+  // A native window still wins over the advertised value.
+  const nativeModel = catalog.models.find((model: any) => model.slug === "gpt-5.6-sol");
+  assert.equal(nativeModel.context_window, 272000);
+  assert.equal(nativeModel.max_context_window, 872000);
+});
+
+test("Codex live synchronization survives unrelated config.toml edits", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-codex-live-catalog-user-edit-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  await fs.mkdir(path.join(home, ".codex"), { recursive: true });
+  await fs.mkdir(bin, { recursive: true });
+  await fs.writeFile(path.join(bin, "codex"), "binary", { mode: 0o755 });
+  let modelIds = ["model-a"];
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => Response.json({ data: modelIds.map((id) => ({ id })) });
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    apiKeyForId: () => "mv_live",
+    definitions: HOST_HARNESS_DEFINITIONS.filter((entry) => entry.id === "openai-codex"),
+    executableDirectories: [bin],
+  });
+  const credential = { apiKeyId: "key-live", apiKey: "mv_live", application: "harness-openai-codex" };
+  await manager.install("openai-codex", credential);
+  const configPath = path.join(home, ".codex", "config.toml");
+  const catalogPath = path.join(home, ".codex", "multivibe-models.json");
+  // The Codex desktop app and the user edit unrelated keys in config.toml
+  // after installation; those edits must not freeze the managed catalog.
+  await fs.appendFile(configPath, '\nmodel = "qwen3:4b"\nmodel_reasoning_effort = "none"\n');
+  modelIds = ["model-a", "new-provider/model-b"];
+  assert.equal(await manager.synchronizeCodexModelCatalog(), true);
+  const catalog = JSON.parse(await fs.readFile(catalogPath, "utf8"));
+  assert.deepEqual(catalog.models.map((model: any) => model.slug), modelIds);
+
+  // A config that no longer points at the managed provider stops the sync.
+  const driftedConfig = (await fs.readFile(configPath, "utf8")).replace(
+    'experimental_bearer_token = "mv_live"',
+    'experimental_bearer_token = "mv_stale"',
+  );
+  await fs.writeFile(configPath, driftedConfig);
+  modelIds = ["model-a", "new-provider/model-b", "new-provider/model-c"];
+  assert.equal(await manager.synchronizeCodexModelCatalog(), false);
+  const untouched = await fs.readFile(catalogPath, "utf8");
+  assert.match(untouched, /new-provider\/model-b/);
+  assert.doesNotMatch(untouched, /new-provider\/model-c/);
+});
+
+test("Codex live synchronization never overwrites a user-modified catalog", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-codex-live-catalog-drift-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  await fs.mkdir(path.join(home, ".codex"), { recursive: true });
+  await fs.mkdir(bin, { recursive: true });
+  await fs.writeFile(path.join(bin, "codex"), "binary", { mode: 0o755 });
+  let modelIds = ["model-a"];
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => Response.json({ data: modelIds.map((id) => ({ id })) });
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    apiKeyForId: () => "mv_live",
+    definitions: HOST_HARNESS_DEFINITIONS.filter((entry) => entry.id === "openai-codex"),
+    executableDirectories: [bin],
+  });
+  await manager.install("openai-codex", { apiKeyId: "key-live", apiKey: "mv_live", application: "harness-openai-codex" });
+  const catalogPath = path.join(home, ".codex", "multivibe-models.json");
+  await fs.writeFile(catalogPath, '{"models":[{"slug":"user-model"}]}\n');
+  modelIds = ["model-a", "model-b"];
+  assert.equal(await manager.synchronizeCodexModelCatalog(), false);
+  assert.match(await fs.readFile(catalogPath, "utf8"), /user-model/);
+});
+
+test("Codex repair refreshes a drifted MultiVibe catalog", async (t) => {
+  mockCodexModelCatalog(t);
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-codex-static-catalog-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  await fs.mkdir(path.join(home, ".codex"), { recursive: true });
+  await fs.mkdir(bin, { recursive: true });
+  await fs.writeFile(path.join(bin, "codex"), "binary", { mode: 0o755 });
+  const configPath = path.join(home, ".codex", "config.toml");
+  await fs.writeFile(configPath, "model = \"gpt-5.6-luna\"\n");
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    definitions: HOST_HARNESS_DEFINITIONS.filter((entry) => entry.id === "openai-codex"),
+    executableDirectories: [bin],
+  });
+  const credential = { apiKeyId: "key-static-catalog", apiKey: "mv_static", application: "harness-openai-codex" };
+  await manager.install("openai-codex", credential);
+  const changed = (await fs.readFile(configPath, "utf8")).replace(
+    "model_catalog_json = ",
+    "model_catalog_json = \"/tmp/static-models.json\" # replaced ",
+  );
+  await fs.writeFile(configPath, changed);
+
+  const drifted = await manager.get("openai-codex");
+  assert.equal(drifted.configured, false);
+  assert.equal(drifted.drifted, true);
+  assert.equal(drifted.repairable, true);
+  assert.match(drifted.configurationIssue ?? "", /does not point to the MultiVibe catalog/);
+
+  const repaired = await manager.repair("openai-codex", credential);
+  assert.equal(repaired.configured, true);
+  assert.equal(repaired.drifted, false);
+  assert.match(await fs.readFile(configPath, "utf8"), /model_catalog_json = .*multivibe-models\.json/);
+});
+
+test("Codex repair preserves a table inserted inside the legacy managed block", async (t) => {
+  mockCodexModelCatalog(t);
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-codex-repair-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  await fs.mkdir(path.join(home, ".codex"), { recursive: true });
+  await fs.mkdir(bin, { recursive: true });
+  await fs.writeFile(path.join(bin, "codex"), "binary", { mode: 0o755 });
+  const configPath = path.join(home, ".codex", "config.toml");
+  await fs.writeFile(configPath, [
+    "model = \"gpt-5.6-luna\"",
+    "",
+    "# >>> MultiVibe Host >>>",
+    "model_provider = \"multivibe\"",
+    "",
+    "[plugins.\"sites@openai-bundled\"]",
+    "enabled = true",
+    "",
+    "[model_providers.multivibe]",
+    "name = \"MultiVibe Host\"",
+    "base_url = \"http://192.168.1.149:1455/v1\"",
+    "# <<< MultiVibe Host <<<",
+    "",
+    "[history]",
+    "persistence = \"none\"",
+    "",
+  ].join("\n"));
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    definitions: HOST_HARNESS_DEFINITIONS.filter((entry) => entry.id === "openai-codex"),
+    executableDirectories: [bin],
+  });
+
+  await manager.install("openai-codex", { apiKeyId: "key-repair", apiKey: "mv_repair", application: "harness-openai-codex" });
+  const repaired = await fs.readFile(configPath, "utf8");
+  assert.match(repaired, /\[plugins\.\"sites@openai-bundled\"\]/);
+  assert.match(repaired, /enabled = true/);
+  assert.doesNotMatch(repaired, /192\.168\.1\.149:1455/);
+  assert.equal((await manager.get("openai-codex")).configured, true);
+});
+
+test("Codex ignores unrelated configuration changes when evaluating connection health", async (t) => {
+  mockCodexModelCatalog(t);
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-codex-reconcile-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  await fs.mkdir(path.join(home, ".codex"), { recursive: true });
+  await fs.mkdir(bin, { recursive: true });
+  await fs.writeFile(path.join(bin, "codex"), "binary", { mode: 0o755 });
+  const configPath = path.join(home, ".codex", "config.toml");
+  await fs.writeFile(configPath, "model = \"gpt-5.6-luna\"\n");
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    definitions: HOST_HARNESS_DEFINITIONS.filter((entry) => entry.id === "openai-codex"),
+    executableDirectories: [bin],
+  });
+  const credential = { apiKeyId: "key-reconcile", apiKey: "mv_reconcile", application: "harness-openai-codex" };
+  await manager.install("openai-codex", credential);
+  await fs.appendFile(configPath, "\n[plugins.\"sites@openai-bundled\"]\nenabled = true\n");
+  const connected = await manager.get("openai-codex");
+  assert.equal(connected.configured, true);
+  assert.equal(connected.drifted, false);
+  assert.equal(connected.canUninstall, false);
+  assert.match(await fs.readFile(configPath, "utf8"), /\[plugins\.\"sites@openai-bundled\"\]/);
+});
+
+test("Codex repairs managed configuration drift without removing unrelated changes", async (t) => {
+  mockCodexModelCatalog(t);
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-codex-managed-drift-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  await fs.mkdir(path.join(home, ".codex"), { recursive: true });
+  await fs.mkdir(bin, { recursive: true });
+  await fs.writeFile(path.join(bin, "codex"), "binary", { mode: 0o755 });
+  const configPath = path.join(home, ".codex", "config.toml");
+  await fs.writeFile(configPath, "model = \"gpt-5.6-luna\"\n");
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    definitions: HOST_HARNESS_DEFINITIONS.filter((entry) => entry.id === "openai-codex"),
+    executableDirectories: [bin],
+  });
+  const credential = { apiKeyId: "key-managed-drift", apiKey: "mv_managed_drift", application: "harness-openai-codex" };
+  await manager.install("openai-codex", credential);
+  const changed = (await fs.readFile(configPath, "utf8"))
+    .replace('base_url = "http://127.0.0.1:1455/v1"', 'base_url = "http://127.0.0.1:9999/v1"');
+  await fs.writeFile(configPath, `${changed}\n[plugins.\"sites@openai-bundled\"]\nenabled = true\n`);
+  const drifted = await manager.get("openai-codex");
+  assert.equal(drifted.configured, false);
+  assert.equal(drifted.drifted, true);
+  assert.equal(drifted.repairable, true);
+  assert.equal(drifted.canUninstall, false);
+
+  const repaired = await manager.repair("openai-codex", credential);
+  assert.equal(repaired.configured, true);
+  assert.equal(repaired.drifted, false);
+  assert.equal(repaired.canUninstall, true);
+  assert.match(await fs.readFile(configPath, "utf8"), /\[plugins\.\"sites@openai-bundled\"\]/);
+});
+
+test("Codex detects a changed managed model catalog", async (t) => {
+  mockCodexModelCatalog(t);
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-codex-credential-drift-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  await fs.mkdir(path.join(home, ".codex"), { recursive: true });
+  await fs.mkdir(bin, { recursive: true });
+  await fs.writeFile(path.join(bin, "codex"), "binary", { mode: 0o755 });
+  const configPath = path.join(home, ".codex", "config.toml");
+  await fs.writeFile(configPath, "model = \"gpt-5.6-luna\"\n");
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    definitions: HOST_HARNESS_DEFINITIONS.filter((entry) => entry.id === "openai-codex"),
+    executableDirectories: [bin],
+  });
+  const credential = { apiKeyId: "key-credential-drift", apiKey: "mv_expected", application: "harness-openai-codex" };
+  await manager.install("openai-codex", credential);
+  const catalogPath = path.join(home, ".codex", "multivibe-models.json");
+  await fs.writeFile(catalogPath, '{"models":[]}\n');
+
+  const drifted = await manager.get("openai-codex");
+  assert.equal(drifted.configured, false);
+  assert.equal(drifted.drifted, true);
+  assert.equal(drifted.repairable, true);
+  assert.equal(drifted.canUninstall, false);
+});
+
+test("Codex accepts brackets inside quoted TOML table keys", async (t) => {
+  mockCodexModelCatalog(t);
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-codex-quoted-header-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  await fs.mkdir(path.join(home, ".codex"), { recursive: true });
+  await fs.mkdir(bin, { recursive: true });
+  await fs.writeFile(path.join(bin, "codex"), "binary", { mode: 0o755 });
+  const configPath = path.join(home, ".codex", "config.toml");
+  await fs.writeFile(configPath, "model = \"gpt-5.6-luna\"\n");
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    definitions: HOST_HARNESS_DEFINITIONS.filter((entry) => entry.id === "openai-codex"),
+    executableDirectories: [bin],
+  });
+  const credential = { apiKeyId: "key-quoted-header", apiKey: "mv_quoted_header", application: "harness-openai-codex" };
+  await manager.install("openai-codex", credential);
+  await fs.appendFile(configPath, '\n[hooks.state."browser@openai-bundled:plugin.json#hooks[0]:stop:0:0"]\nenabled = true\n');
+
+  const drifted = await manager.get("openai-codex");
+  assert.equal(drifted.drifted, false);
+  assert.equal(drifted.repairable, true);
+  assert.equal(drifted.canUninstall, false);
+
+  assert.match(await fs.readFile(configPath, "utf8"), /hooks\[0\]:stop:0:0/);
+});
+
+test("Codex reports profile overrides without hiding a correct default provider", async (t) => {
+  mockCodexModelCatalog(t);
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "multivibe-codex-profile-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const bin = path.join(home, "bin");
+  await fs.mkdir(path.join(home, ".codex"), { recursive: true });
+  await fs.mkdir(bin, { recursive: true });
+  await fs.writeFile(path.join(bin, "codex"), "binary", { mode: 0o755 });
+  const configPath = path.join(home, ".codex", "config.toml");
+  await fs.writeFile(configPath, "[profiles.normal]\nmodel_provider = \"litellm\"\n");
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: home,
+    statePath: path.join(home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455",
+    definitions: HOST_HARNESS_DEFINITIONS.filter((entry) => entry.id === "openai-codex"),
+    executableDirectories: [bin],
+  });
+  const installed = await manager.install("openai-codex", { apiKeyId: "key-profile", apiKey: "mv_profile", application: "harness-openai-codex" });
+  assert.equal(installed.configured, true);
+  assert.match(installed.configurationIssue ?? "", /normal=litellm/);
+});
+
+async function trackingFixture() {
+  const fixtureValue = await fixture();
+  const definition: HostHarnessDefinition = {
+    id: "openai-codex", name: "Codex", category: "cli", executables: [], footprints: [".codex"],
+    configuration: {
+      relativePath: ".codex/config.toml",
+      render: () => 'model_provider = "multivibe"\n',
+      isConfigured: (value) => value.includes('"multivibe"'),
+    },
+  };
+  await fs.mkdir(path.join(fixtureValue.home, ".codex"));
+  const manager = new HostHarnessIntegrationManager({
+    homeDirectory: fixtureValue.home,
+    statePath: path.join(fixtureValue.home, ".multivibe", "harnesses.json"),
+    baseUrl: "http://127.0.0.1:1455", projectRegistrationToken: "fixture-registration-token",
+    definitions: [definition], executableDirectories: [],
+  });
+  return { ...fixtureValue, manager };
+}
+
+const trackingCredential = { apiKeyId: "fixture-key", apiKey: "fixture-secret", application: "harness-openai-codex" };
+
+test("connecting Codex installs private tracking without downloads and restores unrelated hooks on disconnect", async (t) => {
+  const { root, home, manager } = await trackingFixture();
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const hooksPath = path.join(home, ".codex/hooks.json");
+  const original = { hooks: { SessionStart: [{ hooks: [{ type: "command", command: "echo existing" }] }], Stop: [] } };
+  await fs.writeFile(hooksPath, JSON.stringify(original));
+  assert.equal((await manager.install("openai-codex", trackingCredential)).projectTracking, "installed");
+  const configPath = path.join(home, ".codex/multivibe-project.json");
+  assert.equal((await fs.stat(configPath)).mode & 0o777, 0o600);
+  assert.equal(JSON.parse(await fs.readFile(configPath, "utf8")).token, "fixture-registration-token");
+  await manager.enableProjectTracking("openai-codex");
+  assert.equal(JSON.parse(await fs.readFile(hooksPath, "utf8")).hooks.SessionStart.length, 2);
+  await manager.uninstall("openai-codex");
+  assert.deepEqual(JSON.parse(await fs.readFile(hooksPath, "utf8")), original);
+  await assert.rejects(fs.stat(configPath), { code: "ENOENT" });
+});
+
+test("existing Codex connections can add tracking without changing provider configuration", async (t) => {
+  const { root, home, manager } = await trackingFixture();
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const configPath = path.join(home, ".codex/config.toml");
+  const original = 'model_provider = "custom"\n';
+  await fs.writeFile(configPath, original);
+  assert.equal((await manager.enableProjectTracking("openai-codex")).projectTracking, "installed");
+  assert.equal(await fs.readFile(configPath, "utf8"), original);
+  await fs.writeFile(path.join(home, ".codex/hooks/multivibe-project-hook.mjs"), "changed");
+  assert.equal((await manager.get("openai-codex")).projectTracking, "not-installed");
+});
+
+test("invalid existing hooks roll back the provider connection without overwriting user data", async (t) => {
+  const { root, home, manager } = await trackingFixture();
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const hooksPath = path.join(home, ".codex/hooks.json");
+  await fs.writeFile(hooksPath, "invalid JSON");
+  await assert.rejects(manager.install("openai-codex", trackingCredential), /valid JSON/);
+  assert.equal(await fs.readFile(hooksPath, "utf8"), "invalid JSON");
+  await assert.rejects(fs.stat(path.join(home, ".codex/config.toml")), { code: "ENOENT" });
+  assert.equal((await manager.get("openai-codex")).managed, false);
+});
+
+test("tracking setup refuses symlinked hook files", async (t) => {
+  const { root, home, manager } = await trackingFixture();
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const outside = path.join(root, "outside.json");
+  await fs.writeFile(outside, "{}");
+  await fs.symlink(outside, path.join(home, ".codex/hooks.json"));
+  await assert.rejects(manager.enableProjectTracking("openai-codex"), /regular file|symbolic|symlink/i);
+  assert.equal(await fs.readFile(outside, "utf8"), "{}");
+});
+
+
+test("the installed command registers a real session without exposing credentials in the command", async (t) => {
+  const { root, home, manager } = await trackingFixture();
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  let registration: any;
+  let token: string | undefined;
+  const server = http.createServer(async (request, response) => {
+    assert.equal(request.url, "/admin/codex-sessions");
+    token = request.headers["x-codex-project-token"] as string;
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    registration = JSON.parse(Buffer.concat(chunks).toString());
+    response.writeHead(201).end("{}");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  await manager.enableProjectTracking("openai-codex");
+  const configPath = path.join(home, ".codex/multivibe-project.json");
+  const config = JSON.parse(await fs.readFile(configPath, "utf8"));
+  config.url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  await fs.writeFile(configPath, JSON.stringify(config));
+  const manifest = JSON.parse(await fs.readFile(path.join(home, ".codex/hooks.json"), "utf8"));
+  const command = manifest.hooks.SessionStart[0].hooks[0].command;
+  assert.equal(command.includes(config.token), false);
+  await new Promise<void>((resolve, reject) => {
+    const child = exec(command, { timeout: 5000 }, (error) => error ? reject(error) : resolve());
+    child.stdin!.end(JSON.stringify({ session_id: "fixture-session", cwd: home, source: "startup" }));
+  });
+  assert.equal(token, "fixture-registration-token");
+  assert.equal(registration?.sessionId, "fixture-session");
+  assert.equal(registration?.projectRoot, home);
+});

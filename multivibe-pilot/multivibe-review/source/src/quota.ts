@@ -1,0 +1,983 @@
+import { buildXaiUpstreamHeaders } from "./xai.js";
+import { fetchSdkUsage } from "./ai-sdk/quota.js";
+import { fetchCopilotUsage } from "./copilot-quota.js";
+import { trimTrailingSlashes } from "./string-utils.js";
+import type {
+  Account,
+  AccountSelectionTelemetry,
+  ProviderId,
+  UsageSnapshot,
+} from "./types.js";
+import {
+  EMPTY_RESPONSE_BLOCK_THRESHOLD,
+  EMPTY_RESPONSE_BLOCK_DURATION_MS,
+  EMPTY_RESPONSE_WINDOW_MS,
+  MODEL_NOT_FOUND_BLOCK_DURATION_MS,
+} from "./config.js";
+import { openCodeUsageUrl, openCodeInferenceToken, openCodeAccountHeaders } from "./opencode.js";
+
+export const USAGE_CACHE_TTL_MS = Number(process.env.USAGE_CACHE_TTL_MS ?? 300_000);
+// A pay-as-you-go provider exposes an absolute balance that moves on every
+// billed call and has no reset instant to wait for, so it is refreshed sooner
+// than a subscription quota window.
+export const CREDIT_BALANCE_REFRESH_INTERVAL_MS = (() => {
+  const value = Number(process.env.CREDIT_BALANCE_REFRESH_INTERVAL_MS ?? 120_000);
+  return Number.isFinite(value) && value >= 30_000 ? value : 120_000;
+})();
+const USAGE_TIMEOUT_MS = Number(process.env.USAGE_TIMEOUT_MS ?? 10_000);
+const BLOCK_FALLBACK_MS = Number(process.env.BLOCK_FALLBACK_MS ?? 30 * 60_000);
+const FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60;
+const WEEKLY_WINDOW_SECONDS = 7 * 24 * 60 * 60;
+const FIVE_HOUR_NEAR_LIMIT_PERCENT = (() => {
+  const value = Number(process.env.FIVE_HOUR_QUOTA_THRESHOLD_PERCENT ?? 90);
+  return Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 90;
+})();
+
+// Keep only the last choice as a tie breaker. A sticky account for several
+// minutes makes one weekly quota grow while the other remains untouched.
+const lastSelectedAccountByProvider = new Map<ProviderId, string>();
+
+export function normalizeProvider(account?: Pick<Account, "provider">): ProviderId {
+  if (account?.provider === "ai-sdk") return "ai-sdk";
+  if (account?.provider === "openai-compatible") return "openai-compatible";
+  if (account?.provider === "opencode") return "opencode";
+  if (account?.provider === "mistral") return "mistral";
+  if (account?.provider === "zai") return "zai";
+  if (account?.provider === "github-copilot") return "github-copilot";
+  if (account?.provider === "xai") return "xai";
+  return "openai";
+}
+
+export function tracksSubscriptionQuota(
+  account: Pick<Account, "localRuntime" | "multivibeCloud">,
+): boolean {
+  // Discovered/configured runtimes execute locally and have no provider
+  // subscription allowance to query. Request token telemetry is independent
+  // of this quota snapshot and remains available through tracing.
+  return account.localRuntime === undefined && account.multivibeCloud !== true;
+}
+
+/**
+ * True when the snapshot reports spendable credit rather than a quota window.
+ * Such an account must never be treated as a subscription percentage.
+ */
+export function hasCreditBalanceSnapshot(
+  account: Pick<Account, "usage">,
+): boolean {
+  const balance = account.usage?.balance;
+  return (
+    typeof balance?.remaining === "number" &&
+    Number.isFinite(balance.remaining) &&
+    typeof balance.unit === "string" &&
+    balance.unit.trim() !== ""
+  );
+}
+
+function safePct(v?: number): number {
+  if (typeof v !== "number" || Number.isNaN(v)) return 0;
+  return Math.max(0, Math.min(100, v));
+}
+
+function hasFiveHourQuota(account: Account): boolean {
+  return tracksSubscriptionQuota(account) && Boolean(account.usage?.primary);
+}
+
+function fiveHourQuotaIsNearLimit(account: Account): boolean {
+  const usedPercent = account.usage?.primary?.usedPercent;
+  return (
+    typeof usedPercent === "number" &&
+    safePct(usedPercent) >= FIVE_HOUR_NEAR_LIMIT_PERCENT
+  );
+}
+
+function weeklyUsage(account: Account): number | undefined {
+  if (!tracksSubscriptionQuota(account)) return undefined;
+  const value = account.usage?.secondary?.usedPercent;
+  return typeof value === "number" && Number.isFinite(value)
+    ? safePct(value)
+    : undefined;
+}
+
+function remainingPercent(value: number | undefined): number | undefined {
+  return typeof value === "number" && Number.isFinite(value)
+    ? 100 - safePct(value)
+    : undefined;
+}
+
+export type AccountSelectionDecision = {
+  account: Account | null;
+  provider: ProviderId;
+  candidateCount: number;
+  eligibleCount: number;
+  nearLimitCount: number;
+  selectedHeadroomPercent?: number;
+  selectedWeeklyRemainingPercent?: number;
+  selectedFiveHourRemainingPercent?: number;
+};
+
+export type AccountSelectionOptions = {
+  advanceCursor?: boolean;
+};
+
+export function accountHeadroom(account: Account): number | undefined {
+  if (!tracksSubscriptionQuota(account)) return undefined;
+  const windows = [
+    remainingPercent(account.usage?.primary?.usedPercent),
+    remainingPercent(account.usage?.secondary?.usedPercent),
+    remainingPercent(account.usage?.monthly?.usedPercent),
+    remainingPercent(account.usage?.credits?.usedPercent),
+  ].filter((value): value is number => typeof value === "number");
+  return windows.length ? Math.min(...windows) : undefined;
+}
+
+function accountSelectionMetrics(account: Account) {
+  if (!tracksSubscriptionQuota(account)) {
+    return {
+      selectedHeadroomPercent: undefined,
+      selectedWeeklyRemainingPercent: undefined,
+      selectedFiveHourRemainingPercent: undefined,
+    };
+  }
+  const selectedWeeklyRemainingPercent = remainingPercent(
+    account.usage?.secondary?.usedPercent,
+  );
+  const selectedFiveHourRemainingPercent = remainingPercent(
+    account.usage?.primary?.usedPercent,
+  );
+  return {
+    selectedHeadroomPercent: accountHeadroom(account),
+    selectedWeeklyRemainingPercent,
+    selectedFiveHourRemainingPercent,
+  };
+}
+
+export function buildAccountSelectionTelemetry(
+  decision: AccountSelectionDecision,
+  selected: Account | null,
+  reason: AccountSelectionTelemetry["reason"],
+  rotated = false,
+): AccountSelectionTelemetry {
+  return {
+    reason,
+    provider: decision.provider,
+    candidateCount: decision.candidateCount,
+    eligibleCount: decision.eligibleCount,
+    nearLimitCount: decision.nearLimitCount,
+    rotated,
+    ...(selected ? accountSelectionMetrics(selected) : {}),
+  };
+}
+
+function parseCodexCredits(credits: any): UsageSnapshot["codexCredits"] {
+  if (!credits || typeof credits !== "object" || Array.isArray(credits)) return undefined;
+  const raw = credits.balance;
+  const value = typeof raw === "number" || (typeof raw === "string" && raw.trim() !== "")
+    ? Number(raw) : NaN;
+  return {
+    remaining: Number.isFinite(value) && value >= 0 ? value : undefined,
+    hasCredits: typeof credits.has_credits === "boolean" ? credits.has_credits : undefined,
+    unlimited: typeof credits.unlimited === "boolean" ? credits.unlimited : undefined,
+    overageLimitReached: typeof credits.overage_limit_reached === "boolean" ? credits.overage_limit_reached : undefined,
+  };
+}
+
+function parseUsage(data: any): UsageSnapshot {
+  const upstreamPrimary = data?.rate_limit?.primary_window;
+  const upstreamSecondary = data?.rate_limit?.secondary_window;
+  const toWindow = (w: any) => {
+    if (!w || typeof w !== "object") return undefined;
+    const percent = pickFirstNumber(w.used_percent);
+    const resetAt = parseResetAt(w.reset_at);
+    if (percent === undefined && resetAt === undefined) return undefined;
+    return {
+      usedPercent: percent === undefined ? undefined : Math.max(0, Math.min(100, percent)),
+      resetAt,
+      windowSeconds: pickFirstNumber(w.limit_window_seconds),
+    };
+  };
+
+  const positionalPrimary = toWindow(upstreamPrimary);
+  const positionalSecondary = toWindow(upstreamSecondary);
+  const windows = [positionalPrimary, positionalSecondary].filter(
+    (window): window is NonNullable<typeof window> => Boolean(window),
+  );
+
+  // OpenAI's field names describe upstream priority, not a stable duration.
+  // In particular, accounts with only a weekly limit now return that seven-day
+  // window as `primary_window` and leave `secondary_window` null.
+  const primary =
+    windows.find((window) => window.windowSeconds === FIVE_HOUR_WINDOW_SECONDS) ??
+    (positionalPrimary?.windowSeconds === undefined ? positionalPrimary : undefined);
+  const secondary =
+    windows.find((window) => window.windowSeconds === WEEKLY_WINDOW_SECONDS) ??
+    (positionalSecondary?.windowSeconds === undefined ? positionalSecondary : undefined);
+
+  // Free accounts can expose a single rolling 30-day window.
+  const monthly = windows.find((window) => window.windowSeconds === 30 * 24 * 60 * 60);
+  if (!primary && !secondary && !monthly) {
+    throw new Error("OpenAI usage response contains no recognized quota windows");
+  }
+  return { primary, secondary, monthly, codexCredits: parseCodexCredits(data?.credits), quotaStatus: "available", fetchedAt: Date.now() };
+}
+
+function parseOpenAIUsage(data: any): UsageSnapshot {
+  return parseUsage(data);
+}
+
+export function parseOpenCodeUsage(data: any): UsageSnapshot {
+  const usage = data?.usage && typeof data.usage === "object" ? data.usage : data;
+  const toWindow = (window: any, windowSeconds?: number) => {
+    if (!window || typeof window !== "object") return undefined;
+    const usedPercent = pickFirstNumber(
+      window.percent,
+      window.usedPercent,
+      window.used_percent,
+    );
+    const resetAt = parseResetAt(
+      window.resetsAt ?? window.resetAt ?? window.reset_at,
+    );
+    if (usedPercent === undefined && resetAt === undefined) return undefined;
+    return {
+      usedPercent:
+        usedPercent === undefined
+          ? undefined
+          : Math.max(0, Math.min(100, usedPercent)),
+      resetAt,
+      windowSeconds,
+    };
+  };
+  const primary = toWindow(usage?.rolling, FIVE_HOUR_WINDOW_SECONDS);
+  const secondary = toWindow(usage?.weekly, WEEKLY_WINDOW_SECONDS);
+  const monthly = toWindow(usage?.monthly);
+  if (!primary && !secondary && !monthly) {
+    throw new Error("OpenCode usage response contains no recognized quota windows");
+  }
+  return {
+    primary,
+    secondary,
+    monthly,
+    quotaStatus: "available",
+    fetchedAt: Date.now(),
+  };
+}
+
+function markOpenCodeQuotaUnsupported(account: Account, quotaMessage: string): Account {
+  const isProbeAvailabilityError = (message?: string) =>
+    /^OpenCode usage probe failed (403|404)\b/.test(message ?? "");
+  account.usage = {
+    quotaStatus: "unsupported",
+    quotaMessage,
+    fetchedAt: Date.now(),
+  };
+  account.state = {
+    ...account.state,
+    lastError: isProbeAvailabilityError(account.state?.lastError)
+      ? undefined
+      : account.state?.lastError,
+    recentErrors: account.state?.recentErrors?.filter(
+      (error) => !isProbeAvailabilityError(error.message),
+    ),
+  };
+  return account;
+}
+
+function bearerToken(token: string): string {
+  const trimmed = String(token ?? "").trim();
+  if (!trimmed) return "";
+  return /^Bearer\s+/i.test(trimmed) ? trimmed : `Bearer ${trimmed}`;
+}
+
+function isZaiQuotaBaseUrl(baseUrl?: string): boolean {
+  const raw = String(baseUrl ?? "").trim();
+  if (!raw) return false;
+  try {
+    const { hostname } = new URL(raw);
+    return hostname === "api.z.ai" || hostname === "z.ai" || hostname === "open.bigmodel.cn" || hostname === "dev.bigmodel.cn";
+  } catch {
+    return false;
+  }
+}
+
+function zaiQuotaUrl(baseUrl: string): string {
+  const raw = String(baseUrl ?? "").trim();
+  try {
+    const url = new URL(raw);
+    url.pathname = "/api/monitor/usage/quota/limit";
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    const trimmed = trimTrailingSlashes(raw);
+    return `${trimmed}/api/monitor/usage/quota/limit`;
+  }
+}
+
+function toPercent(used?: number, total?: number): number | undefined {
+  if (typeof used !== "number" || Number.isNaN(used)) return undefined;
+  if (typeof total === "number" && Number.isFinite(total) && total > 0) {
+    return Math.max(0, Math.min(100, (used / total) * 100));
+  }
+  return undefined;
+}
+
+function parseResetAt(value: any): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value > 1e12 ? value : value * 1000;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsedNumber = Number(value);
+    if (Number.isFinite(parsedNumber)) {
+      return parsedNumber > 1e12 ? parsedNumber : parsedNumber * 1000;
+    }
+    const parsedDate = Date.parse(value);
+    if (Number.isFinite(parsedDate)) return parsedDate;
+  }
+  return undefined;
+}
+
+function pickFirstNumber(...values: any[]): number | undefined {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return undefined;
+}
+
+function parseZaiWindow(window: any): UsageSnapshot["primary"] {
+  if (!window || typeof window !== "object") return undefined;
+
+  const usedPercent = pickFirstNumber(
+    window.usedPercent,
+    window.used_percent,
+    window.usagePercent,
+    window.usage_percent,
+    window.percent,
+    window.percentUsed,
+    window.percentage,
+  );
+  const used = pickFirstNumber(window.currentValue, window.used, window.type ? undefined : window.usage, window.used_amount, window.consumed);
+  const total = pickFirstNumber(window.total, window.limit, window.quota, window.max, window.capacity, window.type ? window.usage : undefined);
+  const resetAt = parseResetAt(window.nextResetTime ?? window.resetAt ?? window.reset_at ?? window.resetTime ?? window.reset_time ?? window.expireAt ?? window.expire_at);
+
+  const percent = typeof usedPercent === "number"
+    ? Math.max(0, Math.min(100, usedPercent))
+    : toPercent(used, total);
+
+  if (typeof percent !== "number" && typeof resetAt !== "number") return undefined;
+  return { usedPercent: percent, resetAt };
+}
+
+export function parseZaiUsage(data: any): UsageSnapshot {
+  // This explicit entitlement response means subscription quotas do not apply.
+  // Other HTTP-200 provider errors must remain errors (including auth failures).
+  if (data?.success === false && Number(data?.code) === 500 &&
+      data?.msg === "当前用户不存在coding plan" && !data?.error) {
+    return {
+      quotaStatus: "unsupported",
+      quotaMessage: "This Z.ai account has no Coding Plan subscription. Subscription quotas are unavailable; request token usage is tracked separately.",
+      fetchedAt: Date.now(),
+    };
+  }
+  if (data?.success === false || (data?.code !== undefined && ![0, 200].includes(Number(data.code))) || data?.error) {
+    throw new Error("Z.ai usage response reports a provider error");
+  }
+  const root = data?.data && typeof data.data === "object" ? data.data : data;
+
+  let primary = parseZaiWindow(
+    root?.primary ??
+      root?.fiveHour ??
+      root?.five_hour ??
+      root?.hour5 ??
+      root?.shortTerm ??
+      root?.short_term ??
+      root?.rate_limit?.primary_window,
+  );
+
+  let secondary = parseZaiWindow(
+    root?.secondary ??
+      root?.weekly ??
+      root?.week ??
+      root?.weeklyQuota ??
+      root?.weekly_quota ??
+      root?.longTerm ??
+      root?.long_term ??
+      root?.rate_limit?.secondary_window,
+  );
+
+  let tools: UsageSnapshot["tools"];
+  for (const limit of Array.isArray(root?.limits) ? root.limits : []) {
+    const window = parseZaiWindow(limit);
+    if (!window) continue;
+    if (limit.type === "TIME_LIMIT") {
+      tools = window;
+      continue;
+    }
+    if (limit.type !== "TOKENS_LIMIT" && limit.type !== "CREDIT_LIMIT") continue;
+    // Provider period units: day, hour, minute, week. Do not guess unknown periods.
+    const secondsPerUnit: Record<number, number> = { 1: 86400, 3: 3600, 5: 60, 6: 604800 };
+    const unit = pickFirstNumber(limit.unit);
+    const count = pickFirstNumber(limit.number);
+    const seconds = unit !== undefined && count !== undefined
+      ? secondsPerUnit[unit] * count
+      : limit.unit == null && limit.number == null && limit.type === "TOKENS_LIMIT"
+        ? FIVE_HOUR_WINDOW_SECONDS // Legacy shape in Z.ai's official usage plugin.
+        : undefined;
+    if (seconds === FIVE_HOUR_WINDOW_SECONDS) primary = { ...window, windowSeconds: seconds };
+    else if (seconds === WEEKLY_WINDOW_SECONDS) secondary = { ...window, windowSeconds: seconds };
+    else throw new Error("Z.ai usage response contains an unsupported model quota period");
+  }
+  if (!primary && !secondary && !tools) {
+    throw new Error("Z.ai usage response contains no recognized quota windows");
+  }
+  return { primary, secondary, tools, quotaStatus: "available", fetchedAt: Date.now() };
+}
+
+export function parseXaiUsage(data: any): UsageSnapshot {
+  const config = data?.config;
+  if (!config || data?.error) throw new Error("Grok usage response contains no credit quota");
+  const percent = pickFirstNumber(config.creditUsagePercent);
+  const resetAt = parseResetAt(config.currentPeriod?.end ?? config.billingPeriodEnd);
+  if (percent === undefined && resetAt === undefined) {
+    throw new Error("Grok usage response contains no credit quota");
+  }
+  return {
+    credits: { usedPercent: percent === undefined ? undefined : Math.max(0, Math.min(100, percent)), resetAt },
+    quotaStatus: "available",
+    quotaMessage: percent === undefined ? "Grok returned the billing reset date but no subscription usage percentage." : undefined,
+    fetchedAt: Date.now(),
+  };
+}
+
+function setModelBlock(account: Account, model: string, until: number, reason: string) {
+  const modelKey = model.toLowerCase();
+  const modelBlocks = { ...account.state?.modelBlocks };
+  modelBlocks[modelKey] = { until, reason };
+  account.state = { ...account.state, modelBlocks };
+}
+
+export function rememberError(account: Account, message: string) {
+  const next = [{ at: Date.now(), message }, ...(account.state?.recentErrors ?? [])].slice(0, 10);
+  account.state = { ...account.state, lastError: message, recentErrors: next };
+}
+
+export function markEmptyResponseError(account: Account, model: string, message: string = "empty assistant output") {
+  // Track consecutive empty responses to decide when to temporarily block the account+model
+  const recentEmpty = account.state?.recentEmptyResponses ?? [];
+  const next = [{ at: Date.now(), message }, ...recentEmpty].slice(0, 5);
+  const consecutive = next.filter(e => Date.now() - e.at < EMPTY_RESPONSE_WINDOW_MS).length;
+  
+  account.state = { 
+    ...account.state, 
+    lastError: message, 
+    recentEmptyResponses: next,
+  };
+
+  // Block model on account if threshold exceeded within window
+  if (consecutive >= EMPTY_RESPONSE_BLOCK_THRESHOLD) {
+    const blockUntil = Date.now() + EMPTY_RESPONSE_BLOCK_DURATION_MS;
+    setModelBlock(account, model, blockUntil, `empty responses (${consecutive} in ${Math.round(EMPTY_RESPONSE_WINDOW_MS / 60_000)}m)`);
+  }
+}
+
+export function usageUntouched(usage?: UsageSnapshot): boolean {
+  return usage?.primary?.usedPercent === 0 && usage?.secondary?.usedPercent === 0;
+}
+
+export function weeklyResetAt(usage?: UsageSnapshot): number | undefined {
+  return usage?.secondary?.resetAt;
+}
+
+export function nextResetAt(usage?: UsageSnapshot): number | undefined {
+  const list = [
+    usage?.primary?.resetAt,
+    usage?.secondary?.resetAt,
+    usage?.monthly?.resetAt,
+    usage?.credits?.resetAt,
+  ].filter((x): x is number => typeof x === "number" && Number.isFinite(x));
+  return list.length ? Math.min(...list) : undefined;
+}
+
+export function isQuotaErrorText(s: string): boolean {
+  // Generic quota/rate limit patterns
+  if (/\b429\b|quota|usage limit|rate.?limit|too many requests|limit reached|capacity/i.test(s)) {
+    return true;
+  }
+  // z.ai specific business error codes
+  // 1304: Daily call limit, 1305: Rate limit, 1308: Usage limit, 1309: Plan expired
+  // 1310: Weekly/Monthly limit, 1312: High traffic, 1313: Fair Use Policy
+  if (/"code":\s*"?(130[4-9]|131[0-3])"?/i.test(s)) {
+    return true;
+  }
+  // z.ai error messages
+  if (/daily call limit|usage limit reached|limit exhausted|fair use policy|high (concurrency|frequency|traffic)/i.test(s)) {
+    return true;
+  }
+  return false;
+}
+
+export function accountUsable(a: Account, model?: string): boolean {
+  if (!a.enabled) return false;
+  if (
+    typeof a.state?.authBlockedUntil === "number" &&
+    a.state.authBlockedUntil > Date.now()
+  ) {
+    return false;
+  }
+  if (!model) return true;
+  const modelKey = model.toLowerCase();
+  const block = a.state?.modelBlocks?.[modelKey];
+  return !(block && Date.now() < block.until);
+}
+
+export function clearEmptyResponseHistory(account: Account, model?: string) {
+  const modelKey = model?.toLowerCase();
+  if (modelKey) {
+    const modelBlocks = { ...account.state?.modelBlocks };
+    const block = modelBlocks[modelKey];
+
+    // A successful response should only clear a block created by
+    // empty-response detection. Quota/rate-limit/model-specific blocks may
+    // have been created concurrently by another request and must survive.
+    if (block?.reason?.startsWith("empty responses (")) {
+      delete modelBlocks[modelKey];
+    }
+
+    account.state = {
+      ...account.state,
+      recentEmptyResponses: [],
+      modelBlocks,
+    };
+  } else {
+    account.state = {
+      ...account.state,
+      recentEmptyResponses: [],
+    };
+  }
+}
+
+export function accountSelectionPool(accounts: Account[]): Account[] {
+  const enabled = accounts.filter((a) => a.enabled);
+  const withHeadroom = enabled.filter((a) => accountHeadroom(a) !== 0);
+  const available = withHeadroom.length ? withHeadroom : enabled;
+
+  if (!available.length) return [];
+
+  // A nearly exhausted five-hour window must never win solely because its
+  // weekly usage is lower. This applies whether the other accounts are
+  // weekly-only or also have a five-hour window.
+  const pool = available.filter(
+    (account) =>
+      !hasFiveHourQuota(account) || !fiveHourQuotaIsNearLimit(account),
+  );
+
+  return pool.length ? pool : available;
+}
+
+export function chooseAccount(accounts: Account[]): Account | null {
+  return selectAccount(accounts).account;
+}
+
+export function selectAccount(
+  accounts: Account[],
+  options: AccountSelectionOptions = {},
+): AccountSelectionDecision {
+  const provider = normalizeProvider(accounts[0]);
+  const candidates = accounts.filter((account) => account.enabled);
+  const effectivePool = accountSelectionPool(accounts);
+  const nearLimitCount = candidates.filter(
+    (account) => hasFiveHourQuota(account) && fiveHourQuotaIsNearLimit(account),
+  ).length;
+  const allEffectiveAccountsNearLimit =
+    effectivePool.length > 0 &&
+    effectivePool.every(
+      (account) => hasFiveHourQuota(account) && fiveHourQuotaIsNearLimit(account),
+    );
+
+  if (!effectivePool.length) {
+    return {
+      account: null,
+      provider,
+      candidateCount: candidates.length,
+      eligibleCount: 0,
+      nearLimitCount,
+    };
+  }
+
+  const sorted = [...effectivePool].sort((a, b) => {
+    const aheadroom = accountHeadroom(a);
+    const bheadroom = accountHeadroom(b);
+    const aw = weeklyUsage(a);
+    const bw = weeklyUsage(b);
+
+    // Preserve weekly balancing while at least one account has useful
+    // five-hour headroom. Only when every effective account is near its
+    // five-hour limit do we prefer the account with the largest remaining
+    // quota, preventing the smallest weekly usage from burning the tightest
+    // window first.
+    if (allEffectiveAccountsNearLimit) {
+      // An unknown snapshot remains a last resort. This preserves the safe
+      // behavior for accounts whose usage has not been fetched yet.
+      if (aheadroom === undefined && bheadroom !== undefined) return 1;
+      if (aheadroom !== undefined && bheadroom === undefined) return -1;
+      if (aheadroom !== undefined && bheadroom !== undefined && aheadroom !== bheadroom) {
+        return bheadroom - aheadroom;
+      }
+    }
+
+    if (aw === undefined && bw !== undefined) return 1;
+    if (aw !== undefined && bw === undefined) return -1;
+    if (aw !== undefined && bw !== undefined && aw !== bw) return aw - bw;
+
+    if (aw === undefined && bw === undefined && aheadroom !== bheadroom) {
+      if (aheadroom === undefined) return 1;
+      if (bheadroom === undefined) return -1;
+      return bheadroom - aheadroom;
+    }
+
+    const ar = a.usage?.secondary?.resetAt ?? Number.MAX_SAFE_INTEGER;
+    const br = b.usage?.secondary?.resetAt ?? Number.MAX_SAFE_INTEGER;
+    if (ar !== br) return ar - br;
+
+    const ap = a.priority ?? Number.MAX_SAFE_INTEGER;
+    const bp = b.priority ?? Number.MAX_SAFE_INTEGER;
+    if (ap !== bp) return ap - bp;
+
+    return a.id.localeCompare(b.id);
+  });
+
+  // When the effective headroom is equal, alternate between accounts instead
+  // of selecting the first one forever. This keeps traffic balanced without
+  // overriding a better quota headroom score.
+  const selectedHeadroom = accountHeadroom(sorted[0]);
+  const selectedWeeklyUsage = weeklyUsage(sorted[0]);
+  const tiedAccounts = sorted.filter(
+    (account) =>
+      allEffectiveAccountsNearLimit
+        ? accountHeadroom(account) === selectedHeadroom
+        : weeklyUsage(account) === selectedWeeklyUsage &&
+          (selectedWeeklyUsage !== undefined || accountHeadroom(account) === selectedHeadroom),
+  );
+  const previousId = lastSelectedAccountByProvider.get(provider);
+  const previousIndex = previousId
+    ? tiedAccounts.findIndex((account) => account.id === previousId)
+    : -1;
+  const winner =
+    previousIndex >= 0
+      ? tiedAccounts[(previousIndex + 1) % tiedAccounts.length]
+      : sorted[0];
+  if (options.advanceCursor !== false) {
+    lastSelectedAccountByProvider.set(provider, winner.id);
+  }
+
+  return {
+    account: winner,
+    provider,
+    candidateCount: candidates.length,
+    eligibleCount: effectivePool.length,
+    nearLimitCount,
+    ...accountSelectionMetrics(winner),
+  };
+}
+
+export function chooseAccountForProvider(
+  accounts: Account[],
+  provider: ProviderId,
+): Account | null {
+  return selectAccountForProvider(accounts, provider).account;
+}
+
+export function selectAccountForProvider(
+  accounts: Account[],
+  provider: ProviderId,
+  options: AccountSelectionOptions = {},
+): AccountSelectionDecision {
+  const matching = accounts.filter(
+    (account) => normalizeProvider(account) === provider,
+  );
+  const decision = selectAccount(matching, options);
+  return matching.length ? decision : { ...decision, provider };
+}
+
+export function commitAccountSelection(provider: ProviderId, accountId: string): void {
+  lastSelectedAccountByProvider.set(provider, accountId);
+}
+
+export function isUsageRefreshNeeded(
+  account: Account,
+  now = Date.now(),
+): boolean {
+  if (!tracksSubscriptionQuota(account)) return false;
+  // Failed probes retain stale windows. Their old reset dates must not create
+  // an unbounded retry on every request; explicit refresh still bypasses this.
+  if (account.usage?.quotaStatus === "error") {
+    return now - account.usage.fetchedAt >= Math.min(USAGE_CACHE_TTL_MS, 60_000);
+  }
+  const resetDue = [
+    account.usage?.primary?.resetAt,
+    account.usage?.secondary?.resetAt,
+    account.usage?.monthly?.resetAt,
+    account.usage?.credits?.resetAt,
+  ].some(
+    (resetAt) =>
+      typeof resetAt === "number" && Number.isFinite(resetAt) && resetAt <= now,
+  );
+  const ttl = hasCreditBalanceSnapshot(account)
+    ? CREDIT_BALANCE_REFRESH_INTERVAL_MS
+    : USAGE_CACHE_TTL_MS;
+  return (
+    resetDue ||
+    !account.usage ||
+    now - account.usage.fetchedAt >= ttl
+  );
+}
+
+export async function refreshUsageIfNeeded(account: Account, chatgptBaseUrl: string, force = false): Promise<Account> {
+  if (!tracksSubscriptionQuota(account)) {
+    // Clear quota placeholders left by older releases without probing a local
+    // inference endpoint for a subscription concept it cannot expose.
+    account.usage = undefined;
+    return account;
+  }
+  if (!force && !isUsageRefreshNeeded(account)) return account;
+  const provider = normalizeProvider(account);
+  const shouldUseZaiQuotaEndpoint =
+    provider === "zai" || (provider === "openai-compatible" && isZaiQuotaBaseUrl(chatgptBaseUrl));
+
+  // These providers don't expose a compatible usage endpoint here. Keep
+  // routing based on locally observed errors and request usage.
+  if (
+    provider === "mistral" ||
+    (provider === "openai-compatible" && !shouldUseZaiQuotaEndpoint)
+  ) {
+    account.usage = {
+      quotaStatus: "unsupported",
+      quotaMessage: provider === "mistral"
+        ? "Mistral Vibe subscription quotas require a separate Mistral Console browser session. This API connection cannot retrieve them."
+        : "This connection has no supported subscription quota endpoint. Request token usage is tracked separately.",
+      fetchedAt: Date.now(),
+    };
+    return account;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), USAGE_TIMEOUT_MS);
+  try {
+    if (provider === "ai-sdk" || provider === "github-copilot") {
+      const previousQuotaError = account.usage?.quotaStatus === "error" ? account.usage.quotaMessage : undefined;
+      account.usage = provider === "ai-sdk"
+        ? await fetchSdkUsage(account, controller.signal)
+        : await fetchCopilotUsage(account, controller.signal);
+      if (previousQuotaError && account.state?.lastError === previousQuotaError) {
+        account.state = { ...account.state, lastError: undefined };
+      }
+      return account;
+    }
+    const headers: Record<string, string> = {
+      authorization: bearerToken(account.accessToken),
+      accept: "application/json",
+    };
+
+    if (provider === "opencode") {
+      const usageUrl = openCodeUsageUrl(chatgptBaseUrl);
+      if (!usageUrl) {
+        return markOpenCodeQuotaUnsupported(account,
+          "OpenCode Console does not expose Go quota windows through its inference API. Connect a Go API key with the Zen / Go endpoint to monitor 5h, weekly and monthly quotas.");
+      }
+      const res = await fetch(usageUrl, {
+        headers: {
+          ...openCodeAccountHeaders(account),
+          ...headers,
+          authorization: bearerToken(openCodeInferenceToken(account)),
+        },
+        signal: controller.signal,
+      });
+      const json = await res.json().catch(() => undefined);
+      // Only the explicit Go entitlement response proves quotas unavailable.
+      // Workspace errors, WAF denials and missing routes must remain visible.
+      if (res.status === 403 && json?.error?.type === "EntitlementError" &&
+          json?.error?.message === "OpenCode Go subscription required.") {
+        return markOpenCodeQuotaUnsupported(account, "This API key has no OpenCode Go subscription.");
+      }
+      if (!res.ok) throw new Error(`OpenCode usage probe failed ${res.status}`);
+      account.usage = parseOpenCodeUsage(json);
+      if (/^OpenCode usage (probe failed|response)/.test(account.state?.lastError ?? "")) {
+        account.state = { ...account.state, lastError: undefined };
+      }
+      return account;
+    }
+
+    if (provider === "xai") {
+      const usageUrl = `${trimTrailingSlashes(chatgptBaseUrl)}/billing?format=credits`;
+      const res = await fetch(usageUrl, {
+        headers: { ...buildXaiUpstreamHeaders(account.accessToken, { accept: "application/json" }), ...headers },
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error(`Grok usage probe failed ${res.status}`);
+      account.usage = parseXaiUsage(await res.json());
+      if (/^(Grok usage|usage probe)/.test(account.state?.lastError ?? "")) {
+        account.state = { ...account.state, lastError: undefined };
+      }
+      return account;
+    }
+
+    if (shouldUseZaiQuotaEndpoint) {
+      const usageUrl = zaiQuotaUrl(chatgptBaseUrl);
+      const res = await fetch(usageUrl, { headers, signal: controller.signal });
+      if (!res.ok) throw new Error(`Z.ai usage probe failed ${res.status}`);
+      const json = await res.json();
+      account.usage = parseZaiUsage(json);
+      if (/^(Z.ai usage|usage probe)/.test(account.state?.lastError ?? "")) {
+        account.state = { ...account.state, lastError: undefined };
+      }
+      return account;
+    }
+
+    const usageUrl = `${trimTrailingSlashes(chatgptBaseUrl)}/backend-api/wham/usage`;
+    if (provider === "openai" && account.chatgptAccountId) {
+      headers["ChatGPT-Account-Id"] = account.chatgptAccountId;
+    }
+    const res = await fetch(usageUrl, { headers, signal: controller.signal });
+    if (!res.ok) throw new Error(`OpenAI usage probe failed ${res.status}`);
+    const json = await res.json();
+    account.usage = parseOpenAIUsage(json);
+    if (/^(OpenAI usage|usage probe)/.test(account.state?.lastError ?? "")) {
+      account.state = { ...account.state, lastError: undefined };
+    }
+    return account;
+  } catch (err: any) {
+    account.usage = {
+      ...account.usage,
+      quotaStatus: "error",
+      quotaMessage: err?.message ?? String(err),
+      fetchedAt: Date.now(),
+    };
+    rememberError(account, err?.message ?? String(err));
+    return account;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+const RATE_LIMIT_BLOCK_MS = Number(process.env.RATE_LIMIT_BLOCK_MS ?? 60_000);
+const QUOTA_RESET_GRACE_MS = 60_000;
+
+function exhaustedQuotaResetAt(
+  account: Account,
+  now = Date.now(),
+): number | undefined {
+  if (!tracksSubscriptionQuota(account)) return undefined;
+  const resetAts = [account.usage?.primary, account.usage?.secondary, account.usage?.monthly, account.usage?.credits].flatMap(
+    (window) => {
+      if (
+        !window ||
+        typeof window.usedPercent !== "number" ||
+        !Number.isFinite(window.usedPercent) ||
+        window.usedPercent < 99 ||
+        typeof window.resetAt !== "number" ||
+        !Number.isFinite(window.resetAt) ||
+        window.resetAt <= now
+      ) {
+        return [];
+      }
+
+      return [window.resetAt];
+    },
+  );
+
+  if (!resetAts.length) return undefined;
+
+  // If multiple quota windows are exhausted, the account remains unusable
+  // until all of them have reset.
+  return Math.max(...resetAts);
+}
+
+export function markQuotaHit(
+  account: Account,
+  model: string,
+  message: string,
+  upstreamErrorText = "",
+) {
+  const now = Date.now();
+  const isRateLimit = /\b429\b/.test(message);
+  const isUsageLimit =
+    /usage[_ -]?limit[_ -]?reached|usage\s+limit\s+has\s+been\s+reached|quota\s+(?:exhausted|exceeded)|limit\s+exhausted/i.test(
+      upstreamErrorText,
+    );
+
+  const quotaResetAt = isUsageLimit
+    ? exhaustedQuotaResetAt(account, now)
+    : undefined;
+
+  const until =
+    quotaResetAt !== undefined
+      ? quotaResetAt + QUOTA_RESET_GRACE_MS
+      : isRateLimit
+        ? now + RATE_LIMIT_BLOCK_MS
+        : (tracksSubscriptionQuota(account)
+            ? nextResetAt(account.usage)
+            : undefined) ?? now + BLOCK_FALLBACK_MS;
+
+  setModelBlock(account, model, until, message);
+  rememberError(account, message);
+}
+
+export function markModelNotFound(account: Account, model: string, message: string) {
+  setModelBlock(
+    account,
+    model,
+    Date.now() + MODEL_NOT_FOUND_BLOCK_DURATION_MS,
+    message,
+  );
+  rememberError(account, message);
+}
+
+// z.ai business error code categories for smarter handling
+const ZAI_AUTH_ERRORS = new Set([1000, 1001, 1002, 1003, 1004]);
+const ZAI_ACCOUNT_ERRORS = new Set([1110, 1111, 1112, 1113, 1120, 1121]);
+const ZAI_QUOTA_ERRORS = new Set([1304, 1305, 1308, 1309, 1310, 1312, 1313]);
+const ZAI_RATE_LIMIT_ERRORS = new Set([1302, 1303, 1305]);
+
+export function parseZaiErrorCode(errorText: string): number | null {
+  const match = errorText.match(/"code":\s*"?(\d{4})"?/i);
+  if (match) {
+    return parseInt(match[1], 10);
+  }
+  return null;
+}
+
+export function isZaiAuthError(errorCode: number): boolean {
+  return ZAI_AUTH_ERRORS.has(errorCode);
+}
+
+export function isZaiAccountError(errorCode: number): boolean {
+  return ZAI_ACCOUNT_ERRORS.has(errorCode);
+}
+
+export function isZaiQuotaError(errorCode: number): boolean {
+  return ZAI_QUOTA_ERRORS.has(errorCode);
+}
+
+export function isZaiRateLimitError(errorCode: number): boolean {
+  return ZAI_RATE_LIMIT_ERRORS.has(errorCode);
+}
+
+export function shouldBlockAccountForZaiError(errorCode: number): boolean {
+  // Block account for auth errors, account errors, and quota errors
+  return isZaiAuthError(errorCode) || isZaiAccountError(errorCode) || isZaiQuotaError(errorCode);
+}
+
+export function getZaiBlockDuration(errorCode: number): number {
+  // For rate limits, block for shorter period (1-5 minutes)
+  if (isZaiRateLimitError(errorCode)) {
+    return 60_000; // 1 minute
+  }
+  // For quota limits, block until next reset or longer period
+  if (isZaiQuotaError(errorCode)) {
+    return BLOCK_FALLBACK_MS; // 30 minutes default
+  }
+  // For auth/account errors, block for longer
+  return 5 * 60_000; // 5 minutes
+}

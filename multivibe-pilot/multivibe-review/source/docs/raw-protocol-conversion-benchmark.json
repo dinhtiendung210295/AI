@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-09-04",
+  "benchmark": "raw_json_chat_completion_to_response_projection",
+  "cases": [
+    {
+      "samples": 1000,
+      "segments": 256,
+      "payloadBytes": 57491,
+      "baseline": {
+        "implementation": "typescript_json_parse_projection_buffer",
+        "medianMs": 0.32116600000000517,
+        "p95Ms": 0.43070799999998144,
+        "totalMs": 334.7648279999991
+      },
+      "candidate": {
+        "implementation": "rust_napi_raw_bytes_conversion_node_owned_buffer",
+        "medianMs": 0.32533300000000054,
+        "p95Ms": 0.367541000000017,
+        "totalMs": 335.0482160000004
+      }
+    },
+    {
+      "samples": 500,
+      "segments": 1024,
+      "payloadBytes": 229547,
+      "baseline": {
+        "implementation": "typescript_json_parse_projection_buffer",
+        "medianMs": 1.3563330000000633,
+        "p95Ms": 1.853708000000097,
+        "totalMs": 708.0492550000001
+      },
+      "candidate": {
+        "implementation": "rust_napi_raw_bytes_conversion_node_owned_buffer",
+        "medianMs": 1.163583000000017,
+        "p95Ms": 1.2570419999999558,
+        "totalMs": 587.8963699999998
+      }
+    }
+  ],
+  "decision": "enabled_by_default_with_fallback",
+  "reason": "The final-byte Rust path is near parity on the small payload and faster on the larger payload; it is enabled when the native addon is available and retains conservative TypeScript fallbacks.",
+  "limitations": [
+    "Synthetic responses with text segments and string-valued function arguments; no network, provider, or model latency.",
+    "Rust builds a temporary serde_json::Value tree and copies the final body into a Node-owned Buffer; this is not zero-copy parsing.",
+    "The raw candidate is deliberately conservative and falls back for sanitizer-sensitive text and nested object tool arguments.",
+    "The benchmark script measures buffered JSON conversion (stream=false); SSE output is covered by unit and N-API tests.",
+    "Absolute timings depend on host load; these measurements are rollout guards, not end-to-end or production performance claims."
+  ]
+}

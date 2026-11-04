@@ -1,0 +1,1108 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		4CD806D764BD691CA0CF711A /* CloudAgentStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1FEFE1D18BE42970C813B47E /* CloudAgentStateTests.swift */; };
+		91C0AA000000000000000003 /* CloudHermesContextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C0AA000000000000000004 /* CloudHermesContextTests.swift */; };
+		91C0BB000000000000000003 /* HermesSkillCatalogTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C0BB000000000000000004 /* HermesSkillCatalogTests.swift */; };
+		91C0BC000000000000000003 /* HermesSelectedMemoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C0BC000000000000000004 /* HermesSelectedMemoryTests.swift */; };
+		91C0BE000000000000000003 /* HermesLegacyLedgerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C0BE000000000000000004 /* HermesLegacyLedgerTests.swift */; };
+		91C0BF000000000000000003 /* HermesLegacyExtractorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C0BF000000000000000004 /* HermesLegacyExtractorTests.swift */; };
+		91C0C0000000000000000003 /* HermesLegacyEnvelopeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C0C0000000000000000004 /* HermesLegacyEnvelopeTests.swift */; };
+		91C1C0000000000000000003 /* HermesLegacyExportJournalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C1C0000000000000000004 /* HermesLegacyExportJournalTests.swift */; };
+		91C0BD000000000000000003 /* HermesMutationToolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C0BD000000000000000004 /* HermesMutationToolTests.swift */; };
+		C7FF1FE7C944FBE343910524 /* CloudAgentState.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD80E887E35614D8AAC6E385 /* CloudAgentState.swift */; };
+		4EED5163512B1AEF02BEE848 /* CloudWorkspaceArtifactStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 50CFD8DB0AC7E749D88E0EA8 /* CloudWorkspaceArtifactStore.swift */; };
+		91C0AA000000000000000001 /* CloudHermesContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C0AA000000000000000002 /* CloudHermesContext.swift */; };
+		91C0BB000000000000000001 /* HermesSkillCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C0BB000000000000000002 /* HermesSkillCatalog.swift */; };
+		91C0BC000000000000000001 /* HermesSelectedMemory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C0BC000000000000000002 /* HermesSelectedMemory.swift */; };
+		91C0BE000000000000000001 /* HermesLegacyLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C0BE000000000000000002 /* HermesLegacyLedger.swift */; };
+		91C0BF000000000000000001 /* HermesLegacyExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C0BF000000000000000002 /* HermesLegacyExtractor.swift */; };
+		91C0C0000000000000000001 /* HermesLegacyEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C0C0000000000000000002 /* HermesLegacyEnvelope.swift */; };
+		91C1C0000000000000000001 /* HermesLegacyExportJournal.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C1C0000000000000000002 /* HermesLegacyExportJournal.swift */; };
+		C01920000000000000000001 /* CloudHermesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C01920000000000000000002 /* CloudHermesTests.swift */; };
+		3491652F996C3B28A19A7889 /* CloudWorkspaceArtifactStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09865E68F5B92BF9F6227862 /* CloudWorkspaceArtifactStoreTests.swift */; };
+		C01910000000000000000003 /* HermesFoundationAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C01910000000000000000004 /* HermesFoundationAdapter.swift */; };
+		C01910000000000000000001 /* HermesCheckpointStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C01910000000000000000002 /* HermesCheckpointStore.swift */; };
+		003956616649C28F8B135B88 /* LocalWebFetch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B001301568AC61EB8AE8F59 /* LocalWebFetch.swift */; };
+		036E2BC5E7BD23973C3C4181 /* AgentMemory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 68DE1C2DEDCA28B710DD6C5D /* AgentMemory.swift */; };
+		0A4A1A84E6560C97F714C2C9 /* VoiceController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 82F71476C40CB1762E352DF5 /* VoiceController.swift */; };
+		161492948E0D59E41E6E7018 /* libc++.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = E2EABA31C1CFB803896807DD /* libc++.tbd */; };
+		1C8F8986E4465808FAB30AF7 /* LocalDeviceData.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6636026081D44F2E5870C485 /* LocalDeviceData.swift */; };
+		1DF0848C4A22AE54E2F6A90F /* SDKApplicationsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DF240043145CEC1114F5AAAC /* SDKApplicationsView.swift */; };
+		2DFBD8DBB45B3C239506B60A /* AutomationTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46AFA56819D7AFFDE7893BB0 /* AutomationTools.swift */; };
+		3498F2842AD2073C13C61F4C /* SecureStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD2222EAEE8931D5CFBC41BA /* SecureStore.swift */; };
+		3606B7EF64FF9A93199C7558 /* RemoteAutomationAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC85FE3EFC1C01C8EF3F7C30 /* RemoteAutomationAgent.swift */; };
+		43FB686D2DA826CF810CC5DA /* AutomationsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D630802B501EF5F12EE05015 /* AutomationsView.swift */; };
+		5BAE03F5B75D339A9AF58336 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = D7577716199F102273754156 /* PrivacyInfo.xcprivacy */; };
+		61EEC9C8DB8522810F721117 /* ChatAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EC3EFFD60CE2939BD5BCD88 /* ChatAPI.swift */; };
+		726A7A3E670153E53166E796 /* SSEParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 42EEE3F6ED3F93F3854EAC51 /* SSEParserTests.swift */; };
+		76D1281C135A63D3CFB0FBEA /* LocalModelLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84D36CAA606FDEACCA4F58AF /* LocalModelLibrary.swift */; };
+		77407A84E21962A60F63DC56 /* MultiVibeChatApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00217B9D7702B72A5569309F /* MultiVibeChatApp.swift */; };
+		77B928731CC37B951A8780FC /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C5173C6F10D1D8A8125C53A7 /* Accelerate.framework */; };
+		7A74361E398770E2EA5D9736 /* NativeIntentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E7A1B6F2486B8877A908300 /* NativeIntentTests.swift */; };
+		7B76CFC0D6BDEA312BCFA0E7 /* WebRTC in Frameworks */ = {isa = PBXBuildFile; productRef = DE00EB6D0A8D4203924A289E /* WebRTC */; };
+		7D68D3936B5105AC7AD322D6 /* RealtimeVoiceController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95A103874D7DD2121986E6B7 /* RealtimeVoiceController.swift */; };
+		7E9DADADAF1DFF748EDF171A /* VoiceTranscriptLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 57E9D6AD4061C1FC45E4695F /* VoiceTranscriptLedger.swift */; };
+		8144B301625507F33189954E /* LocalWeatherForecast.swift in Sources */ = {isa = PBXBuildFile; fileRef = 586626865BD3FD4B7CB6632A /* LocalWeatherForecast.swift */; };
+		8C1A0F4BD94755906DAE4B90 /* MemoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74D766009C5F24AF210383CA /* MemoryView.swift */; };
+		8C5D2ED524FCFB0349D7B83C /* DownloadedModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 305C09A77B9927C7474D6147 /* DownloadedModelTests.swift */; };
+		8FD1D22653DBCCB2B45A4CEA /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B36277A8CFF4EC17A06D2FC /* Models.swift */; };
+		915752F0CA99F9CFC83278C1 /* LocalAgentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3319D8F58B7782A53C37AF9B /* LocalAgentTests.swift */; };
+		91ABE914998A0252BC864813 /* AuthenticationUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73484D90F6B8C690FC806EBB /* AuthenticationUITests.swift */; };
+		92079D5C291F20B604251334 /* ConversationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED63046FBAF333333E159086 /* ConversationManager.swift */; };
+		94044294E174A79BF89B09B3 /* PiAgentHarness.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25782B401A99BA1E09850757 /* PiAgentHarness.swift */; };
+		9D053541A18A2D53C94E927F /* PiAgentCore-LICENSES.txt in Resources */ = {isa = PBXBuildFile; fileRef = 8E3FEAC535D29FB28363C8A5 /* PiAgentCore-LICENSES.txt */; };
+		A121AF7435396F761EF406ED /* PiAgentCore.js in Resources */ = {isa = PBXBuildFile; fileRef = D6D203722FEE3A237B2FBA13 /* PiAgentCore.js */; };
+		AB19983233E7FE9F37CFDDDC /* LocalAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10A5C9556D7CAFE2EE22707 /* LocalAgent.swift */; };
+		B242BA0DFE43365D51F44CF8 /* LocalModelsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 922D779C752D39F8E3F7F0EA /* LocalModelsView.swift */; };
+		B5F3F31445565B7A4FC8EB04 /* VoiceWebRTCTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19FF539BBD48306A3977C171 /* VoiceWebRTCTransport.swift */; };
+		B85D75D9CEF4051E7820B844 /* DownloadedModelRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8DBDCECFA9845CE5F3C6A960 /* DownloadedModelRuntime.swift */; };
+		BE6766D49B5A31ADDF3502EB /* llama-LICENSE.txt in Resources */ = {isa = PBXBuildFile; fileRef = EF18EF613BF5858C8BAB2F5F /* llama-LICENSE.txt */; };
+		BFFED1E87FEC0124E73AD138 /* AutomationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8B7BDC40696F8598713904B /* AutomationTests.swift */; };
+		C1B15569E65D46A8593B090F /* MultiVibeSDK in Frameworks */ = {isa = PBXBuildFile; productRef = 609BC433EA9477C7C93608F5 /* MultiVibeSDK */; };
+		C5B0EF7566EBC95B7DDE1C55 /* AutomationCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 629415D327799BA41C85897A /* AutomationCoordinator.swift */; };
+		C74FEFADAC73275DB726E5A6 /* AuthenticationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA4393E98F397246F4A41196 /* AuthenticationView.swift */; };
+		C8B0A62B02F77441A8AFB13A /* LocalModelCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6180BCA2920EE4B41879C672 /* LocalModelCatalog.swift */; };
+		CFAB7A55714A5EFB15394DD9 /* AutomationStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B8204CBB43A4BF53FAEC6DB /* AutomationStore.swift */; };
+		D799973F6174A8B009400FB7 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = CCC5DC2C101699AB590EC553 /* Metal.framework */; };
+		D82AAFC3C8F507B521619C45 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B3F9F268516DD34F81AB7817 /* Assets.xcassets */; };
+		D93DCB45C9AFA5ED65425AE5 /* AgentMemoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B34FCAA84CB37FAFCB223316 /* AgentMemoryTests.swift */; };
+		E897D566713EF64EA43668E0 /* LocalModelManifest.json in Resources */ = {isa = PBXBuildFile; fileRef = 8713B44FBEA8912EB4C8334F /* LocalModelManifest.json */; };
+		E93F3E946B9434ED4C5BFD94 /* NativeIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC28D33BB97A4F1A6581EB4F /* NativeIntents.swift */; };
+		ECDEA29B56DDE2F17FA9DC61 /* MultiVibeChatUI in Frameworks */ = {isa = PBXBuildFile; productRef = 866486075F05053501529275 /* MultiVibeChatUI */; };
+		EDD89E16CC7EEE5F49D07739 /* ChatIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 626C77A820035BB712EF6520 /* ChatIntents.swift */; };
+		EFCAC148BE4F8564C164FEF7 /* RealtimeVoiceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9178B9C07BCDF95DFE9A7DA /* RealtimeVoiceView.swift */; };
+		F1D6D7802498EC8BC30B8023 /* AutomationUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 63B3E34A764DACD69B7AB0B0 /* AutomationUITests.swift */; };
+		FE355EA09A71428B7CF119AB /* MultiVibeLocalInference.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 16EA3BB8F0EBD6ADB21388D9 /* MultiVibeLocalInference.xcframework */; };
+		FE9F141E961C8316B702D426 /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D23AAC6A6C06292DD31EC37 /* ChatView.swift */; };
+		62492105ACF7C46D3D8B5DB4 /* NativeApplicationIdentityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A9764498BB340F8623FA6CA /* NativeApplicationIdentityTests.swift */; };
+		109A00000000000000000001 /* OpenUI.html in Resources */ = {isa = PBXBuildFile; fileRef = 109A00000000000000000002 /* OpenUI.html */; };
+		109A00000000000000000003 /* OpenUI-prompt.txt in Resources */ = {isa = PBXBuildFile; fileRef = 109A00000000000000000004 /* OpenUI-prompt.txt */; };
+		9603E8B8789A6DE4543FBADA /* RemoteInstances.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA6B89A03896D709E22D13C5 /* RemoteInstances.swift */; };
+		B28DAADAE29B17B03F7DF0FB /* RemoteInstancesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D499EB95F5048DD372591A0 /* RemoteInstancesView.swift */; };
+		DF18DD8A27AC6BAAD42D2194 /* RemoteInstanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 65C2FB5C1C8357ED347AEC8F /* RemoteInstanceTests.swift */; };
+		F23B2D1A98894DEFE2241C04 /* RelayUsage.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCE462929D0E3F1A4F619694 /* RelayUsage.swift */; };
+		22602C45A42FA0BC47D8EE51 /* RelayUsageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC6D28D4C268910BBDE0A191 /* RelayUsageView.swift */; };
+		C4A1999FC9655EF81EAB7942 /* RelayUsageTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A65934447F415B4FE7CED761 /* RelayUsageTests.swift */; };
+		207A00000000000000000002 /* CloudUsage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 207A00000000000000000001 /* CloudUsage.swift */; };
+		207B00000000000000000002 /* CloudUsageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 207B00000000000000000001 /* CloudUsageView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		1081D506940149DD59EEBD2F /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = E52D4EB5FB0629151209900A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = D823DF267AB00046A3ED4807;
+			remoteInfo = MultiVibeChat;
+		};
+		2C69B18F72E64D7E3F81C3D3 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = E52D4EB5FB0629151209900A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = D823DF267AB00046A3ED4807;
+			remoteInfo = MultiVibeChat;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		1FEFE1D18BE42970C813B47E /* CloudAgentStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudAgentStateTests.swift; sourceTree = "<group>"; };
+		91C0AA000000000000000004 /* CloudHermesContextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudHermesContextTests.swift; sourceTree = "<group>"; };
+		91C0BB000000000000000004 /* HermesSkillCatalogTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesSkillCatalogTests.swift; sourceTree = "<group>"; };
+		91C0BC000000000000000004 /* HermesSelectedMemoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesSelectedMemoryTests.swift; sourceTree = "<group>"; };
+		91C0BE000000000000000004 /* HermesLegacyLedgerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesLegacyLedgerTests.swift; sourceTree = "<group>"; };
+		91C0BF000000000000000004 /* HermesLegacyExtractorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesLegacyExtractorTests.swift; sourceTree = "<group>"; };
+		91C0C0000000000000000004 /* HermesLegacyEnvelopeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesLegacyEnvelopeTests.swift; sourceTree = "<group>"; };
+		91C1C0000000000000000004 /* HermesLegacyExportJournalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesLegacyExportJournalTests.swift; sourceTree = "<group>"; };
+		91C0BD000000000000000004 /* HermesMutationToolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesMutationToolTests.swift; sourceTree = "<group>"; };
+		BD80E887E35614D8AAC6E385 /* CloudAgentState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudAgentState.swift; sourceTree = "<group>"; };
+		50CFD8DB0AC7E749D88E0EA8 /* CloudWorkspaceArtifactStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudWorkspaceArtifactStore.swift; sourceTree = "<group>"; };
+		91C0AA000000000000000002 /* CloudHermesContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudHermesContext.swift; sourceTree = "<group>"; };
+		91C0BB000000000000000002 /* HermesSkillCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesSkillCatalog.swift; sourceTree = "<group>"; };
+		91C0BC000000000000000002 /* HermesSelectedMemory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesSelectedMemory.swift; sourceTree = "<group>"; };
+		91C0BE000000000000000002 /* HermesLegacyLedger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesLegacyLedger.swift; sourceTree = "<group>"; };
+		91C0BF000000000000000002 /* HermesLegacyExtractor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesLegacyExtractor.swift; sourceTree = "<group>"; };
+		91C0C0000000000000000002 /* HermesLegacyEnvelope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesLegacyEnvelope.swift; sourceTree = "<group>"; };
+		91C1C0000000000000000002 /* HermesLegacyExportJournal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesLegacyExportJournal.swift; sourceTree = "<group>"; };
+		C01910000000000000000004 /* HermesFoundationAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesFoundationAdapter.swift; sourceTree = "<group>"; };
+		C01920000000000000000002 /* CloudHermesTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudHermesTests.swift; sourceTree = "<group>"; };
+		09865E68F5B92BF9F6227862 /* CloudWorkspaceArtifactStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudWorkspaceArtifactStoreTests.swift; sourceTree = "<group>"; };
+		C01910000000000000000002 /* HermesCheckpointStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesCheckpointStore.swift; sourceTree = "<group>"; };
+		00217B9D7702B72A5569309F /* MultiVibeChatApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultiVibeChatApp.swift; sourceTree = "<group>"; };
+		16EA3BB8F0EBD6ADB21388D9 /* MultiVibeLocalInference.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = MultiVibeLocalInference.xcframework; path = .build/MultiVibeLocalInference.xcframework; sourceTree = "<group>"; };
+		19FF539BBD48306A3977C171 /* VoiceWebRTCTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceWebRTCTransport.swift; sourceTree = "<group>"; };
+		25782B401A99BA1E09850757 /* PiAgentHarness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PiAgentHarness.swift; sourceTree = "<group>"; };
+		26BC4D73E9F06A51A165F8E9 /* MultiVibeChat.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MultiVibeChat.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		305C09A77B9927C7474D6147 /* DownloadedModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadedModelTests.swift; sourceTree = "<group>"; };
+		3319D8F58B7782A53C37AF9B /* LocalAgentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalAgentTests.swift; sourceTree = "<group>"; };
+		3B8204CBB43A4BF53FAEC6DB /* AutomationStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutomationStore.swift; sourceTree = "<group>"; };
+		42EEE3F6ED3F93F3854EAC51 /* SSEParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSEParserTests.swift; sourceTree = "<group>"; };
+		46AFA56819D7AFFDE7893BB0 /* AutomationTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutomationTools.swift; sourceTree = "<group>"; };
+		4B001301568AC61EB8AE8F59 /* LocalWebFetch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalWebFetch.swift; sourceTree = "<group>"; };
+		4D23AAC6A6C06292DD31EC37 /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
+		4E7A1B6F2486B8877A908300 /* NativeIntentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeIntentTests.swift; sourceTree = "<group>"; };
+		4EC3EFFD60CE2939BD5BCD88 /* ChatAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatAPI.swift; sourceTree = "<group>"; };
+		57E9D6AD4061C1FC45E4695F /* VoiceTranscriptLedger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceTranscriptLedger.swift; sourceTree = "<group>"; };
+		586626865BD3FD4B7CB6632A /* LocalWeatherForecast.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalWeatherForecast.swift; sourceTree = "<group>"; };
+		6180BCA2920EE4B41879C672 /* LocalModelCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalModelCatalog.swift; sourceTree = "<group>"; };
+		626C77A820035BB712EF6520 /* ChatIntents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatIntents.swift; sourceTree = "<group>"; };
+		629415D327799BA41C85897A /* AutomationCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutomationCoordinator.swift; sourceTree = "<group>"; };
+		63B3E34A764DACD69B7AB0B0 /* AutomationUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutomationUITests.swift; sourceTree = "<group>"; };
+		6636026081D44F2E5870C485 /* LocalDeviceData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalDeviceData.swift; sourceTree = "<group>"; };
+		68DE1C2DEDCA28B710DD6C5D /* AgentMemory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentMemory.swift; sourceTree = "<group>"; };
+		73484D90F6B8C690FC806EBB /* AuthenticationUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthenticationUITests.swift; sourceTree = "<group>"; };
+		74D766009C5F24AF210383CA /* MemoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemoryView.swift; sourceTree = "<group>"; };
+		82F71476C40CB1762E352DF5 /* VoiceController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceController.swift; sourceTree = "<group>"; };
+		84D36CAA606FDEACCA4F58AF /* LocalModelLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalModelLibrary.swift; sourceTree = "<group>"; };
+		8713B44FBEA8912EB4C8334F /* LocalModelManifest.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = LocalModelManifest.json; sourceTree = "<group>"; };
+		8DBDCECFA9845CE5F3C6A960 /* DownloadedModelRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadedModelRuntime.swift; sourceTree = "<group>"; };
+		8E3FEAC535D29FB28363C8A5 /* PiAgentCore-LICENSES.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "PiAgentCore-LICENSES.txt"; sourceTree = "<group>"; };
+		922D779C752D39F8E3F7F0EA /* LocalModelsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalModelsView.swift; sourceTree = "<group>"; };
+		95A103874D7DD2121986E6B7 /* RealtimeVoiceController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeVoiceController.swift; sourceTree = "<group>"; };
+		9A8B15C5C36771B67C287720 /* MultiVibeChat.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = MultiVibeChat.entitlements; sourceTree = "<group>"; };
+		9B36277A8CFF4EC17A06D2FC /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		A10A5C9556D7CAFE2EE22707 /* LocalAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalAgent.swift; sourceTree = "<group>"; };
+		A69AFB0001BDEA3472C4FE21 /* MultiVibeChatTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = MultiVibeChatTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		B34FCAA84CB37FAFCB223316 /* AgentMemoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentMemoryTests.swift; sourceTree = "<group>"; };
+		B3F9F268516DD34F81AB7817 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		BC28D33BB97A4F1A6581EB4F /* NativeIntents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeIntents.swift; sourceTree = "<group>"; };
+		C40B5C17410BA2068BAC1E38 /* MultiVibeChatUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = MultiVibeChatUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		C5173C6F10D1D8A8125C53A7 /* Accelerate.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Accelerate.framework; path = System/Library/Frameworks/Accelerate.framework; sourceTree = SDKROOT; };
+		C8B7BDC40696F8598713904B /* AutomationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutomationTests.swift; sourceTree = "<group>"; };
+		CA4393E98F397246F4A41196 /* AuthenticationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthenticationView.swift; sourceTree = "<group>"; };
+		CC85FE3EFC1C01C8EF3F7C30 /* RemoteAutomationAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteAutomationAgent.swift; sourceTree = "<group>"; };
+		CCC5DC2C101699AB590EC553 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		D630802B501EF5F12EE05015 /* AutomationsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutomationsView.swift; sourceTree = "<group>"; };
+		D6D203722FEE3A237B2FBA13 /* PiAgentCore.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = PiAgentCore.js; sourceTree = "<group>"; };
+		D7577716199F102273754156 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		DD2222EAEE8931D5CFBC41BA /* SecureStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureStore.swift; sourceTree = "<group>"; };
+		DF240043145CEC1114F5AAAC /* SDKApplicationsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SDKApplicationsView.swift; sourceTree = "<group>"; };
+		E2EABA31C1CFB803896807DD /* libc++.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = "libc++.tbd"; path = "usr/lib/libc++.tbd"; sourceTree = SDKROOT; };
+		ED63046FBAF333333E159086 /* ConversationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationManager.swift; sourceTree = "<group>"; };
+		EE89CDEC6389DF7D57D2960C /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		EF18EF613BF5858C8BAB2F5F /* llama-LICENSE.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "llama-LICENSE.txt"; sourceTree = "<group>"; };
+		F821AA010F4443A441EF6DF0 /* MultiVibeSDK */ = {isa = PBXFileReference; lastKnownFileType = folder; name = MultiVibeSDK; path = ../sdk/MultiVibeSDK; sourceTree = SOURCE_ROOT; };
+		F9178B9C07BCDF95DFE9A7DA /* RealtimeVoiceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeVoiceView.swift; sourceTree = "<group>"; };
+		7A9764498BB340F8623FA6CA /* NativeApplicationIdentityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeApplicationIdentityTests.swift; sourceTree = "<group>"; };
+		109A00000000000000000002 /* OpenUI.html */ = {isa = PBXFileReference; lastKnownFileType = text.html; path = "OpenUI.html"; sourceTree = "<group>"; };
+		109A00000000000000000004 /* OpenUI-prompt.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "OpenUI-prompt.txt"; sourceTree = "<group>"; };
+		FA6B89A03896D709E22D13C5 /* RemoteInstances.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteInstances.swift; sourceTree = "<group>"; };
+		2D499EB95F5048DD372591A0 /* RemoteInstancesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteInstancesView.swift; sourceTree = "<group>"; };
+		65C2FB5C1C8357ED347AEC8F /* RemoteInstanceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteInstanceTests.swift; sourceTree = "<group>"; };
+		BCE462929D0E3F1A4F619694 /* RelayUsage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayUsage.swift; sourceTree = "<group>"; };
+		AC6D28D4C268910BBDE0A191 /* RelayUsageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayUsageView.swift; sourceTree = "<group>"; };
+		A65934447F415B4FE7CED761 /* RelayUsageTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayUsageTests.swift; sourceTree = "<group>"; };
+		207A00000000000000000001 /* CloudUsage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudUsage.swift; sourceTree = "<group>"; };
+		207B00000000000000000001 /* CloudUsageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudUsageView.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		6F9FE7DF70824C66A84CD1B2 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				FE355EA09A71428B7CF119AB /* MultiVibeLocalInference.xcframework in Frameworks */,
+				D799973F6174A8B009400FB7 /* Metal.framework in Frameworks */,
+				77B928731CC37B951A8780FC /* Accelerate.framework in Frameworks */,
+				161492948E0D59E41E6E7018 /* libc++.tbd in Frameworks */,
+				7B76CFC0D6BDEA312BCFA0E7 /* WebRTC in Frameworks */,
+				C1B15569E65D46A8593B090F /* MultiVibeSDK in Frameworks */,
+				ECDEA29B56DDE2F17FA9DC61 /* MultiVibeChatUI in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		0176F3E9DB381B1BC9F98FE9 /* Intents */ = {
+			isa = PBXGroup;
+			children = (
+				626C77A820035BB712EF6520 /* ChatIntents.swift */,
+				BC28D33BB97A4F1A6581EB4F /* NativeIntents.swift */,
+			);
+			path = Intents;
+			sourceTree = "<group>";
+		};
+		0DA66C4F0BF02D9969E0A4EA /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				109A00000000000000000004 /* OpenUI-prompt.txt */,
+				109A00000000000000000002 /* OpenUI.html */,
+				B3F9F268516DD34F81AB7817 /* Assets.xcassets */,
+				EE89CDEC6389DF7D57D2960C /* Info.plist */,
+				EF18EF613BF5858C8BAB2F5F /* llama-LICENSE.txt */,
+				8713B44FBEA8912EB4C8334F /* LocalModelManifest.json */,
+				9A8B15C5C36771B67C287720 /* MultiVibeChat.entitlements */,
+				8E3FEAC535D29FB28363C8A5 /* PiAgentCore-LICENSES.txt */,
+				D6D203722FEE3A237B2FBA13 /* PiAgentCore.js */,
+				D7577716199F102273754156 /* PrivacyInfo.xcprivacy */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+		2552CDE13CC1D7A4C5490D52 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				C5173C6F10D1D8A8125C53A7 /* Accelerate.framework */,
+				E2EABA31C1CFB803896807DD /* libc++.tbd */,
+				CCC5DC2C101699AB590EC553 /* Metal.framework */,
+				16EA3BB8F0EBD6ADB21388D9 /* MultiVibeLocalInference.xcframework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		4E2D41FACA6712F630B5551A /* Features */ = {
+			isa = PBXGroup;
+			children = (
+				AC6D28D4C268910BBDE0A191 /* RelayUsageView.swift */,
+				207B00000000000000000001 /* CloudUsageView.swift */,
+				2D499EB95F5048DD372591A0 /* RemoteInstancesView.swift */,
+				CA4393E98F397246F4A41196 /* AuthenticationView.swift */,
+				4D23AAC6A6C06292DD31EC37 /* ChatView.swift */,
+				74D766009C5F24AF210383CA /* MemoryView.swift */,
+				95A103874D7DD2121986E6B7 /* RealtimeVoiceController.swift */,
+				F9178B9C07BCDF95DFE9A7DA /* RealtimeVoiceView.swift */,
+				DF240043145CEC1114F5AAAC /* SDKApplicationsView.swift */,
+				82F71476C40CB1762E352DF5 /* VoiceController.swift */,
+				57E9D6AD4061C1FC45E4695F /* VoiceTranscriptLedger.swift */,
+				19FF539BBD48306A3977C171 /* VoiceWebRTCTransport.swift */,
+			);
+			path = Features;
+			sourceTree = "<group>";
+		};
+		5C147FEBCFDA6C8DE43FC6FE = {
+			isa = PBXGroup;
+			children = (
+				9F736F9E06A57D5336B5EF56 /* MultiVibeChat */,
+				EB53AE013465F9A3A0975BF0 /* MultiVibeChatTests */,
+				AEF795B841217F91E11BECAB /* MultiVibeChatUITests */,
+				C97E3DDB64FFADFA945BF602 /* Packages */,
+				2552CDE13CC1D7A4C5490D52 /* Frameworks */,
+				E74BA307CA304FB896B611C5 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		65B88871F8779C83D1773838 /* Automations */ = {
+			isa = PBXGroup;
+			children = (
+				629415D327799BA41C85897A /* AutomationCoordinator.swift */,
+				3B8204CBB43A4BF53FAEC6DB /* AutomationStore.swift */,
+				D630802B501EF5F12EE05015 /* AutomationsView.swift */,
+				46AFA56819D7AFFDE7893BB0 /* AutomationTools.swift */,
+				CC85FE3EFC1C01C8EF3F7C30 /* RemoteAutomationAgent.swift */,
+			);
+			path = Automations;
+			sourceTree = "<group>";
+		};
+		9CBCBF237FEDF9219CD07ED9 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				00217B9D7702B72A5569309F /* MultiVibeChatApp.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		9F736F9E06A57D5336B5EF56 /* MultiVibeChat */ = {
+			isa = PBXGroup;
+			children = (
+				9CBCBF237FEDF9219CD07ED9 /* App */,
+				65B88871F8779C83D1773838 /* Automations */,
+				A61722CD3AFEF006161E3043 /* Core */,
+				4E2D41FACA6712F630B5551A /* Features */,
+				0176F3E9DB381B1BC9F98FE9 /* Intents */,
+				FE9C06615FE7F001D1A98668 /* LocalModels */,
+				0DA66C4F0BF02D9969E0A4EA /* Resources */,
+			);
+			path = MultiVibeChat;
+			sourceTree = "<group>";
+		};
+		A61722CD3AFEF006161E3043 /* Core */ = {
+			isa = PBXGroup;
+			children = (
+				BCE462929D0E3F1A4F619694 /* RelayUsage.swift */,
+				207A00000000000000000001 /* CloudUsage.swift */,
+				FA6B89A03896D709E22D13C5 /* RemoteInstances.swift */,
+				68DE1C2DEDCA28B710DD6C5D /* AgentMemory.swift */,
+				BD80E887E35614D8AAC6E385 /* CloudAgentState.swift */,
+				50CFD8DB0AC7E749D88E0EA8 /* CloudWorkspaceArtifactStore.swift */,
+				91C0AA000000000000000002 /* CloudHermesContext.swift */,
+				91C0BB000000000000000002 /* HermesSkillCatalog.swift */,
+				91C0BC000000000000000002 /* HermesSelectedMemory.swift */,
+				91C0BE000000000000000002 /* HermesLegacyLedger.swift */,
+				91C0BF000000000000000002 /* HermesLegacyExtractor.swift */,
+				91C0C0000000000000000002 /* HermesLegacyEnvelope.swift */,
+				91C1C0000000000000000002 /* HermesLegacyExportJournal.swift */,
+				4EC3EFFD60CE2939BD5BCD88 /* ChatAPI.swift */,
+				ED63046FBAF333333E159086 /* ConversationManager.swift */,
+				A10A5C9556D7CAFE2EE22707 /* LocalAgent.swift */,
+				6636026081D44F2E5870C485 /* LocalDeviceData.swift */,
+				586626865BD3FD4B7CB6632A /* LocalWeatherForecast.swift */,
+				4B001301568AC61EB8AE8F59 /* LocalWebFetch.swift */,
+				9B36277A8CFF4EC17A06D2FC /* Models.swift */,
+				25782B401A99BA1E09850757 /* PiAgentHarness.swift */,
+				C01910000000000000000004 /* HermesFoundationAdapter.swift */,
+				C01910000000000000000002 /* HermesCheckpointStore.swift */,
+				DD2222EAEE8931D5CFBC41BA /* SecureStore.swift */,
+			);
+			path = Core;
+			sourceTree = "<group>";
+		};
+		AEF795B841217F91E11BECAB /* MultiVibeChatUITests */ = {
+			isa = PBXGroup;
+			children = (
+				73484D90F6B8C690FC806EBB /* AuthenticationUITests.swift */,
+				63B3E34A764DACD69B7AB0B0 /* AutomationUITests.swift */,
+			);
+			path = MultiVibeChatUITests;
+			sourceTree = "<group>";
+		};
+		C97E3DDB64FFADFA945BF602 /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				F821AA010F4443A441EF6DF0 /* MultiVibeSDK */,
+			);
+			name = Packages;
+			sourceTree = "<group>";
+		};
+		E74BA307CA304FB896B611C5 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				26BC4D73E9F06A51A165F8E9 /* MultiVibeChat.app */,
+				A69AFB0001BDEA3472C4FE21 /* MultiVibeChatTests.xctest */,
+				C40B5C17410BA2068BAC1E38 /* MultiVibeChatUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		EB53AE013465F9A3A0975BF0 /* MultiVibeChatTests */ = {
+			isa = PBXGroup;
+			children = (
+				A65934447F415B4FE7CED761 /* RelayUsageTests.swift */,
+				65C2FB5C1C8357ED347AEC8F /* RemoteInstanceTests.swift */,
+				7A9764498BB340F8623FA6CA /* NativeApplicationIdentityTests.swift */,
+				B34FCAA84CB37FAFCB223316 /* AgentMemoryTests.swift */,
+				1FEFE1D18BE42970C813B47E /* CloudAgentStateTests.swift */,
+				91C0AA000000000000000004 /* CloudHermesContextTests.swift */,
+				91C0BB000000000000000004 /* HermesSkillCatalogTests.swift */,
+				91C0BC000000000000000004 /* HermesSelectedMemoryTests.swift */,
+				91C0BE000000000000000004 /* HermesLegacyLedgerTests.swift */,
+				91C0BF000000000000000004 /* HermesLegacyExtractorTests.swift */,
+				91C0C0000000000000000004 /* HermesLegacyEnvelopeTests.swift */,
+				91C1C0000000000000000004 /* HermesLegacyExportJournalTests.swift */,
+				91C0BD000000000000000004 /* HermesMutationToolTests.swift */,
+				C8B7BDC40696F8598713904B /* AutomationTests.swift */,
+				305C09A77B9927C7474D6147 /* DownloadedModelTests.swift */,
+				C01920000000000000000002 /* CloudHermesTests.swift */,
+				09865E68F5B92BF9F6227862 /* CloudWorkspaceArtifactStoreTests.swift */,
+				3319D8F58B7782A53C37AF9B /* LocalAgentTests.swift */,
+				4E7A1B6F2486B8877A908300 /* NativeIntentTests.swift */,
+				42EEE3F6ED3F93F3854EAC51 /* SSEParserTests.swift */,
+			);
+			path = MultiVibeChatTests;
+			sourceTree = "<group>";
+		};
+		FE9C06615FE7F001D1A98668 /* LocalModels */ = {
+			isa = PBXGroup;
+			children = (
+				8DBDCECFA9845CE5F3C6A960 /* DownloadedModelRuntime.swift */,
+				6180BCA2920EE4B41879C672 /* LocalModelCatalog.swift */,
+				84D36CAA606FDEACCA4F58AF /* LocalModelLibrary.swift */,
+				922D779C752D39F8E3F7F0EA /* LocalModelsView.swift */,
+			);
+			path = LocalModels;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		09219E21BBB094474B51D932 /* MultiVibeChatTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = E9C4C9FE82076FFEF3436F98 /* Build configuration list for PBXNativeTarget "MultiVibeChatTests" */;
+			buildPhases = (
+				785250CEB79AE07583077FC7 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				80C782AD02B95521AF692E35 /* PBXTargetDependency */,
+			);
+			name = MultiVibeChatTests;
+			packageProductDependencies = (
+			);
+			productName = MultiVibeChatTests;
+			productReference = A69AFB0001BDEA3472C4FE21 /* MultiVibeChatTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		166FBE78ECDABB967CC778B0 /* MultiVibeChatUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 88D95E16424675C4D296896F /* Build configuration list for PBXNativeTarget "MultiVibeChatUITests" */;
+			buildPhases = (
+				CB6562891200DB52479A4384 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				9BCD3C45974DDA73A850623F /* PBXTargetDependency */,
+			);
+			name = MultiVibeChatUITests;
+			packageProductDependencies = (
+			);
+			productName = MultiVibeChatUITests;
+			productReference = C40B5C17410BA2068BAC1E38 /* MultiVibeChatUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+		D823DF267AB00046A3ED4807 /* MultiVibeChat */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 7A8AE9A3B7EEA451E1849277 /* Build configuration list for PBXNativeTarget "MultiVibeChat" */;
+			buildPhases = (
+				8E9A59D4886F3741D42861B9 /* Sources */,
+				8E90FB10541779995B3439C0 /* Resources */,
+				6F9FE7DF70824C66A84CD1B2 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = MultiVibeChat;
+			packageProductDependencies = (
+				DE00EB6D0A8D4203924A289E /* WebRTC */,
+				609BC433EA9477C7C93608F5 /* MultiVibeSDK */,
+				866486075F05053501529275 /* MultiVibeChatUI */,
+			);
+			productName = MultiVibeChat;
+			productReference = 26BC4D73E9F06A51A165F8E9 /* MultiVibeChat.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		E52D4EB5FB0629151209900A /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					09219E21BBB094474B51D932 = {
+						DevelopmentTeam = "";
+					};
+					166FBE78ECDABB967CC778B0 = {
+						DevelopmentTeam = "";
+						TestTargetID = D823DF267AB00046A3ED4807;
+					};
+				};
+			};
+			buildConfigurationList = 9B4F3B7FF37AACF77048EF2B /* Build configuration list for PBXProject "MultiVibeChat" */;
+			developmentRegion = fr;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				fr,
+			);
+			mainGroup = 5C147FEBCFDA6C8DE43FC6FE;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				BC20CCA88EA0B22EF3ABC765 /* XCRemoteSwiftPackageReference "WebRTC" */,
+				8A03A575490DF8296F8BB694 /* XCLocalSwiftPackageReference "../sdk/MultiVibeSDK" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = E74BA307CA304FB896B611C5 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				D823DF267AB00046A3ED4807 /* MultiVibeChat */,
+				09219E21BBB094474B51D932 /* MultiVibeChatTests */,
+				166FBE78ECDABB967CC778B0 /* MultiVibeChatUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		8E90FB10541779995B3439C0 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				109A00000000000000000003 /* OpenUI-prompt.txt in Resources */,
+				109A00000000000000000001 /* OpenUI.html in Resources */,
+				D82AAFC3C8F507B521619C45 /* Assets.xcassets in Resources */,
+				E897D566713EF64EA43668E0 /* LocalModelManifest.json in Resources */,
+				9D053541A18A2D53C94E927F /* PiAgentCore-LICENSES.txt in Resources */,
+				A121AF7435396F761EF406ED /* PiAgentCore.js in Resources */,
+				5BAE03F5B75D339A9AF58336 /* PrivacyInfo.xcprivacy in Resources */,
+				BE6766D49B5A31ADDF3502EB /* llama-LICENSE.txt in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		785250CEB79AE07583077FC7 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C4A1999FC9655EF81EAB7942 /* RelayUsageTests.swift in Sources */,
+				DF18DD8A27AC6BAAD42D2194 /* RemoteInstanceTests.swift in Sources */,
+				62492105ACF7C46D3D8B5DB4 /* NativeApplicationIdentityTests.swift in Sources */,
+				D93DCB45C9AFA5ED65425AE5 /* AgentMemoryTests.swift in Sources */,
+				4CD806D764BD691CA0CF711A /* CloudAgentStateTests.swift in Sources */,
+				91C0AA000000000000000003 /* CloudHermesContextTests.swift in Sources */,
+				91C0BB000000000000000003 /* HermesSkillCatalogTests.swift in Sources */,
+				91C0BC000000000000000003 /* HermesSelectedMemoryTests.swift in Sources */,
+				91C0BE000000000000000003 /* HermesLegacyLedgerTests.swift in Sources */,
+				91C0BF000000000000000003 /* HermesLegacyExtractorTests.swift in Sources */,
+				91C0C0000000000000000003 /* HermesLegacyEnvelopeTests.swift in Sources */,
+				91C1C0000000000000000003 /* HermesLegacyExportJournalTests.swift in Sources */,
+				91C0BD000000000000000003 /* HermesMutationToolTests.swift in Sources */,
+				BFFED1E87FEC0124E73AD138 /* AutomationTests.swift in Sources */,
+				8C5D2ED524FCFB0349D7B83C /* DownloadedModelTests.swift in Sources */,
+				C01920000000000000000001 /* CloudHermesTests.swift in Sources */,
+				3491652F996C3B28A19A7889 /* CloudWorkspaceArtifactStoreTests.swift in Sources */,
+				915752F0CA99F9CFC83278C1 /* LocalAgentTests.swift in Sources */,
+				7A74361E398770E2EA5D9736 /* NativeIntentTests.swift in Sources */,
+				726A7A3E670153E53166E796 /* SSEParserTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		8E9A59D4886F3741D42861B9 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				22602C45A42FA0BC47D8EE51 /* RelayUsageView.swift in Sources */,
+				B28DAADAE29B17B03F7DF0FB /* RemoteInstancesView.swift in Sources */,
+				F23B2D1A98894DEFE2241C04 /* RelayUsage.swift in Sources */,
+				9603E8B8789A6DE4543FBADA /* RemoteInstances.swift in Sources */,
+				036E2BC5E7BD23973C3C4181 /* AgentMemory.swift in Sources */,
+				C7FF1FE7C944FBE343910524 /* CloudAgentState.swift in Sources */,
+				4EED5163512B1AEF02BEE848 /* CloudWorkspaceArtifactStore.swift in Sources */,
+				91C0AA000000000000000001 /* CloudHermesContext.swift in Sources */,
+				91C0BB000000000000000001 /* HermesSkillCatalog.swift in Sources */,
+				91C0BC000000000000000001 /* HermesSelectedMemory.swift in Sources */,
+				91C0BE000000000000000001 /* HermesLegacyLedger.swift in Sources */,
+				91C0BF000000000000000001 /* HermesLegacyExtractor.swift in Sources */,
+				91C0C0000000000000000001 /* HermesLegacyEnvelope.swift in Sources */,
+				91C1C0000000000000000001 /* HermesLegacyExportJournal.swift in Sources */,
+				C74FEFADAC73275DB726E5A6 /* AuthenticationView.swift in Sources */,
+				C5B0EF7566EBC95B7DDE1C55 /* AutomationCoordinator.swift in Sources */,
+				CFAB7A55714A5EFB15394DD9 /* AutomationStore.swift in Sources */,
+				2DFBD8DBB45B3C239506B60A /* AutomationTools.swift in Sources */,
+				43FB686D2DA826CF810CC5DA /* AutomationsView.swift in Sources */,
+				61EEC9C8DB8522810F721117 /* ChatAPI.swift in Sources */,
+				EDD89E16CC7EEE5F49D07739 /* ChatIntents.swift in Sources */,
+				FE9F141E961C8316B702D426 /* ChatView.swift in Sources */,
+				207B00000000000000000002 /* CloudUsageView.swift in Sources */,
+				207A00000000000000000002 /* CloudUsage.swift in Sources */,
+				92079D5C291F20B604251334 /* ConversationManager.swift in Sources */,
+				B85D75D9CEF4051E7820B844 /* DownloadedModelRuntime.swift in Sources */,
+				AB19983233E7FE9F37CFDDDC /* LocalAgent.swift in Sources */,
+				1C8F8986E4465808FAB30AF7 /* LocalDeviceData.swift in Sources */,
+				C8B0A62B02F77441A8AFB13A /* LocalModelCatalog.swift in Sources */,
+				76D1281C135A63D3CFB0FBEA /* LocalModelLibrary.swift in Sources */,
+				B242BA0DFE43365D51F44CF8 /* LocalModelsView.swift in Sources */,
+				8144B301625507F33189954E /* LocalWeatherForecast.swift in Sources */,
+				003956616649C28F8B135B88 /* LocalWebFetch.swift in Sources */,
+				8C1A0F4BD94755906DAE4B90 /* MemoryView.swift in Sources */,
+				8FD1D22653DBCCB2B45A4CEA /* Models.swift in Sources */,
+				77407A84E21962A60F63DC56 /* MultiVibeChatApp.swift in Sources */,
+				E93F3E946B9434ED4C5BFD94 /* NativeIntents.swift in Sources */,
+				94044294E174A79BF89B09B3 /* PiAgentHarness.swift in Sources */,
+				C01910000000000000000003 /* HermesFoundationAdapter.swift in Sources */,
+				C01910000000000000000001 /* HermesCheckpointStore.swift in Sources */,
+				7D68D3936B5105AC7AD322D6 /* RealtimeVoiceController.swift in Sources */,
+				EFCAC148BE4F8564C164FEF7 /* RealtimeVoiceView.swift in Sources */,
+				3606B7EF64FF9A93199C7558 /* RemoteAutomationAgent.swift in Sources */,
+				1DF0848C4A22AE54E2F6A90F /* SDKApplicationsView.swift in Sources */,
+				3498F2842AD2073C13C61F4C /* SecureStore.swift in Sources */,
+				0A4A1A84E6560C97F714C2C9 /* VoiceController.swift in Sources */,
+				7E9DADADAF1DFF748EDF171A /* VoiceTranscriptLedger.swift in Sources */,
+				B5F3F31445565B7A4FC8EB04 /* VoiceWebRTCTransport.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		CB6562891200DB52479A4384 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				91ABE914998A0252BC864813 /* AuthenticationUITests.swift in Sources */,
+				F1D6D7802498EC8BC30B8023 /* AutomationUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		80C782AD02B95521AF692E35 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = D823DF267AB00046A3ED4807 /* MultiVibeChat */;
+			targetProxy = 2C69B18F72E64D7E3F81C3D3 /* PBXContainerItemProxy */;
+		};
+		9BCD3C45974DDA73A850623F /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = D823DF267AB00046A3ED4807 /* MultiVibeChat */;
+			targetProxy = 1081D506940149DD59EEBD2F /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		1AEEA522BA640FE5C007E2B3 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = cloud.multivibe.MultiVibeChatUITests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = MultiVibeChat;
+			};
+			name = Debug;
+		};
+		625D874EDD03458AA4AFD6B4 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = cloud.multivibe.MultiVibeChatTests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/MultiVibeChat.app/MultiVibeChat";
+			};
+			name = Release;
+		};
+		63E01F36306CADC2E3A3088A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = cloud.multivibe.MultiVibeChatTests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/MultiVibeChat.app/MultiVibeChat";
+			};
+			name = Debug;
+		};
+		6CF1F678CC137B084FEB8E00 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = "";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MARKETING_VERSION = 1.0.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		87755962CEABABB5573C2744 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = cloud.multivibe.MultiVibeChatUITests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = MultiVibeChat;
+			};
+			name = Release;
+		};
+		B778F51862E9747047829ECD /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = MultiVibeChat/Resources/MultiVibeChat.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = 5E2CNR9H47;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".build\"",
+				);
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = MultiVibeChat/Resources/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MULTIVIBE_DISPLAY_NAME = MultiVibe;
+				MULTIVIBE_URL_SCHEME = "multivibe-chat";
+				PRODUCT_BUNDLE_IDENTIFIER = cloud.multivibe.chat;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		C9669EC1E0F06EFF39552B7E /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = MultiVibeChat/Resources/MultiVibeChat.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = 5E2CNR9H47;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".build\"",
+				);
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = MultiVibeChat/Resources/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MULTIVIBE_DISPLAY_NAME = MultiVibe;
+				MULTIVIBE_URL_SCHEME = "multivibe-chat";
+				PRODUCT_BUNDLE_IDENTIFIER = cloud.multivibe.chat;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		D786A16DEAA5752F783C6D57 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MARKETING_VERSION = 1.0.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		5AE7F64017A678B1125B99AB /* QA */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = cloud.multivibe.chat.qa.uitests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = MultiVibeChat;
+			};
+			name = QA;
+		};
+		7B90911403FAC2D28B7F4523 /* QA */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MARKETING_VERSION = 1.0.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = QA;
+		};
+		8E6E81358ECEAB384182D74A /* QA */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = MultiVibeChat/Resources/MultiVibeChatQA.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = 5E2CNR9H47;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".build\"",
+				);
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = MultiVibeChat/Resources/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MULTIVIBE_DISPLAY_NAME = "MultiVibe QA";
+				MULTIVIBE_URL_SCHEME = "multivibe-chat-qa";
+				PRODUCT_BUNDLE_IDENTIFIER = cloud.multivibe.chat.qa;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = QA;
+		};
+		D256228DD8B2F21F31F9C72F /* QA */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = cloud.multivibe.chat.qa.tests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/MultiVibeChat.app/MultiVibeChat";
+			};
+			name = QA;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		7A8AE9A3B7EEA451E1849277 /* Build configuration list for PBXNativeTarget "MultiVibeChat" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C9669EC1E0F06EFF39552B7E /* Debug */,
+				B778F51862E9747047829ECD /* Release */,
+				8E6E81358ECEAB384182D74A /* QA */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		88D95E16424675C4D296896F /* Build configuration list for PBXNativeTarget "MultiVibeChatUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1AEEA522BA640FE5C007E2B3 /* Debug */,
+				87755962CEABABB5573C2744 /* Release */,
+				5AE7F64017A678B1125B99AB /* QA */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		9B4F3B7FF37AACF77048EF2B /* Build configuration list for PBXProject "MultiVibeChat" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D786A16DEAA5752F783C6D57 /* Debug */,
+				6CF1F678CC137B084FEB8E00 /* Release */,
+				7B90911403FAC2D28B7F4523 /* QA */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		E9C4C9FE82076FFEF3436F98 /* Build configuration list for PBXNativeTarget "MultiVibeChatTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				63E01F36306CADC2E3A3088A /* Debug */,
+				625D874EDD03458AA4AFD6B4 /* Release */,
+				D256228DD8B2F21F31F9C72F /* QA */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		8A03A575490DF8296F8BB694 /* XCLocalSwiftPackageReference "../sdk/MultiVibeSDK" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../sdk/MultiVibeSDK;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		BC20CCA88EA0B22EF3ABC765 /* XCRemoteSwiftPackageReference "WebRTC" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/stasel/WebRTC.git";
+			requirement = {
+				kind = exactVersion;
+				version = 153.0.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		609BC433EA9477C7C93608F5 /* MultiVibeSDK */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = MultiVibeSDK;
+		};
+		866486075F05053501529275 /* MultiVibeChatUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = MultiVibeChatUI;
+		};
+		DE00EB6D0A8D4203924A289E /* WebRTC */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = BC20CCA88EA0B22EF3ABC765 /* XCRemoteSwiftPackageReference "WebRTC" */;
+			productName = WebRTC;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = E52D4EB5FB0629151209900A /* Project object */;
+}

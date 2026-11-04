@@ -1,0 +1,1234 @@
+use serde_json::{Map, Value, json};
+
+use napi::{
+    Env, Error, Status,
+    bindgen_prelude::{Buffer, BufferSlice},
+};
+use napi_derive::napi;
+
+const FAST_SSE_EVENT_PREFIXES: &[&str] = &["response.reasoning", "response.refusal"];
+const EMPTY_ASSISTANT_FALLBACK_TEXT: &str = "[upstream returned no assistant output; please retry]";
+
+fn is_fast_sse_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "response.output_text.delta" | "response.output_text.done"
+    ) || FAST_SSE_EVENT_PREFIXES
+        .iter()
+        .any(|prefix| event_type.starts_with(prefix))
+}
+
+/// Extract the first JSON `type`-like property using the same deliberately
+/// conservative syntax accepted by the TypeScript fast path. This is not a
+/// JSON parser: frames that do not match the exact SSE shape return `None` and
+/// remain on the reference parser.
+fn json_type_property(payload: &str) -> Option<&str> {
+    let marker = "\"type\"";
+    let mut search_from = 0;
+
+    while search_from < payload.len() {
+        let relative = payload[search_from..].find(marker)?;
+        let marker_start = search_from + relative;
+        let mut remainder = &payload[marker_start + marker.len()..];
+        remainder = remainder.trim_start();
+        if let Some(after_colon) = remainder.strip_prefix(':') {
+            let after_colon = after_colon.trim_start();
+            if let Some(after_quote) = after_colon.strip_prefix('"') {
+                let end = after_quote.find('"')?;
+                if end > 0 {
+                    return Some(&after_quote[..end]);
+                }
+            }
+        }
+        search_from = marker_start + marker.len();
+    }
+
+    None
+}
+
+/// Classify only the high-frequency SSE frames whose event type can be used
+/// without materializing the JSON event. The return value is empty when the
+/// caller must use the full parser.
+pub fn classify_sse_frame_type(frame: &str) -> Option<&str> {
+    let mut event_type: Option<&str> = None;
+    let mut data_payload: Option<&str> = None;
+
+    for raw_line in frame.split('\n') {
+        let line = raw_line.trim();
+        if let Some(value) = line.strip_prefix("event:") {
+            event_type = Some(value.trim());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            if data_payload.is_some() {
+                return None;
+            }
+            data_payload = Some(value.trim());
+        }
+    }
+
+    let event_type = event_type?;
+    let data_payload = data_payload?;
+    if !data_payload.starts_with('{') || !data_payload.ends_with('}') {
+        return None;
+    }
+
+    let payload_type = json_type_property(data_payload)?;
+    if payload_type != event_type || !is_fast_sse_event_type(event_type) {
+        return None;
+    }
+
+    Some(event_type)
+}
+
+/// Stable, serialization-friendly result of the request inspection phase.
+///
+/// The fields intentionally mirror the existing TypeScript contract. Routing
+/// and provider code should depend on this small result rather than on the
+/// request representation itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadContextInspection {
+    pub has_image: bool,
+    pub compaction_item_count: usize,
+    pub latest_compaction_index: i64,
+}
+
+/// JavaScript-facing representation of [`PayloadContextInspection`].
+///
+/// The N-API object deliberately contains only the three scalar values needed
+/// by the router. It does not expose the parsed request or retain any payload
+/// bytes after the synchronous call returns.
+#[napi(object)]
+pub struct NativePayloadContextInspection {
+    pub has_image: bool,
+    pub compaction_item_count: i64,
+    pub latest_compaction_index: i64,
+}
+
+/// Small metadata returned alongside a native response body. The complete
+/// response stays in the Buffer so JavaScript does not have to materialize it
+/// just to update traces and usage counters.
+#[napi(object)]
+pub struct NativeResponseUsage {
+    pub input_tokens: f64,
+    pub output_tokens: f64,
+    pub total_tokens: f64,
+}
+
+/// Result of the raw-byte Chat Completions projection.
+///
+/// `body` is the final HTTP representation: JSON for a buffered response or
+/// one `response.completed` SSE frame when `stream` was requested. An
+/// unsupported shape returns `supported: false` and an empty body so the
+/// TypeScript reference path can take over without parsing twice.
+#[napi(object)]
+pub struct NativeRawProtocolConversion {
+    pub supported: bool,
+    pub body: Buffer,
+    pub has_assistant_output: bool,
+    pub usage: Option<NativeResponseUsage>,
+}
+
+impl NativeRawProtocolConversion {
+    fn unsupported() -> Self {
+        Self {
+            supported: false,
+            body: Buffer::default(),
+            has_assistant_output: false,
+            usage: None,
+        }
+    }
+}
+
+impl Default for PayloadContextInspection {
+    fn default() -> Self {
+        Self {
+            has_image: false,
+            compaction_item_count: 0,
+            latest_compaction_index: -1,
+        }
+    }
+}
+
+fn type_contains_image(value: &Value) -> bool {
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.contains("image"))
+}
+
+/// Inspects the JSON request shape used by Responses and Chat Completions.
+///
+/// This is deliberately limited to the current router's observable contract:
+/// it does not normalize, mutate, or retain request content.
+pub fn inspect_payload_context(payload: &Value) -> PayloadContextInspection {
+    let mut inspection = PayloadContextInspection::default();
+
+    if let Some(messages) = payload.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            if let Some(content) = message.get("content").and_then(Value::as_array) {
+                for part in content {
+                    inspection.has_image |= type_contains_image(part);
+                }
+            }
+        }
+    }
+
+    if let Some(input) = payload.get("input").and_then(Value::as_array) {
+        for (index, item) in input.iter().enumerate() {
+            inspection.has_image |= type_contains_image(item);
+
+            if item.get("type").and_then(Value::as_str) == Some("compaction") {
+                inspection.compaction_item_count += 1;
+                inspection.latest_compaction_index = index as i64;
+            }
+
+            if let Some(content) = item.get("content").and_then(Value::as_array) {
+                for part in content {
+                    inspection.has_image |= type_contains_image(part);
+                }
+            }
+        }
+    }
+
+    inspection
+}
+
+fn as_non_empty_string(value: Option<&Value>) -> Option<&str> {
+    let value = value?.as_str()?;
+    (!value.trim().is_empty()).then_some(value.trim())
+}
+
+fn should_expose_function_call_name(value: Option<&Value>) -> bool {
+    let Some(name) = value.and_then(Value::as_str) else {
+        return true;
+    };
+    !name.trim().to_ascii_lowercase().starts_with("functions.")
+}
+
+fn normalized_tool_arguments(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if value.is_null() {
+        return None;
+    }
+    if let Some(text) = value.as_str() {
+        return (!text.trim().is_empty()).then(|| text.to_owned());
+    }
+
+    let serialized = serde_json::to_string(value).ok()?;
+    (!serialized.trim().is_empty()).then_some(serialized)
+}
+
+fn is_valid_chat_tool_call(value: &Value) -> bool {
+    let Some(tool_call) = value.as_object() else {
+        return false;
+    };
+    let Some(function) = tool_call
+        .get("function")
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+
+    as_non_empty_string(function.get("name")).is_some()
+        && should_expose_function_call_name(function.get("name"))
+        && normalized_tool_arguments(function.get("arguments")).is_some()
+}
+
+fn content_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| match part {
+                Value::String(text) => Some(text.as_str()),
+                Value::Object(object) => object.get("text").and_then(Value::as_str),
+                _ => None,
+            })
+            .collect(),
+        _ => String::new(),
+    }
+}
+
+fn is_ascii_word(value: u8) -> bool {
+    value.is_ascii_alphanumeric() || value == b'_'
+}
+
+fn has_word_boundary_before(value: &[u8], index: usize) -> bool {
+    index == 0 || !is_ascii_word(value[index - 1])
+}
+
+fn has_word_boundary_after(value: &[u8], index: usize) -> bool {
+    index >= value.len() || !is_ascii_word(value[index])
+}
+
+fn contains_word_phrase(text: &str, phrase: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let phrase = phrase.to_ascii_lowercase();
+    let mut search_from = 0;
+
+    while let Some(relative) = lower[search_from..].find(&phrase) {
+        let start = search_from + relative;
+        let end = start + phrase.len();
+        if has_word_boundary_before(lower.as_bytes(), start)
+            && has_word_boundary_after(lower.as_bytes(), end)
+        {
+            return true;
+        }
+        search_from = start + 1;
+    }
+
+    false
+}
+
+fn starts_with_word_prefix(text: &str, prefix: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let prefix = prefix.to_ascii_lowercase();
+    lower.starts_with(&prefix) && has_word_boundary_after(lower.as_bytes(), prefix.len())
+}
+
+fn contains_assistant_to_functions(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let marker = "assistant";
+    let target = "to=functions.";
+    let mut search_from = 0;
+
+    while let Some(relative) = lower[search_from..].find(marker) {
+        let start = search_from + relative;
+        let after_assistant = start + marker.len();
+        if has_word_boundary_before(bytes, start) {
+            let whitespace_start = after_assistant;
+            let mut target_start = whitespace_start;
+            while target_start < bytes.len() && bytes[target_start].is_ascii_whitespace() {
+                target_start += 1;
+            }
+            if target_start > whitespace_start && lower[target_start..].starts_with(target) {
+                return true;
+            }
+        }
+        search_from = start + 1;
+    }
+
+    false
+}
+
+fn contains_named_protocol_tool(text: &str, prefix: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut search_from = 0;
+
+    while let Some(relative) = lower[search_from..].find(prefix) {
+        let start = search_from + relative;
+        if has_word_boundary_before(bytes, start) {
+            let name_start = start + prefix.len();
+            let mut name_end = name_start;
+            while name_end < bytes.len()
+                && (bytes[name_end].is_ascii_lowercase()
+                    || bytes[name_end].is_ascii_digit()
+                    || bytes[name_end] == b'_')
+            {
+                name_end += 1;
+            }
+            if name_end > name_start && has_word_boundary_after(bytes, name_end) {
+                return true;
+            }
+        }
+        search_from = start + 1;
+    }
+
+    false
+}
+
+fn looks_like_internal_tool_protocol_text(text: &str) -> bool {
+    contains_assistant_to_functions(text)
+        || contains_named_protocol_tool(text, "to=functions.")
+        || contains_named_protocol_tool(text, "functions.")
+}
+
+fn looks_like_internal_planner_text(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+
+    let trimmed = text.trim_start();
+    let lower = text.to_ascii_lowercase();
+    let trimmed_lower = trimmed.to_ascii_lowercase();
+
+    if contains_word_phrase(text, "the user earlier asked:")
+        || trimmed_lower.starts_with("now we need to reply final message")
+        || [
+            "need to",
+            "now run",
+            "let's run",
+            "use tool",
+            "use functions",
+            "input to tool",
+            "command:",
+            "we'll run",
+        ]
+        .iter()
+        .any(|prefix| starts_with_word_prefix(trimmed, prefix))
+        || trimmed_lower.starts_with("[use functions tool")
+    {
+        return true;
+    }
+
+    [
+        "need to",
+        "now run command",
+        "let's run",
+        "use functions",
+        "use tool",
+        "input to tool",
+        "use functions.",
+        "command:",
+    ]
+    .iter()
+    .filter(|marker| {
+        if **marker == "use functions." {
+            contains_named_protocol_tool(&lower, "functions.")
+                && contains_word_phrase(text, "use functions")
+        } else {
+            contains_word_phrase(text, marker)
+        }
+    })
+    .take(2)
+    .count()
+        >= 2
+}
+
+fn sanitize_output_text(text: &str) -> String {
+    if looks_like_internal_tool_protocol_text(text) || looks_like_internal_planner_text(text) {
+        String::new()
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Keep the raw-byte rollout conservative around content whose exact
+/// sanitization or nested JSON-string ordering is observable by callers. The
+/// reference JavaScript path remains responsible for those less common
+/// shapes; ordinary text and string-valued tool arguments stay on the native
+/// candidate path.
+fn raw_projection_is_safe(value: &Value) -> bool {
+    let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+        return true;
+    };
+
+    for choice in choices {
+        let Some(message) = choice.get("message").and_then(Value::as_object) else {
+            continue;
+        };
+
+        let content = message.get("content");
+        let mut text_values = Vec::new();
+        match content {
+            Some(Value::String(text)) => text_values.push(text.as_str()),
+            Some(Value::Array(parts)) => {
+                for part in parts {
+                    match part {
+                        Value::String(text) => text_values.push(text.as_str()),
+                        Value::Object(object) => {
+                            if let Some(text) = object.get("text").and_then(Value::as_str) {
+                                text_values.push(text);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        if text_values.iter().any(|text| {
+            let lower = text.to_ascii_lowercase();
+            [
+                "<think>",
+                "</think>",
+                "functions.",
+                "to=functions.",
+                "need to",
+                "now run",
+                "let's run",
+                "use tool",
+                "use functions",
+                "input to tool",
+                "command:",
+                "the user earlier asked:",
+                "now we need to reply final message",
+                "need summary:",
+                "list commands run:",
+                "need final instructions:",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker))
+        }) {
+            return false;
+        }
+
+        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for tool_call in tool_calls {
+                if !is_valid_chat_tool_call(tool_call) {
+                    continue;
+                }
+                // The JavaScript reference generates a random id when the
+                // upstream tool call omits one. Keep that case on the
+                // reference path because a raw native projection cannot
+                // reproduce the same id semantics without materializing the
+                // object in JavaScript.
+                if tool_call.get("id").is_none_or(Value::is_null) {
+                    return false;
+                }
+                let arguments = tool_call
+                    .get("function")
+                    .and_then(|function| function.get("arguments"));
+                if !arguments.is_some_and(Value::is_string) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
+fn chat_choice_has_assistant_output(choice: Option<&Value>) -> bool {
+    let Some(choice) = choice else {
+        return false;
+    };
+    let content = choice
+        .get("message")
+        .and_then(|message| message.get("content"));
+    let content_text = content_text(content);
+    let has_text = !content_text.trim().is_empty();
+    let has_tool_calls = choice
+        .get("message")
+        .and_then(|message| message.get("tool_calls"))
+        .and_then(Value::as_array)
+        .is_some_and(|tool_calls| tool_calls.iter().any(is_valid_chat_tool_call));
+    has_text || has_tool_calls
+}
+
+fn chat_completion_has_assistant_output(chat: &Value) -> bool {
+    if chat.get("object").and_then(Value::as_str) != Some("chat.completion") {
+        return false;
+    }
+    chat.get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .is_some_and(|choice| chat_choice_has_assistant_output(Some(choice)))
+}
+
+fn ensure_non_empty_chat_completion(chat: Value) -> Value {
+    let Some(object) = chat.as_object() else {
+        return chat;
+    };
+    if object.get("object").and_then(Value::as_str) != Some("chat.completion") {
+        return chat;
+    }
+    let Some(choices) = object.get("choices").and_then(Value::as_array) else {
+        return chat;
+    };
+    let Some(first) = choices.first() else {
+        return chat;
+    };
+    if chat_choice_has_assistant_output(Some(first)) {
+        return chat;
+    }
+
+    let mut next = object.clone();
+    let mut next_choices = choices.clone();
+    let mut next_choice = first.as_object().cloned().unwrap_or_default();
+    let mut message = first
+        .get("message")
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    message.insert(
+        "content".to_owned(),
+        Value::String(EMPTY_ASSISTANT_FALLBACK_TEXT.to_owned()),
+    );
+    if first.get("finish_reason").is_none_or(Value::is_null) {
+        next_choice.insert("finish_reason".to_owned(), json!("stop"));
+    }
+    next_choice.insert("message".to_owned(), Value::Object(message));
+    next_choices[0] = Value::Object(next_choice);
+    next.insert("choices".to_owned(), Value::Array(next_choices));
+    Value::Object(next)
+}
+
+/// Remove paired, case-insensitive `<think>...</think>` sections while
+/// preserving unmatched markers. This mirrors the stream bridge's existing
+/// JavaScript behavior without bringing a regex engine into the native core.
+fn strip_think_blocks(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut cursor = 0;
+    let mut output = String::new();
+
+    while let Some(relative_start) = lower[cursor..].find("<think>") {
+        let start = cursor + relative_start;
+        output.push_str(&text[cursor..start]);
+        let content_start = start + "<think>".len();
+        let Some(relative_end) = lower[content_start..].find("</think>") else {
+            output.push_str(&text[start..]);
+            return output;
+        };
+        cursor = content_start + relative_end + "</think>".len();
+    }
+
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn response_usage_from_chat_usage(value: Option<&Value>) -> Option<Value> {
+    let usage = value?;
+    // JavaScript's typeof [] is "object" as well. Arrays cannot expose the
+    // named fields below, so they naturally fall back to zeroes.
+    if !(usage.is_object() || usage.is_array()) {
+        return None;
+    }
+
+    let input = usage
+        .get("prompt_tokens")
+        .filter(|value| !value.is_null())
+        .or_else(|| usage.get("input_tokens").filter(|value| !value.is_null()))
+        .cloned()
+        .unwrap_or_else(|| json!(0));
+    let output = usage
+        .get("completion_tokens")
+        .filter(|value| !value.is_null())
+        .or_else(|| usage.get("output_tokens").filter(|value| !value.is_null()))
+        .cloned()
+        .unwrap_or_else(|| json!(0));
+    let total = usage
+        .get("total_tokens")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .unwrap_or_else(|| match (&input, &output) {
+            (Value::Number(input), Value::Number(output)) => {
+                if let (Some(input), Some(output)) = (input.as_u64(), output.as_u64()) {
+                    json!(input.saturating_add(output))
+                } else if let (Some(input), Some(output)) = (input.as_i64(), output.as_i64()) {
+                    json!(input.saturating_add(output))
+                } else {
+                    let total = input.as_f64().unwrap_or(0.0) + output.as_f64().unwrap_or(0.0);
+                    json!(total)
+                }
+            }
+            _ => json!(0),
+        });
+
+    let mut result = json!({ "input_tokens": input, "output_tokens": output, "total_tokens": total });
+    for (source, target) in [("prompt_tokens_details", "input_tokens_details"), ("completion_tokens_details", "output_tokens_details")] {
+        if let Some(details) = usage.get(source).or_else(|| usage.get(target)).filter(|value| !value.is_null()) {
+            result[target] = details.clone();
+        }
+    }
+    Some(result)
+}
+
+fn usage_number(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::Number(number) => number.as_f64(),
+        Value::String(value) => value.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn first_usage_number(usage: &Value, keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .find_map(|key| usage.get(*key).filter(|value| !value.is_null()))
+        .and_then(|value| usage_number(Some(value)))
+}
+
+fn response_usage_metadata(value: Option<&Value>) -> Option<NativeResponseUsage> {
+    let usage = value?;
+    if !(usage.is_object() || usage.is_array()) {
+        return None;
+    }
+
+    let input_tokens = first_usage_number(usage, &["prompt_tokens", "input_tokens"]).unwrap_or(0.0);
+    let output_tokens =
+        first_usage_number(usage, &["completion_tokens", "output_tokens"]).unwrap_or(0.0);
+    let total_tokens =
+        first_usage_number(usage, &["total_tokens"]).unwrap_or(input_tokens + output_tokens);
+
+    Some(NativeResponseUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+    })
+}
+
+fn response_output_from_chat_message(message: &Value) -> Vec<Value> {
+    let raw_content = message.get("content");
+    let stripped = strip_think_blocks(&content_text(raw_content));
+    let text = sanitize_output_text(&stripped).trim_start().to_owned();
+    let mut output = Vec::new();
+
+    if !text.is_empty() {
+        output.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        }));
+    }
+
+    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for tool_call in tool_calls {
+            if !is_valid_chat_tool_call(tool_call) {
+                continue;
+            }
+            let Some(tool_call_object) = tool_call.as_object() else {
+                continue;
+            };
+            let Some(function) = tool_call_object.get("function").and_then(Value::as_object) else {
+                continue;
+            };
+            let Some(name) = function.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(arguments) = normalized_tool_arguments(function.get("arguments")) else {
+                continue;
+            };
+
+            let mut function_call = Map::new();
+            if let Some(id) = tool_call_object.get("id").filter(|value| !value.is_null()) {
+                function_call.insert("id".to_owned(), id.clone());
+                function_call.insert("call_id".to_owned(), id.clone());
+            }
+            function_call.insert("type".to_owned(), json!("function_call"));
+            function_call.insert("name".to_owned(), json!(name));
+            function_call.insert("arguments".to_owned(), json!(arguments));
+            output.push(Value::Object(function_call));
+        }
+    }
+
+    if output.is_empty() {
+        output.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": ""}],
+        }));
+    }
+
+    output
+}
+
+/// Convert a normalized Chat Completions object to the Responses object used
+/// by the proxy's compatibility layer.
+///
+/// The JavaScript sanitizer and empty-output guard remain the authority for
+/// the full client-facing contract. This core owns only the deterministic
+/// protocol projection; response and missing tool-call identifiers are passed
+/// in by the caller so the native path cannot silently change identifier
+/// semantics.
+pub fn chat_completion_to_response(
+    chat: &Value,
+    fallback_model: &str,
+    response_id: &str,
+    created_at: i64,
+) -> Value {
+    let empty = Value::Null;
+    let choice = chat
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .unwrap_or(&empty);
+    let message = choice
+        .get("message")
+        .filter(|value| value.is_object())
+        .unwrap_or(&empty);
+
+    let model = chat
+        .get("model")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .unwrap_or_else(|| json!(fallback_model));
+    let created = chat
+        .get("created")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .unwrap_or_else(|| json!(created_at));
+    let usage = response_usage_from_chat_usage(chat.get("usage"));
+
+    let mut response = Map::new();
+    response.insert("id".to_owned(), json!(response_id));
+    response.insert("object".to_owned(), json!("response"));
+    response.insert("created_at".to_owned(), created);
+    response.insert("model".to_owned(), model);
+    response.insert("status".to_owned(), json!("completed"));
+    response.insert(
+        "output".to_owned(),
+        Value::Array(response_output_from_chat_message(message)),
+    );
+    if let Some(usage) = usage {
+        response.insert("usage".to_owned(), usage);
+    }
+
+    Value::Object(response)
+}
+
+impl From<PayloadContextInspection> for NativePayloadContextInspection {
+    fn from(value: PayloadContextInspection) -> Self {
+        Self {
+            has_image: value.has_image,
+            compaction_item_count: value.compaction_item_count as i64,
+            latest_compaction_index: value.latest_compaction_index,
+        }
+    }
+}
+
+/// Inspect UTF-8 JSON bytes received from Node without serializing the object
+/// across the language boundary.
+///
+/// The function is synchronous because the operation is CPU-bound and small;
+/// callers invoke it from the body-parser's existing synchronous verification
+/// hook. Invalid JSON is reported as an `InvalidArg` N-API exception so the
+/// TypeScript caller can keep its existing implementation as a safe fallback.
+#[napi(js_name = "inspectPayloadContextJson")]
+pub fn inspect_payload_context_json(
+    payload: Buffer,
+) -> napi::Result<NativePayloadContextInspection> {
+    let value: Value = serde_json::from_slice(payload.as_ref()).map_err(|error| {
+        Error::new(Status::InvalidArg, format!("Invalid JSON payload: {error}"))
+    })?;
+
+    Ok(inspect_payload_context(&value).into())
+}
+
+/// Convert normalized Chat Completions JSON without crossing the N-API
+/// boundary once per output item. Invalid JSON remains an argument error so
+/// the TypeScript caller can use its reference implementation.
+#[napi(js_name = "convertChatCompletionToResponseJson")]
+pub fn convert_chat_completion_to_response_json(
+    payload: Buffer,
+    fallback_model: String,
+    response_id: String,
+    created_at: i64,
+) -> napi::Result<String> {
+    let value: Value = serde_json::from_slice(payload.as_ref()).map_err(|error| {
+        Error::new(Status::InvalidArg, format!("Invalid JSON payload: {error}"))
+    })?;
+
+    serde_json::to_string(&chat_completion_to_response(
+        &value,
+        &fallback_model,
+        &response_id,
+        created_at,
+    ))
+    .map_err(|error| {
+        Error::new(
+            Status::GenericFailure,
+            format!("Serialization failed: {error}"),
+        )
+    })
+}
+
+/// Convert a raw upstream JSON body when it is a Chat Completions object.
+///
+/// An empty string means that the body is not a supported raw Chat Completions
+/// response shape. The envelope keeps the assistant-output decision next to
+/// the converted response so the TypeScript router can preserve its retry
+/// behavior without parsing the input a second time.
+fn try_chat_completion_response(
+    value: &Value,
+    fallback_model: &str,
+    response_id: &str,
+    created_at: i64,
+) -> Option<(bool, Value)> {
+    if value.get("object").and_then(Value::as_str) != Some("chat.completion") {
+        return None;
+    }
+    if !raw_projection_is_safe(value) {
+        return None;
+    }
+
+    let has_assistant_output = chat_completion_has_assistant_output(value);
+    let response = if has_assistant_output {
+        chat_completion_to_response(value, fallback_model, response_id, created_at)
+    } else {
+        let normalized = ensure_non_empty_chat_completion(value.clone());
+        chat_completion_to_response(&normalized, fallback_model, response_id, created_at)
+    };
+    Some((has_assistant_output, response))
+}
+
+fn try_chat_completion_to_response(
+    value: &Value,
+    fallback_model: &str,
+    response_id: &str,
+    created_at: i64,
+) -> Option<Value> {
+    let (has_assistant_output, response) =
+        try_chat_completion_response(value, fallback_model, response_id, created_at)?;
+    Some(json!({
+        "hasAssistantOutput": has_assistant_output,
+        "response": response,
+    }))
+}
+
+fn serialize_response_body(response: &Value, stream: bool) -> serde_json::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    if stream {
+        body.extend_from_slice(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":",
+        );
+        serde_json::to_writer(&mut body, response)?;
+        body.extend_from_slice(b"}\n\n");
+    } else {
+        serde_json::to_writer(&mut body, response)?;
+    }
+    Ok(body)
+}
+
+#[napi(js_name = "tryConvertChatCompletionToResponseJson")]
+pub fn try_convert_chat_completion_to_response_json(
+    payload: Buffer,
+    fallback_model: String,
+    response_id: String,
+    created_at: i64,
+) -> napi::Result<String> {
+    let value: Value = serde_json::from_slice(payload.as_ref()).map_err(|error| {
+        Error::new(Status::InvalidArg, format!("Invalid JSON payload: {error}"))
+    })?;
+
+    let Some(result) =
+        try_chat_completion_to_response(&value, &fallback_model, &response_id, created_at)
+    else {
+        return Ok(String::new());
+    };
+
+    serde_json::to_string(&result).map_err(|error| {
+        Error::new(
+            Status::GenericFailure,
+            format!("Serialization failed: {error}"),
+        )
+    })
+}
+
+/// Convert a raw upstream Chat Completions body into the final HTTP bytes.
+///
+/// Unlike the JSON-returning bridge above, this function never serializes a
+/// Rust response into a JavaScript string and never asks JavaScript to parse
+/// the converted response. N-API transfers ownership of the final Buffer to
+/// Node, while only small routing/trace metadata crosses as fields.
+#[napi(js_name = "tryConvertChatCompletionToResponseBytes")]
+pub fn try_convert_chat_completion_to_response_bytes(
+    env: Env,
+    payload: Buffer,
+    fallback_model: String,
+    response_id: String,
+    created_at: i64,
+    stream: bool,
+) -> napi::Result<NativeRawProtocolConversion> {
+    let value: Value = serde_json::from_slice(payload.as_ref()).map_err(|error| {
+        Error::new(Status::InvalidArg, format!("Invalid JSON payload: {error}"))
+    })?;
+
+    let Some((has_assistant_output, response)) =
+        try_chat_completion_response(&value, &fallback_model, &response_id, created_at)
+    else {
+        return Ok(NativeRawProtocolConversion::unsupported());
+    };
+
+    let body = serialize_response_body(&response, stream).map_err(|error| {
+        Error::new(
+            Status::GenericFailure,
+            format!("Serialization failed: {error}"),
+        )
+    })?;
+    let body = BufferSlice::copy_from(&env, &body)
+        .map_err(|error| Error::new(Status::GenericFailure, error.to_string()))?
+        .into_buffer(&env)
+        .map_err(|error| Error::new(Status::GenericFailure, error.to_string()))?;
+
+    Ok(NativeRawProtocolConversion {
+        supported: true,
+        body,
+        has_assistant_output,
+        usage: response_usage_metadata(value.get("usage")),
+    })
+}
+
+/// Classify a high-frequency SSE frame without parsing its JSON payload.
+///
+/// An empty string means that the frame is not eligible for the fast path and
+/// must be inspected by the caller's full JSON parser. The function is kept
+/// synchronous and allocation-light because it is called from the stream
+/// relay's hot loop only for frames above the native rollout threshold.
+#[napi(js_name = "classifySseFrame")]
+pub fn classify_sse_frame(frame: String) -> napi::Result<String> {
+    Ok(classify_sse_frame_type(&frame)
+        .unwrap_or_default()
+        .to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        EMPTY_ASSISTANT_FALLBACK_TEXT, PayloadContextInspection, chat_completion_to_response,
+        classify_sse_frame_type, inspect_payload_context, serialize_response_body,
+        try_chat_completion_response, try_chat_completion_to_response,
+    };
+    use serde_json::{Value, json};
+
+    #[test]
+    fn matches_every_shared_migration_fixture() {
+        let fixtures: Vec<Value> =
+            serde_json::from_str(include_str!("../testdata/payload-inspection-cases.json"))
+                .expect("shared payload inspection fixtures must be valid JSON");
+
+        for fixture in fixtures {
+            let name = fixture["name"].as_str().expect("fixture name");
+            let actual = inspect_payload_context(&fixture["payload"]);
+            let expected = &fixture["expected"];
+            assert_eq!(
+                actual.has_image,
+                expected["hasImage"].as_bool().expect("hasImage"),
+                "{name}"
+            );
+            assert_eq!(
+                actual.compaction_item_count,
+                expected["compactionItemCount"].as_u64().expect("count") as usize,
+                "{name}"
+            );
+            assert_eq!(
+                actual.latest_compaction_index,
+                expected["latestCompactionIndex"].as_i64().expect("index"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_only_the_safe_sse_fast_path() {
+        let fixtures: Vec<Value> =
+            serde_json::from_str(include_str!("../testdata/sse-fast-path-cases.json"))
+                .expect("shared SSE fixtures must be valid JSON");
+
+        for fixture in fixtures {
+            let frame = fixture["frame"].as_str().expect("fixture frame");
+            let expected = fixture["expected"].as_str();
+            assert_eq!(
+                classify_sse_frame_type(frame),
+                expected,
+                "{}",
+                fixture["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_the_responses_image_and_compaction_contract_stable() {
+        let payload = json!({
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "before"}]},
+                {"type": "compaction", "encrypted_content": "opaque-one"},
+                {"role": "user", "content": [{"type": "input_image", "image_url": "data:image/png;base64,AA"}]},
+                {"type": "compaction", "encrypted_content": "opaque-two"}
+            ]
+        });
+
+        assert_eq!(
+            inspect_payload_context(&payload),
+            PayloadContextInspection {
+                has_image: true,
+                compaction_item_count: 2,
+                latest_compaction_index: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn recognizes_item_and_nested_content_images() {
+        let payload = json!({
+            "input": [
+                {"type": "computer_screenshot_image", "data": "opaque"},
+                {"content": [{"type": "custom_image_part"}]}
+            ]
+        });
+
+        assert!(inspect_payload_context(&payload).has_image);
+    }
+
+    #[test]
+    fn recognizes_chat_completions_images_without_compaction_data() {
+        let payload = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image_url", "image_url": {"url": "https://example/image"}}
+                ]
+            }]
+        });
+
+        assert_eq!(
+            inspect_payload_context(&payload),
+            PayloadContextInspection {
+                has_image: true,
+                compaction_item_count: 0,
+                latest_compaction_index: -1,
+            }
+        );
+    }
+
+    #[test]
+    fn ignores_malformed_or_scalar_payload_branches() {
+        for payload in [json!(null), json!("text"), json!(42), json!([])] {
+            assert_eq!(
+                inspect_payload_context(&payload),
+                PayloadContextInspection::default()
+            );
+        }
+
+        let malformed = json!({"input": {}, "messages": {}});
+        assert_eq!(
+            inspect_payload_context(&malformed),
+            PayloadContextInspection::default()
+        );
+    }
+
+    #[test]
+    fn counts_every_compaction_item_and_reports_the_last_array_index() {
+        let payload = json!({
+            "input": [
+                {"type": "compaction"},
+                {"type": "input_text", "content": [{"type": "text"}]},
+                {"type": "compaction"},
+                {"type": "compaction"}
+            ]
+        });
+
+        assert_eq!(
+            inspect_payload_context(&payload),
+            PayloadContextInspection {
+                has_image: false,
+                compaction_item_count: 3,
+                latest_compaction_index: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn matches_every_shared_protocol_conversion_fixture() {
+        let fixtures: Vec<Value> =
+            serde_json::from_str(include_str!("../testdata/protocol-conversion-cases.json"))
+                .expect("shared protocol conversion fixtures must be valid JSON");
+
+        for fixture in fixtures {
+            let actual = chat_completion_to_response(
+                &fixture["chat"],
+                fixture["fallbackModel"].as_str().expect("fallback model"),
+                fixture["responseId"].as_str().expect("response id"),
+                fixture["createdAt"].as_i64().expect("created at"),
+            );
+            assert_eq!(actual, fixture["expected"], "{}", fixture["name"]);
+        }
+    }
+
+    #[test]
+    fn matches_every_shared_raw_protocol_conversion_fixture() {
+        let fixtures: Vec<Value> = serde_json::from_str(include_str!(
+            "../testdata/raw-protocol-conversion-cases.json"
+        ))
+        .expect("shared protocol conversion fixtures must be valid JSON");
+
+        for fixture in fixtures {
+            let raw = serde_json::to_vec(&fixture["chat"])
+                .expect("fixture Chat Completions body must serialize");
+            let parsed: Value = serde_json::from_slice(&raw).expect("raw fixture body must parse");
+            let actual = try_chat_completion_to_response(
+                &parsed,
+                fixture["fallbackModel"].as_str().expect("fallback model"),
+                fixture["responseId"].as_str().expect("response id"),
+                fixture["createdAt"].as_i64().expect("created at"),
+            )
+            .expect("fixture must be recognized as Chat Completions");
+            assert_eq!(
+                actual["response"], fixture["expected"],
+                "{}",
+                fixture["name"]
+            );
+            assert_eq!(actual["hasAssistantOutput"], true, "{}", fixture["name"]);
+        }
+    }
+
+    #[test]
+    fn raw_projection_preserves_retry_signal_and_falls_back_for_unsafe_text() {
+        let empty_chat = json!({
+            "object": "chat.completion",
+            "choices": [{"message": {"content": ""}}]
+        });
+
+        let actual = try_chat_completion_to_response(
+            &empty_chat,
+            "fallback-model",
+            "resp_raw_sanitized",
+            1710000101,
+        )
+        .expect("Chat Completions body must be recognized");
+        assert_eq!(actual["hasAssistantOutput"], false);
+        assert_eq!(
+            actual["response"]["output"][0]["content"][0]["text"],
+            EMPTY_ASSISTANT_FALLBACK_TEXT
+        );
+        let unsafe_chat = json!({
+            "object": "chat.completion",
+            "choices": [{"message": {"content": "Need to use tool now run command"}}]
+        });
+        assert!(
+            try_chat_completion_to_response(
+                &unsafe_chat,
+                "fallback-model",
+                "resp_unsafe",
+                1710000101,
+            )
+            .is_none()
+        );
+        assert!(
+            try_chat_completion_to_response(
+                &json!({"object": "response"}),
+                "fallback-model",
+                "resp_not_chat",
+                1710000101,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn serializes_the_final_json_and_sse_bodies_without_an_envelope() {
+        let fixtures: Vec<Value> = serde_json::from_str(include_str!(
+            "../testdata/raw-protocol-conversion-cases.json"
+        ))
+        .expect("shared raw protocol fixtures must be valid JSON");
+        let fixture = &fixtures[0];
+        let (has_assistant_output, response) = try_chat_completion_response(
+            &fixture["chat"],
+            fixture["fallbackModel"].as_str().expect("fallback model"),
+            fixture["responseId"].as_str().expect("response id"),
+            fixture["createdAt"].as_i64().expect("created at"),
+        )
+        .expect("fixture must be recognized as Chat Completions");
+
+        assert!(has_assistant_output);
+        let json_body = serialize_response_body(&response, false).expect("JSON body");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&json_body).unwrap(),
+            fixture["expected"]
+        );
+
+        let sse_body = serialize_response_body(&response, true).expect("SSE body");
+        let sse_body = std::str::from_utf8(&sse_body).expect("SSE body must be UTF-8");
+        assert!(sse_body.starts_with("event: response.completed\ndata: "));
+        let payload = sse_body
+            .strip_prefix("event: response.completed\ndata: ")
+            .and_then(|body| body.strip_suffix("\n\n"))
+            .expect("SSE framing");
+        let payload: Value = serde_json::from_str(payload).expect("SSE JSON payload");
+        assert_eq!(payload["type"], "response.completed");
+        assert_eq!(payload["response"], fixture["expected"]);
+    }
+}

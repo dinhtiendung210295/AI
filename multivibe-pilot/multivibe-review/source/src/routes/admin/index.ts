@@ -1,0 +1,2621 @@
+import { modelBenchmarkRoutes } from './model-benchmark-routes.js';
+import { createModelBenchmarkClient } from '../../model-benchmarks.js';
+import { createCachedModelBenchmarkClient } from '../../model-benchmark-cache.js';
+import { GUIDANCE_VERSION, modelNeeds, relevantChoices, recommendedChoices, verifiedCloudCatalog, type GuidanceEntry, type ModelNeed } from '../../model-guidance.js';
+import { invoiceOverview } from "../../provider-invoices.js";
+import { publishDeviceSignIn } from "../../host/device-signin.js";
+import { COPILOT_BASE_URL, requestCopilotDeviceCode, pollCopilotDeviceCode, accountFromCopilotOAuth, trustedCopilotBaseUrl } from "../../github-copilot.js";
+import { withVirtualModels } from "../../module-virtual-models.js";
+import { ARTIFICIAL_ANALYSIS_API_KEY, MULTIVIBE_CONTROL_PLANE } from "../../config.js";
+import { createAuthRateLimiter } from "../../auth-rate-limit.js";
+import { trimTrailingSlashes } from "../../string-utils.js";
+import { sdkProviderCatalog } from "../../ai-sdk/catalog.js";
+import { sdkAccountModels } from "../../ai-sdk/catalog.js";
+import type { LiveModelCatalogSource } from "../../ai-sdk/live-model-catalog.js";
+import type { ModelsDevCatalog } from "../../ai-sdk/models-dev-catalog.js";
+import { validateSdkAccount } from "../../ai-sdk/providers.js";
+import express from "express";
+import path from "node:path";
+import { randomBytes, randomUUID } from "node:crypto";
+import { AccountStore, OAuthStateStore } from "../../store.js";
+import type {
+  Account,
+  CompatibilityMode,
+  CapacityProfile,
+  ModelAlias,
+  ApplicationWebhook,
+  UpstreamMode,
+  StoreSettings,
+} from "../../types.js";
+import type { AnonymousUsageSharingController } from "../../anonymous-usage-sharing.js";
+import {
+  isUsageRefreshNeeded,
+  normalizeProvider,
+  refreshUsageIfNeeded,
+  tracksSubscriptionQuota,
+  USAGE_CACHE_TTL_MS,
+} from "../../quota.js";
+import type { UsageRefreshCoordinator } from "../../usage-refresh.js";
+import {
+  accountFromOAuth,
+  buildAuthorizationUrl,
+  createOAuthState,
+  exchangeCodeForToken,
+  mergeTokenIntoAccount,
+  parseAuthorizationInput,
+  pollDeviceCode,
+  requestDeviceCode,
+  type OAuthConfig,
+} from "../../oauth.js";
+import { ensureValidToken, isTokenRefreshNeeded } from "../../account-utils.js";
+import type { TraceManager } from "../../traces.js";
+import { isHiddenTraceRoute } from "../../traces.js";
+import { discoverModels } from "../../native-model-catalog.js";
+import {
+  maybeConsumeScheduledWeeklyReset,
+  rateLimitResetCreditRequest,
+  scheduleWeeklyReset,
+} from "../../rate-limit-reset.js";
+import {
+  XAI_AUTH_PATH,
+  XAI_BASE_URL,
+  XAI_OAUTH_CLIENT_ID,
+  XAI_OAUTH_ISSUER,
+  OPENCODE_BASE_URL,
+  USAGE_REFRESH_INTERVAL_MS,
+} from "../../config.js";
+import {
+  accountFromXaiOAuth,
+  loadXaiAuthFile,
+  pollXaiDeviceCode,
+  requestXaiDeviceCode,
+} from "../../xai.js";
+import {
+  accountFromOpenCodeOAuth,
+  pollOpenCodeDeviceCode,
+  requestOpenCodeDeviceCode,
+} from "../../opencode.js";
+import type { CodexProjectRegistry } from "../../codex-projects.js";
+import { aggregateProjectUsage } from "../../project-usage.js";
+import {
+  aggregateSessionUsage,
+  sessionTurnsFor,
+} from "../../session-usage.js";
+import { buildCodexHookInstallCommand } from "../../codex-hook-install.js";
+import type { ProxyApiKey } from "../../proxy-api-keys.js";
+import {
+  evaluateAliasPolicy,
+  inferAccountLocation,
+  migrateModelAlias,
+  parseRoutingHeaders,
+  validateSmartAlias,
+} from "../../smart-routing.js";
+import type { SmartRoutingCoordinator } from "../../smart-routing-routes.js";
+import type { ModuleManager } from "../../module-manager.js";
+import {
+  HostHarnessIntegrationError,
+  type HostHarnessIntegrationManager,
+} from "../../host/harness-integrations.js";
+import {
+  ConversationHarnessError,
+  type HostConversationHarnessManager,
+} from "../../host/conversation-harnesses.js";
+import { CODING_ECONOMY_ALIAS_DESCRIPTION, CODING_ECONOMY_PLUGIN } from "../../coding-economy-model.js";
+import { buildTaskLedger, buildTaskLedgerEntry } from "../../task-ledger.js";
+import { resolveVirtualModels, syncVirtualModelAliases } from "../../virtual-model-registry.js";
+import type { HostUpdateController, HostUpdateStatus } from "../../host/update-controller.js";
+import type { MultivibeCloudService } from "../../multivibe-cloud.js";
+import { fetchCodexQuotaResetForecast } from "../../quota-reset-forecast.js";
+import type { MultivibeTeamSyncService, TeamSyncManifest } from "../../team-sync.js";
+import type { ManagedTeamEnrollmentService } from "../../managed-team-enrollment.js";
+import type { HostHarnessRuntime } from "../../host/harness-runtime/runtime.js";
+import { harnessRuntimeRoutes } from "../../host/harness-runtime/routes.js";
+import { instanceRelayRoutes, type InstanceRelay } from "../../host/instance-relay.js";
+import { legacyHarnessRun } from "../../host/harness-runtime/legacy.js";
+import { isInstallableConversationHarness } from "../../host/conversation-harnesses.js";
+
+const MULTIVIBE_CLOUD_FLOW_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+type StoragePaths = {
+  accountsPath: string;
+  oauthStatePath: string;
+  tracePath: string;
+  traceStatsHistoryPath: string;
+  codexProjectsPath: string;
+};
+
+export type AdminRoutesOptions = {
+  store: AccountStore;
+  oauthStore: OAuthStateStore;
+  traceManager: TraceManager;
+  codexProjectRegistry: CodexProjectRegistry;
+  oauthConfig: OAuthConfig;
+  openaiBaseUrl: string;
+  mistralBaseUrl: string;
+  zaiBaseUrl: string;
+  codexProjectRegistrationToken: string;
+  configuredProxyApiKeys: ProxyApiKey[];
+  storagePaths: StoragePaths;
+  smartRouting?: SmartRoutingCoordinator;
+  usageRefreshCoordinator?: UsageRefreshCoordinator;
+  anonymousUsageSharing?: AnonymousUsageSharingController;
+  communityBenchmarks?: AnonymousUsageSharingController;
+  hostApplication?: boolean;
+  hostHarnessIntegrations?: HostHarnessIntegrationManager;
+  hostConversationHarnesses?: HostConversationHarnessManager;
+  hostHarnessRuntime?: HostHarnessRuntime;
+  instanceRelay?: InstanceRelay;
+  moduleManager?: ModuleManager;
+  hostUpdateController?: HostUpdateController;
+  multivibeCloud?: MultivibeCloudService;
+  teamSync?: MultivibeTeamSyncService;
+  managedTeamEnrollment?: ManagedTeamEnrollmentService;
+  appVersion?: string;
+  liveModelCatalog?: LiveModelCatalogSource;
+  modelsDevCatalog?: ModelsDevCatalog;
+};
+
+function proxyApiKeyPreview(key: string): string {
+  if (key.length <= 12) return `${key.slice(0, 4)}••••`;
+  return `${key.slice(0, 8)}••••${key.slice(-4)}`;
+}
+
+function normalizeApplicationName(value: unknown): string | null {
+  const application = String(value ?? "").trim();
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/.test(application)) return null;
+  return application;
+}
+
+function normalizeBaseUrl(value: unknown): string | undefined {
+  const raw = String(value ?? "").trim();
+  if (!raw) return undefined;
+  return trimTrailingSlashes(raw);
+}
+
+function normalizeUpstreamMode(value: unknown): UpstreamMode | undefined {
+  if (value === "responses") return "responses";
+  if (value === "chat/completions") return "chat/completions";
+  return undefined;
+}
+
+function normalizeCompatibilityMode(
+  value: unknown,
+): CompatibilityMode | undefined {
+  if (value === "auto") return "auto";
+  if (value === "responses") return "responses";
+  if (value === "chat-completions-bridge")
+    return "chat-completions-bridge";
+  return undefined;
+}
+
+function normalizeCapacityProfile(value: unknown): CapacityProfile | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("capacityProfile must be an object");
+  }
+  const raw = value as Record<string, unknown>;
+  const positive = (key: string, integer = false) => {
+    if (raw[key] === undefined || raw[key] === "") return undefined;
+    const parsed = Number(raw[key]);
+    if (!Number.isFinite(parsed) || parsed <= 0 || (integer && !Number.isInteger(parsed))) {
+      throw new Error(`${key} must be a positive ${integer ? "integer" : "number"}`);
+    }
+    return parsed;
+  };
+  const endpoint = (key: string) => {
+    if (!raw[key]) return undefined;
+    const parsed = new URL(String(raw[key]));
+    if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) {
+      throw new Error(`${key} must be an HTTP(S) URL without credentials`);
+    }
+    return parsed.toString();
+  };
+  return {
+    maxConcurrent: positive("maxConcurrent", true),
+    prefillTokensPerSecond: positive("prefillTokensPerSecond"),
+    decodeTokensPerSecond: positive("decodeTokensPerSecond"),
+    contextWindow: positive("contextWindow", true),
+    healthUrl: endpoint("healthUrl"),
+    metricsUrl: endpoint("metricsUrl"),
+  };
+}
+
+function parseQueryNumber(v: unknown): number | undefined {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
+}
+
+function redact(account: Account) {
+  const { opencodeHeaders: _opencodeHeaders, opencodeApiKey, ...publicAccount } = account;
+  return {
+    ...publicAccount,
+    opencodeApiKey: opencodeApiKey ? "[redacted]" : undefined,
+    accessToken: account.provider === "github-copilot" ? "[redacted]" : account.accessToken ? `${account.accessToken.slice(0, 8)}...` : "",
+    refreshToken: account.provider === "github-copilot" ? (account.refreshToken ? "[redacted]" : undefined) : account.refreshToken
+      ? `${account.refreshToken.slice(0, 8)}...`
+      : undefined,
+  };
+}
+
+function sanitizeAliasId(value: unknown): string {
+  const normalized = String(value ?? "").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-");
+  let start = 0;
+  let end = normalized.length;
+  while (start < end && normalized[start] === "-") start++;
+  while (end > start && normalized[end - 1] === "-") end--;
+  return normalized.slice(start, end);
+}
+
+function normalizeAliasTargets(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return Array.from(
+    new Set(
+      value
+        .map((x) => (typeof x === "string" ? x.trim() : ""))
+        .filter((x) => x.length > 0),
+    ),
+  );
+}
+
+const EFFORT_TIERS = ["minimal", "low", "medium", "high", "xhigh"] as const;
+const EFFORT_TARGET_RE = /^(minimal|low|medium|high|xhigh):(.+)$/;
+const MODEL_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*(\/[a-zA-Z0-9._-]+)*$/;
+
+function validateAliasTargets(targets: string[]): string | null {
+  for (const t of targets) {
+    const m = t.match(EFFORT_TARGET_RE);
+    if (m) {
+      const model = m[2];
+      if (!model || !MODEL_NAME_RE.test(model))
+        return `Invalid model name after effort prefix in target "${t}"`;
+    } else if (!MODEL_NAME_RE.test(t)) {
+      return `Invalid target format: "${t}". Expected a model name or effort:model (e.g. xhigh:gpt-5.3-pro)`;
+    }
+  }
+  return null;
+}
+
+function parseTraceWindowBounds(query: Record<string, unknown>) {
+  return {
+    sinceMs: parseQueryNumber(query.sinceMs),
+    untilMs: parseQueryNumber(query.untilMs),
+  };
+}
+
+function filterTracesByWindow<T extends { at: number }>(
+  traces: T[],
+  sinceMs?: number,
+  untilMs?: number,
+): T[] {
+  return traces.filter((t) => {
+    if (typeof sinceMs === "number" && Number.isFinite(sinceMs) && t.at < sinceMs) return false;
+    if (typeof untilMs === "number" && Number.isFinite(untilMs) && t.at > untilMs) return false;
+    return true;
+  });
+}
+
+function filterVisibleTraces<T extends { route?: string }>(traces: T[]): T[] {
+  return traces.filter((trace) => !isHiddenTraceRoute(trace.route));
+}
+
+function isOpenAiEnabledAccount(account: Account | undefined): account is Account {
+  return Boolean(account && (account.provider ?? "openai") === "openai" && account.enabled);
+}
+
+function normalizeModelLookupKey(model?: string): string {
+  const raw = (model ?? "").trim().toLowerCase();
+  if (!raw) return "";
+  if (!raw.includes("/")) return raw;
+  const tail = raw.split("/").pop()?.trim();
+  return tail || raw;
+}
+
+function formatZipDosTime(date: Date) {
+  const year = Math.max(1980, date.getUTCFullYear());
+  const month = date.getUTCMonth() + 1;
+  const day = date.getUTCDate();
+  const hours = date.getUTCHours();
+  const minutes = date.getUTCMinutes();
+  const seconds = Math.floor(date.getUTCSeconds() / 2);
+  return {
+    dosTime: (hours << 11) | (minutes << 5) | seconds,
+    dosDate: ((year - 1980) << 9) | (month << 5) | day,
+  };
+}
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n += 1) {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) {
+      c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(data: Buffer): number {
+  let c = 0xffffffff;
+  for (let i = 0; i < data.length; i += 1) {
+    c = CRC32_TABLE[(c ^ data[i]) & 0xff] ^ (c >>> 8);
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function createZipBuffer(files: Array<{ name: string; data: Buffer }>): Buffer {
+  const now = formatZipDosTime(new Date());
+  const localParts: Buffer[] = [];
+  const centralParts: Buffer[] = [];
+  let offset = 0;
+
+  for (const file of files) {
+    const nameBuf = Buffer.from(file.name, "utf8");
+    const data = file.data;
+    const crc = crc32(data);
+    const compressedSize = data.length;
+    const uncompressedSize = data.length;
+
+    const localHeader = Buffer.alloc(30);
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4);
+    localHeader.writeUInt16LE(0, 6);
+    localHeader.writeUInt16LE(0, 8);
+    localHeader.writeUInt16LE(now.dosTime, 10);
+    localHeader.writeUInt16LE(now.dosDate, 12);
+    localHeader.writeUInt32LE(crc, 14);
+    localHeader.writeUInt32LE(compressedSize, 18);
+    localHeader.writeUInt32LE(uncompressedSize, 22);
+    localHeader.writeUInt16LE(nameBuf.length, 26);
+    localHeader.writeUInt16LE(0, 28);
+
+    localParts.push(localHeader, nameBuf, data);
+
+    const centralHeader = Buffer.alloc(46);
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE(20, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt16LE(0, 8);
+    centralHeader.writeUInt16LE(0, 10);
+    centralHeader.writeUInt16LE(now.dosTime, 12);
+    centralHeader.writeUInt16LE(now.dosDate, 14);
+    centralHeader.writeUInt32LE(crc, 16);
+    centralHeader.writeUInt32LE(compressedSize, 20);
+    centralHeader.writeUInt32LE(uncompressedSize, 24);
+    centralHeader.writeUInt16LE(nameBuf.length, 28);
+    centralHeader.writeUInt16LE(0, 30);
+    centralHeader.writeUInt16LE(0, 32);
+    centralHeader.writeUInt16LE(0, 34);
+    centralHeader.writeUInt16LE(0, 36);
+    centralHeader.writeUInt32LE(0, 38);
+    centralHeader.writeUInt32LE(offset, 42);
+    centralParts.push(centralHeader, nameBuf);
+
+    offset += localHeader.length + nameBuf.length + data.length;
+  }
+
+  const centralDirectory = Buffer.concat(centralParts);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(centralDirectory.length, 12);
+  end.writeUInt32LE(offset, 16);
+  end.writeUInt16LE(0, 20);
+
+  return Buffer.concat([...localParts, centralDirectory, end]);
+}
+
+export function createAdminRouter(options: AdminRoutesOptions) {
+  const {
+    store,
+    oauthStore,
+    traceManager,
+    codexProjectRegistry,
+    oauthConfig,
+    openaiBaseUrl,
+    mistralBaseUrl,
+    zaiBaseUrl,
+    codexProjectRegistrationToken,
+    configuredProxyApiKeys,
+    storagePaths,
+    smartRouting,
+    moduleManager,
+  } = options;
+
+  const {
+    readTraceWindow,
+    readTraceById,
+    readTraceListWindow,
+    readTracesLegacy,
+    readStatsHistory,
+    readStatsHistoryRange,
+    getTraceStats,
+    buildTraceStats,
+    createUsageAggregate,
+    addTraceToAggregate,
+    finalizeAggregate,
+    pageSizeMax,
+  } = traceManager;
+
+  const router = express.Router();
+  router.use("/host-harness-runtime/v1", harnessRuntimeRoutes(options.hostHarnessRuntime));
+  router.use("/instance-relay/v1", instanceRelayRoutes(options.instanceRelay,
+    options.multivibeCloud ? operation => options.multivibeCloud!.withRelayAccount(operation) : undefined));
+  const benchmarkClient = createCachedModelBenchmarkClient(
+    createModelBenchmarkClient({ artificialAnalysisApiKey: ARTIFICIAL_ANALYSIS_API_KEY }),
+    { path: path.join(path.dirname(storagePaths.accountsPath), "model-benchmarks-v1.json") },
+  );
+  router.use("/benchmarks", modelBenchmarkRoutes(benchmarkClient));
+  router.get("/host-update", async (_req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.hostApplication || !options.hostUpdateController?.available()) {
+      return res.status(404).json({ error: "Host updater is unavailable" });
+    }
+    try {
+      return res.json(await options.hostUpdateController.status());
+    } catch (error: any) {
+      return res.status(503).json({ error: error?.message ?? "Host updater failed" });
+    }
+  });
+
+  router.post("/host-update/check", async (_req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.hostApplication || !options.hostUpdateController?.available()) {
+      return res.status(404).json({ error: "Host updater is unavailable" });
+    }
+    try {
+      return res.json(await options.hostUpdateController.check());
+    } catch (error: any) {
+      return res.status(503).json({ error: error?.message ?? "Update check failed" });
+    }
+  });
+
+  router.post("/host-update/download", async (_req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.hostApplication || !options.hostUpdateController?.available()) {
+      return res.status(404).json({ error: "Host updater is unavailable" });
+    }
+    try {
+      return res.json(await options.hostUpdateController.download());
+    } catch (error: any) {
+      return res.status(503).json({ error: error?.message ?? "Update download failed" });
+    }
+  });
+
+  router.patch("/host-update", async (req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.hostApplication || !options.hostUpdateController?.available()) {
+      return res.status(404).json({ error: "Host updater is unavailable" });
+    }
+    const mode = String(req.body?.mode ?? "") as HostUpdateStatus["mode"];
+    const channel = String(req.body?.channel ?? "") as HostUpdateStatus["channel"];
+    if (!["automatic", "download", "notify"].includes(mode) || !["stable", "beta"].includes(channel)) {
+      return res.status(400).json({ error: "Invalid Host update policy" });
+    }
+    try {
+      return res.json(await options.hostUpdateController.configure(mode, channel));
+    } catch (error: any) {
+      return res.status(503).json({ error: error?.message ?? "Update policy failed" });
+    }
+  });
+
+  router.post("/host-update/apply", async (_req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.hostApplication || !options.hostUpdateController?.available()) {
+      return res.status(404).json({ error: "Host updater is unavailable" });
+    }
+    try {
+      return res.status(202).json(await options.hostUpdateController.apply());
+    } catch (error: any) {
+      return res.status(503).json({ error: error?.message ?? "Update installation could not be queued" });
+    }
+  });
+
+  router.post("/host-update/drain", async (_req, res) => {
+    if (!options.hostApplication || !options.hostUpdateController) {
+      return res.status(404).json({ error: "Host updater is unavailable" });
+    }
+    try {
+      await options.hostUpdateController.beginDrain();
+      return res.json(await options.hostUpdateController.readiness());
+    } catch (error: any) {
+      return res.status(503).json({ error: error?.message ?? "Inference drain failed" });
+    }
+  });
+
+  router.post("/host-update/resume", async (_req, res) => {
+    if (!options.hostApplication || !options.hostUpdateController) {
+      return res.status(404).json({ error: "Host updater is unavailable" });
+    }
+    try {
+      await options.hostUpdateController.resume();
+      return res.json({ resumed: true });
+    } catch (error: any) {
+      return res.status(503).json({ error: error?.message ?? "Inference resume failed" });
+    }
+  });
+
+  router.get("/host-update/readiness", async (_req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.hostApplication || !options.hostUpdateController) {
+      return res.status(404).json({ error: "Host updater is unavailable" });
+    }
+    try {
+      return res.json(await options.hostUpdateController.readiness());
+    } catch {
+      return res.status(503).json({ error: "Host update readiness is unavailable" });
+    }
+  });
+
+  router.get("/host-harnesses", async (_req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.hostApplication || !options.hostHarnessIntegrations) {
+      return res.json({ hostApplication: false, harnesses: [] });
+    }
+    try {
+      const harnesses = (await options.hostHarnessIntegrations.list()).filter((entry) => entry.detected);
+      return res.json({ hostApplication: true, harnesses });
+    } catch (error: any) {
+      const status = error instanceof HostHarnessIntegrationError ? error.status : 500;
+      return res.status(status).json({ error: error?.message ?? "Harness detection failed" });
+    }
+  });
+
+  router.get("/host-conversation-harnesses", async (_req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.hostApplication || !options.hostConversationHarnesses) {
+      return res.json({ harnesses: [] });
+    }
+    try {
+      const [legacy,descriptors]=await Promise.all([options.hostConversationHarnesses.list(),options.hostHarnessRuntime?.catalog()??Promise.resolve([])]);
+      const byId=new Map(descriptors.map(v=>[v.id,v]));
+      return res.json({harnesses:legacy.map(entry=>{
+        const descriptor=byId.get(entry.id);if(!descriptor)return entry;
+        return {...entry,available:descriptor.available && descriptor.configured,configured:descriptor.configured,conversationCapable:true,
+          description:`Conversation supervisée · ${descriptor.protocol}`,unavailableReason:descriptor.reason??(!descriptor.configured?"Connectez ce harness à MultiVibe pour utiliser l’ancien client.":undefined),
+          capabilities:{sessions:descriptor.capabilities.sessions.available,streaming:descriptor.capabilities.streaming.available,tools:descriptor.capabilities.tools.available,longTermMemory:descriptor.capabilities.memory.available}};
+      })});
+    } catch (error: any) {
+      const status = error instanceof ConversationHarnessError ? error.status : 500;
+      return res.status(status).json({ error: error?.message ?? "Conversation harness detection failed" });
+    }
+  });
+
+  router.post("/host-conversation-harnesses/:id/run", async (req, res) => {
+    if (!options.hostApplication || !options.hostConversationHarnesses) {
+      return res.status(404).json({ error: "Conversation harnesses are available only in MultiVibe Host" });
+    }
+    const controller = new AbortController();
+    res.on("close", () => { if (!res.writableEnded) controller.abort(); });
+    res.status(200);
+    res.setHeader("content-type", "text/event-stream; charset=utf-8");
+    res.setHeader("cache-control", "no-store");
+    res.setHeader("x-accel-buffering", "no");
+    res.flushHeaders();
+    const emit = (value: unknown) => { if (!res.writableEnded) res.write(`data: ${JSON.stringify(value)}\n\n`); };
+    try {
+      const input = {
+        harnessId: String(req.params.id) as "hermes-agent" | "pi",
+        conversationId: String(req.body?.conversationId ?? ""),
+        prompt: String(req.body?.prompt ?? ""),
+        model: String(req.body?.model ?? ""),
+        ...(req.body?.sessionId ? { sessionId: String(req.body.sessionId) } : {}),
+      };
+      const update = (text:string) => emit({ type: "text", text });
+      const result = options.hostHarnessRuntime
+        ? await legacyHarnessRun(options.hostHarnessRuntime,input,controller.signal,update)
+        : await options.hostConversationHarnesses.run(input,controller.signal,update);
+      emit({ type: "result", ...result });
+      res.end();
+    } catch (error: any) {
+      const status = Number.isInteger(error?.status) && error.status>=400 && error.status<=599 ? error.status : 500;
+      emit({ type: "error", status, error: error?.message ?? "Conversation harness failed" });
+      res.end();
+    }
+  });
+
+  router.post("/host-conversation-harnesses/:id/install", async (req, res) => {
+    if (!options.hostApplication || !options.hostConversationHarnesses) {
+      return res.status(404).json({ error: "Conversation harnesses are available only in MultiVibe Host" });
+    }
+    const id = String(req.params.id);
+    if (!isInstallableConversationHarness(id)) return res.status(404).json({ error: "Unknown conversation harness" });
+    const controller = new AbortController();
+    res.on("close", () => { if (!res.writableEnded) controller.abort(); });
+    res.status(200);
+    res.setHeader("content-type", "text/event-stream; charset=utf-8");
+    res.setHeader("cache-control", "no-store");
+    res.setHeader("x-accel-buffering", "no");
+    res.flushHeaders();
+    const emit = (value: unknown) => { if (!res.writableEnded) res.write(`data: ${JSON.stringify(value)}\n\n`); };
+    try {
+      await options.hostConversationHarnesses.install(id, controller.signal, (line) => emit({ type: "log", line }));
+      emit({ type: "result" });
+    } catch (error: any) {
+      emit({ type: "error", error: error?.message ?? "Harness installation failed" });
+    }
+    res.end();
+  });
+
+  router.post("/host-harnesses/:id/project-tracking", async (req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.hostApplication || !options.hostHarnessIntegrations) {
+      return res.status(404).json({ error: "Project tracking setup is available only in MultiVibe Host" });
+    }
+    try {
+      const harness = await options.hostHarnessIntegrations.enableProjectTracking(String(req.params.id));
+      return res.json({ harness });
+    } catch (error: any) {
+      return res.status(error instanceof HostHarnessIntegrationError ? error.status : 500)
+        .json({ error: error?.message ?? "Project tracking setup failed" });
+    }
+  });
+
+  router.post("/host-harnesses/:id/install", async (req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.hostApplication || !options.hostHarnessIntegrations) {
+      return res.status(404).json({ error: "Harness integrations are available only in MultiVibe Host" });
+    }
+    const id = String(req.params.id ?? "");
+    let createdId: string | undefined;
+    try {
+      const current = await options.hostHarnessIntegrations.get(id);
+      if (current.managed && current.drifted) {
+        return res.status(409).json({ error: `${current.name} has drifted; use the repair action` });
+      }
+      if (current.configured || current.managed) return res.json({ harness: current });
+      if (!current.canInstall) {
+        return res.status(409).json({ error: current.unavailableReason ?? `${current.name} cannot be configured automatically` });
+      }
+      const application = `harness-${id}`;
+      const existing = [...configuredProxyApiKeys, ...store.getCachedProxyApiKeys()]
+        .find((entry) => entry.application === application);
+      if (existing) {
+        return res.status(409).json({ error: `An API key already exists for ${application}; revoke it before reconnecting this harness` });
+      }
+      createdId = randomUUID();
+      const key = `mv_${randomBytes(32).toString("base64url")}`;
+      await store.addProxyApiKey({ id: createdId, application, key, createdAt: Date.now() });
+      const harness = await options.hostHarnessIntegrations.install(id, {
+        apiKeyId: createdId,
+        apiKey: key,
+        application,
+      });
+      if (!harness.managed) {
+        await store.deleteProxyApiKey(createdId);
+        createdId = undefined;
+      }
+      return res.status(201).json({ harness });
+    } catch (error: any) {
+      if (createdId) await store.deleteProxyApiKey(createdId).catch(() => undefined);
+      const status = error instanceof HostHarnessIntegrationError ? error.status : 500;
+      return res.status(status).json({ error: error?.message ?? "Harness installation failed" });
+    }
+  });
+
+  router.post("/host-harnesses/:id/repair", async (req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.hostApplication || !options.hostHarnessIntegrations) {
+      return res.status(404).json({ error: "Harness integrations are available only in MultiVibe Host" });
+    }
+    const id = String(req.params.id ?? "");
+    try {
+      const current = await options.hostHarnessIntegrations.get(id);
+      if (!current.managed) return res.status(409).json({ error: `${current.name} is not managed by MultiVibe Host` });
+      if (!current.repairable) {
+        return res.status(409).json({ error: current.configurationIssue ?? `${current.name} cannot be repaired safely` });
+      }
+      const application = `harness-${id}`;
+      const existing = store.getCachedProxyApiKeys().find((entry) => entry.application === application);
+      if (!existing) {
+        return res.status(409).json({ error: `The API key for ${application} is unavailable; reconnect this harness manually` });
+      }
+      const harness = await options.hostHarnessIntegrations.repair(id, {
+        apiKeyId: existing.id,
+        apiKey: existing.key,
+        application,
+      });
+      return res.json({ harness });
+    } catch (error: any) {
+      const status = error instanceof HostHarnessIntegrationError ? error.status : 500;
+      return res.status(status).json({ error: error?.message ?? "Harness repair failed" });
+    }
+  });
+
+  router.delete("/host-harnesses/:id/install", async (req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.hostApplication || !options.hostHarnessIntegrations) {
+      return res.status(404).json({ error: "Harness integrations are available only in MultiVibe Host" });
+    }
+    try {
+      const result = await options.hostHarnessIntegrations.uninstall(String(req.params.id ?? ""));
+      if (result.apiKeyId) await store.deleteProxyApiKey(result.apiKeyId);
+      return res.json({ harness: result.view });
+    } catch (error: any) {
+      const status = error instanceof HostHarnessIntegrationError ? error.status : 500;
+      return res.status(status).json({ error: error?.message ?? "Harness removal failed" });
+    }
+  });
+
+  // Opt-in only. Enabling writes a managed `[agents]` block plus the parent
+  // delegation contract into ~/.codex/config.toml; disabling removes exactly
+  // that block and leaves the previous file restorable.
+  router.post("/host-harnesses/:id/coding-economy", async (req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.hostApplication || !options.hostHarnessIntegrations) {
+      return res.status(404).json({ error: "Harness integrations are available only in MultiVibe Host" });
+    }
+    try {
+      const harness = await options.hostHarnessIntegrations.setCodexCodingEconomy(
+        String(req.params.id ?? ""),
+        Boolean(req.body?.enabled),
+        {
+          workerModel: typeof req.body?.workerModel === "string" ? req.body.workerModel : "",
+          reasoningEffort: typeof req.body?.reasoningEffort === "string" ? req.body.reasoningEffort : "",
+        },
+      );
+      return res.json({ harness });
+    } catch (error: any) {
+      const status = error instanceof HostHarnessIntegrationError ? error.status : 500;
+      return res.status(status).json({ error: error?.message ?? "Coding economy update failed" });
+    }
+  });
+
+  router.get("/modules/:id/analytics", (req, res) => {
+    if (!moduleManager) return res.status(503).json({ error: "Module manager is unavailable" });
+    try { return res.json(moduleManager.analytics(req.params.id)); }
+    catch (error) { return res.status(404).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+
+  router.get("/models/recommendations", async (req, res) => {
+    res.setHeader("cache-control", "no-store");
+    const need = req.query.need ?? 'writing';
+    if (!modelNeeds.some(item => item.id === need)) return res.status(400).json({ error: 'Unknown model need' });
+    try {
+      const [models, accounts, cloudAccess] = await Promise.all([
+        discoverModels(store, openaiBaseUrl, mistralBaseUrl, zaiBaseUrl), store.listAccounts(),
+        options.multivibeCloud?.getAccessibleModels(),
+      ]);
+      const now = Date.now();
+      // Only authoritative model/account associations grant access. No credentials
+      // or complete account objects are included in the response.
+      const catalog: GuidanceEntry[] = models.filter(model => !model.metadata?.is_alias && !model.metadata?.is_virtual).map(model => ({
+        id: model.id, name: model.id,
+        routes: accounts.filter(account => model.metadata?.account_ids?.includes(account.id)).map(account => ({
+          source: account.multivibeCloud ? 'cloud' as const : account.localRuntime || account.location === 'local' ? 'local' as const : 'provider' as const,
+          label: account.multivibeCloud ? 'MultiVibe Cloud' : account.localRuntime?.adapter ?? account.sdkProvider ?? account.provider ?? 'Service',
+          modelId: model.id, accountId: account.id,
+          ready: account.enabled && !account.state?.needsTokenRefresh && !(Number(account.expiresAt) <= now)
+            && !(Number(account.state?.authBlockedUntil) > now) && !(Number(account.state?.modelBlocks?.[model.id]?.until) > now),
+        })),
+      }));
+      const choices = relevantChoices(verifiedCloudCatalog(catalog, cloudAccess, cloudAccess?.status === 'available'), need as ModelNeed);
+      return res.json({ version: GUIDANCE_VERSION, need, choices, recommended: recommendedChoices(choices), cloudAccess });
+    } catch { return res.status(503).json({ error: 'Recommendations could not be verified' }); }
+  });
+
+  router.get("/modules/models", async (_req, res) => {
+    res.json({ models: withVirtualModels(await discoverModels(store, openaiBaseUrl, mistralBaseUrl, zaiBaseUrl), MULTIVIBE_CONTROL_PLANE ? undefined : moduleManager) });
+  });
+
+  router.get("/modules", (_req, res) => {
+    if (!moduleManager) return res.status(503).json({ error: "Module manager is unavailable" });
+    return res.json({ inferencePluginsSupported: !MULTIVIBE_CONTROL_PLANE, modules: moduleManager.list(), marketplace: moduleManager.marketplaceList() });
+  });
+
+  router.post("/modules/submit", async (req, res) => {
+    if (!moduleManager) return res.status(503).json({ error: "Module manager is unavailable" });
+    try {
+      return res.status(201).json({ marketplaceModule: await moduleManager.submit(String(req.body?.url ?? "")) });
+    } catch (error) {
+      return res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  router.post("/modules/install", async (req, res) => {
+    if (!moduleManager) return res.status(503).json({ error: "Module manager is unavailable" });
+    try {
+      return res.status(201).json({ module: await moduleManager.install(String(req.body?.url ?? "")) });
+    } catch (error) {
+      return res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  router.post("/modules/:id/update", async (req, res) => {
+    if (!moduleManager) return res.status(503).json({ error: "Module manager is unavailable" });
+    try {
+      return res.json({ module: await moduleManager.update(req.params.id) });
+    } catch (error) {
+      return res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  router.patch("/modules/:id", async (req, res) => {
+    if (!moduleManager) return res.status(503).json({ error: "Module manager is unavailable" });
+    try {
+      let result;
+      if (req.body?.enabled && MULTIVIBE_CONTROL_PLANE) throw new Error("JavaScript inference plugins require the JavaScript inference profile; native Rust inference does not run these hooks");
+      if ("enabled" in (req.body ?? {})) result = await moduleManager.setEnabled(req.params.id, Boolean(req.body.enabled));
+      if ("settings" in (req.body ?? {})) result = await moduleManager.setSettings(req.params.id, req.body.settings);
+      // Declared virtual models are reconciled on every module change so a
+      // disabled or misconfigured module cannot leave a routable alias behind.
+      let virtualModels;
+      try { virtualModels = await syncVirtualModelAliases(store, moduleManager, await catalogModelIds()); }
+      catch { virtualModels = undefined; }
+      return res.json({ module: result ?? moduleManager.list().find((entry) => entry.id === req.params.id), virtualModels });
+    } catch (error) {
+      return res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+
+  const catalogModelIds = async (): Promise<Set<string>> =>
+    new Set((await discoverModels(store, openaiBaseUrl, mistralBaseUrl, zaiBaseUrl)).map((model) => model.id));
+
+  const codingEconomyModule = () =>
+    moduleManager?.list().find((entry) => entry.id === CODING_ECONOMY_PLUGIN);
+
+  /** Accounts billed by plan quota, and accounts served by local runtimes. */
+  const accountClassSets = async () => {
+    const accounts = await store.listAccounts();
+    const subscription = new Set<string>();
+    const local = new Set<string>();
+    for (const account of accounts) {
+      const usage = account.usage;
+      if (account.chatgptAccountId || usage?.primary || usage?.secondary || usage?.allowances?.length) {
+        subscription.add(account.id);
+      }
+      if (account.location === "local" || account.localRuntime) local.add(account.id);
+    }
+    return { subscription, local };
+  };
+
+  const codingEconomyLedgerOptions = async () => {
+    const settings = (codingEconomyModule()?.settings ?? {}) as Record<string, unknown>;
+    const { subscription, local } = await accountClassSets();
+    return {
+      parentModel: typeof settings.parentModel === "string" && settings.parentModel.trim() ? settings.parentModel.trim() : undefined,
+      subscriptionAccountIds: subscription,
+      localAccountIds: local,
+    };
+  };
+
+  router.get("/coding-economy", async (_req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!moduleManager) return res.status(503).json({ error: "Module manager is unavailable" });
+    try {
+      const catalog = await catalogModelIds();
+      const module = codingEconomyModule();
+      return res.json({
+        module: module ? { id: module.id, name: module.manifest?.name, enabled: module.enabled, healthy: module.healthy, settings: module.settings } : null,
+        virtualModels: resolveVirtualModels(moduleManager, catalog),
+        managedAliases: (await store.listModelAliases())
+          .filter((alias) => alias.description === CODING_ECONOMY_ALIAS_DESCRIPTION)
+          .map((alias) => ({ id: alias.id, enabled: alias.enabled, targets: alias.rules.flatMap((rule) => rule.candidates.map((candidate) => candidate.model)) })),
+        measurementOnly: "Delegation is decided by the coding harness. MultiVibe configures the models and records evidence; it never blocks or rewrites a request.",
+      });
+    } catch (error: any) {
+      return res.status(500).json({ error: error?.message ?? "Coding economy status failed" });
+    }
+  });
+
+  router.post("/coding-economy/sync", async (_req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!moduleManager) return res.status(503).json({ error: "Module manager is unavailable" });
+    try {
+      return res.json(await syncVirtualModelAliases(store, moduleManager, await catalogModelIds()));
+    } catch (error: any) {
+      return res.status(500).json({ error: error?.message ?? "Virtual model synchronization failed" });
+    }
+  });
+
+  router.get("/coding-economy/tasks", async (req, res) => {
+    res.setHeader("cache-control", "no-store");
+    try {
+      const limit = Math.max(1, Math.min(2_000, Number(req.query.limit ?? 500) || 500));
+      const traces = await traceManager.readTracesLegacy(Number.MAX_SAFE_INTEGER);
+      const options = await codingEconomyLedgerOptions();
+      const tasks = buildTaskLedger(traces, { ...options, limit });
+      return res.json({
+        tasks,
+        costKinds: ["measuredApiCashUsd", "estimatedSubscriptionQuotaUnits", "localComputeTokens", "counterfactualSavingsUsd"],
+        note: "Measured API cash is reconcilable against provider pricing. Subscription-quota units are estimated in tokens. Local compute consumes hardware, not cash. Counterfactual savings are a model-repriced estimate, never a measured saving. Unknown values stay unknown.",
+      });
+    } catch (error: any) {
+      return res.status(500).json({ error: error?.message ?? "Task ledger failed" });
+    }
+  });
+
+  router.get("/coding-economy/tasks/:taskId", async (req, res) => {
+    res.setHeader("cache-control", "no-store");
+    try {
+      const traces = await traceManager.readTracesLegacy(Number.MAX_SAFE_INTEGER);
+      const task = buildTaskLedgerEntry(traces, String(req.params.taskId), await codingEconomyLedgerOptions());
+      if (!task) return res.status(404).json({ error: "not found" });
+      return res.json({ task });
+    } catch (error: any) {
+      return res.status(500).json({ error: error?.message ?? "Task ledger failed" });
+    }
+  });
+
+  router.delete("/modules/:id", async (req, res) => {
+    if (!moduleManager) return res.status(503).json({ error: "Module manager is unavailable" });
+    try {
+      await moduleManager.remove(req.params.id);
+      return res.json({ ok: true });
+    } catch (error) {
+      return res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  const usageBaseUrlForAccount = (account: Account): string => {
+    const provider = normalizeProvider(account);
+    if (provider === "openai-compatible") return account.baseUrl ?? "";
+    if (provider === "github-copilot") return account.baseUrl ?? COPILOT_BASE_URL;
+    if (provider === "opencode") return account.baseUrl ?? OPENCODE_BASE_URL;
+    if (provider === "mistral") return mistralBaseUrl;
+    if (provider === "zai") return zaiBaseUrl;
+    if (provider === "xai") return account.baseUrl ?? XAI_BASE_URL;
+    return openaiBaseUrl;
+  };
+
+  const refreshAccountsUsage = async (force: boolean): Promise<Account[]> => {
+    const refreshed = await Promise.all(
+      (await store.listAccounts()).map(async (account) => {
+        const tokenRefreshNeeded = isTokenRefreshNeeded(account);
+        const usageRefreshNeeded =
+          tracksSubscriptionQuota(account) &&
+          (force || isUsageRefreshNeeded(account));
+        if (!tokenRefreshNeeded && !usageRefreshNeeded) {
+          return { account, modified: false };
+        }
+        const valid = tokenRefreshNeeded
+          ? await ensureValidToken(account, oauthConfig)
+          : account;
+        let refreshedAccount = valid;
+        if (usageRefreshNeeded && options.usageRefreshCoordinator) {
+          refreshedAccount = await options.usageRefreshCoordinator.refresh(
+            valid,
+            usageBaseUrlForAccount(valid),
+            force,
+          );
+        } else if (usageRefreshNeeded) {
+          refreshedAccount = await refreshUsageIfNeeded(
+            valid,
+            usageBaseUrlForAccount(valid),
+            force,
+          );
+        }
+        return { account: refreshedAccount, modified: true };
+      }),
+    );
+    await Promise.all(
+      refreshed
+        .filter(({ modified }) => modified)
+        .map(({ account }) => store.addOrUpdate(account)),
+    );
+    const accounts = refreshed.map(({ account }) => account);
+    await Promise.all(
+      accounts
+        .filter((account) => normalizeProvider(account) === "openai")
+        .map((account) =>
+          maybeConsumeScheduledWeeklyReset(account.id, store, openaiBaseUrl),
+        ),
+    );
+    return store.getCachedAccounts();
+  };
+
+  let staleUsageRefresh: Promise<Account[]> | undefined;
+  const refreshStaleAccountsUsage = (): Promise<Account[]> => {
+    if (staleUsageRefresh) return staleUsageRefresh;
+    const refresh = refreshAccountsUsage(false);
+    staleUsageRefresh = refresh;
+    void refresh.finally(() => {
+      if (staleUsageRefresh === refresh) staleUsageRefresh = undefined;
+    }).catch(() => undefined);
+    return refresh;
+  };
+
+  router.get("/proxy-api-keys", async (_req, res) => {
+    const managed = await store.listProxyApiKeys();
+    res.json({
+      proxyApiKeys: [
+        ...configuredProxyApiKeys.map((entry, index) => ({
+          id: `configured:${index}`,
+          application: entry.application,
+          keyPreview: proxyApiKeyPreview(entry.key),
+          source: "environment" as const,
+        })),
+        ...managed.map((entry) => ({
+          id: entry.id,
+          application: entry.application,
+          keyPreview: proxyApiKeyPreview(entry.key),
+          createdAt: entry.createdAt,
+          source: "dashboard" as const,
+        })),
+      ],
+    });
+  });
+
+  router.post("/proxy-api-keys", async (req, res) => {
+    const application = normalizeApplicationName(req.body?.application);
+    if (!application) {
+      return res.status(400).json({
+        error: "application must contain only letters, numbers, dots, underscores, or hyphens",
+      });
+    }
+    const existing = [
+      ...configuredProxyApiKeys,
+      ...store.getCachedProxyApiKeys(),
+    ];
+    if (existing.some((entry) => entry.application === application)) {
+      return res.status(409).json({ error: "An API key already exists for this application" });
+    }
+    const entry = {
+      id: randomUUID(),
+      application,
+      key: `mv_${randomBytes(32).toString("base64url")}`,
+      createdAt: Date.now(),
+    };
+    await store.addProxyApiKey(entry);
+    res.status(201).json({
+      proxyApiKey: {
+        id: entry.id,
+        application: entry.application,
+        key: entry.key,
+        keyPreview: proxyApiKeyPreview(entry.key),
+        createdAt: entry.createdAt,
+        source: "dashboard",
+      },
+    });
+  });
+
+  router.delete("/proxy-api-keys/:id", async (req, res) => {
+    const deleted = await store.deleteProxyApiKey(String(req.params.id));
+    if (!deleted) return res.status(404).json({ error: "API key not found" });
+    res.json({ ok: true });
+  });
+
+  router.get("/application-policies", (_req, res) => {
+    res.json({
+      applicationPolicies: store.getCachedApplicationPolicies().map((policy) => ({
+        ...policy,
+        webhooks: policy.webhooks.map(({ secret: _secret, ...webhook }) => webhook),
+      })),
+    });
+  });
+
+  router.patch("/application-policies/:application", async (req, res) => {
+    const application = normalizeApplicationName(req.params.application);
+    if (!application) return res.status(400).json({ error: "invalid application" });
+    const current = store.getApplicationPolicy(application);
+    const fairnessWeight = Number(req.body?.fairnessWeight ?? current.fairnessWeight);
+    if (!Number.isFinite(fairnessWeight) || fairnessWeight < 0.1 || fairnessWeight > 100) {
+      return res.status(400).json({ error: "fairnessWeight must be between 0.1 and 100" });
+    }
+    const policy = await store.upsertApplicationPolicy({
+      ...current,
+      fairnessWeight,
+    });
+    res.json({
+      ok: true,
+      applicationPolicy: {
+        ...policy,
+        webhooks: policy.webhooks.map(({ secret: _secret, ...webhook }) => webhook),
+      },
+    });
+  });
+
+  router.post("/application-policies/:application/webhooks", async (req, res) => {
+    const application = normalizeApplicationName(req.params.application);
+    if (!application) return res.status(400).json({ error: "invalid application" });
+    let url: URL;
+    try {
+      url = new URL(String(req.body?.url ?? ""));
+      if (!(["http:", "https:"] as string[]).includes(url.protocol) || url.username || url.password) {
+        throw new Error("invalid webhook URL");
+      }
+    } catch {
+      return res.status(400).json({ error: "webhook URL must be an absolute HTTP(S) URL without credentials" });
+    }
+    const policy = store.getApplicationPolicy(application);
+    const webhook: ApplicationWebhook = {
+      id: randomUUID(),
+      url: url.toString(),
+      secret: randomBytes(32).toString("base64url"),
+      enabled: true,
+      createdAt: Date.now(),
+    };
+    policy.webhooks.push(webhook);
+    await store.upsertApplicationPolicy(policy);
+    res.status(201).json({ webhook });
+  });
+
+  router.delete("/application-policies/:application/webhooks/:id", async (req, res) => {
+    const application = normalizeApplicationName(req.params.application);
+    if (!application) return res.status(400).json({ error: "invalid application" });
+    const policy = store.getApplicationPolicy(application);
+    const before = policy.webhooks.length;
+    policy.webhooks = policy.webhooks.filter((webhook) => webhook.id !== req.params.id);
+    if (policy.webhooks.length === before) return res.status(404).json({ error: "not found" });
+    await store.upsertApplicationPolicy(policy);
+    res.status(204).end();
+  });
+
+  router.get("/config", (_req, res) => {
+    res.json({
+      ok: true,
+      hostApplication: Boolean(options.hostApplication),
+      oauthRedirectUri: oauthConfig.redirectUri,
+      xaiAuthPath: XAI_AUTH_PATH,
+      usageCacheTtlMs: USAGE_CACHE_TTL_MS,
+      usageRefreshIntervalMs: USAGE_REFRESH_INTERVAL_MS,
+      storage: {
+        accountsPath: storagePaths.accountsPath,
+        oauthStatePath: storagePaths.oauthStatePath,
+        tracePath: storagePaths.tracePath,
+        traceStatsHistoryPath: storagePaths.traceStatsHistoryPath,
+        codexProjectsPath: storagePaths.codexProjectsPath,
+        persistenceLikelyEnabled:
+          storagePaths.accountsPath.startsWith("/data/") ||
+          storagePaths.accountsPath.startsWith("/data"),
+        accountStore: store.getPersistenceStatus(),
+        traces: traceManager.getPersistenceStatus(),
+        codexProjects: codexProjectRegistry.getPersistenceStatus(),
+      },
+    });
+  });
+
+  router.get("/codex-projects", (_req, res) => {
+    res.json({ ok: true, projects: codexProjectRegistry.listProjects() });
+  });
+
+  router.get("/codex-sessions", (_req, res) => {
+    res.json({ ok: true, sessions: codexProjectRegistry.listSessions() });
+  });
+
+  router.post("/codex-hook-install-command", (req, res) => {
+    try {
+      const command = buildCodexHookInstallCommand(
+        req.body?.baseUrl,
+        codexProjectRegistrationToken,
+      );
+      res.json({ ok: true, command });
+    } catch (error: any) {
+      const message = error?.message ?? String(error);
+      const status = message.includes("registration is disabled") ? 503 : 400;
+      res.status(status).json({ error: message });
+    }
+  });
+
+  router.get("/provider-catalog", async (_req, res) => {
+    if (options.modelsDevCatalog) {
+      try { await options.modelsDevCatalog.ensure(); } catch { /* bundled snapshot stays authoritative */ }
+    }
+    res.json(sdkProviderCatalog(options.modelsDevCatalog));
+  });
+
+  const providerAccountModels = async (req: express.Request, res: express.Response, force: boolean) => {
+    const account = (await store.listAccounts()).find((entry) => entry.id === req.params.id);
+    if (!account || account.provider !== "ai-sdk" || !account.enabled) {
+      return res.status(404).json({ error: "Provider account unavailable" });
+    }
+    if (options.modelsDevCatalog) {
+      try { await options.modelsDevCatalog.ensure(); } catch { /* optional metadata */ }
+    }
+    let live;
+    try {
+      live = force && options.liveModelCatalog?.refresh
+        ? await options.liveModelCatalog.refresh(account)
+        : await options.liveModelCatalog?.snapshot(account);
+    } catch {
+      live = undefined;
+    }
+    res.setHeader("Cache-Control", "no-store");
+    res.json({
+      object: "list",
+      provider: account.sdkProvider ?? null,
+      selection: account.sdkModels ?? [],
+      discovered: Boolean(live),
+      live: live ?? null,
+      catalog: options.modelsDevCatalog?.state() ?? null,
+      data: sdkAccountModels(account, live, options.modelsDevCatalog),
+    });
+  };
+
+  router.get("/accounts/:id/models", async (req, res) => {
+    try { await providerAccountModels(req, res, false); }
+    catch { res.status(500).json({ error: "Could not load provider models" }); }
+  });
+
+  router.post("/accounts/:id/models/refresh", async (req, res) => {
+    try { await providerAccountModels(req, res, true); }
+    catch { res.status(500).json({ error: "Could not refresh provider models" }); }
+  });
+
+  router.get("/invoices", async (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    // A local admin session alone must not expose a Team's financial documents to members.
+    const settings = await store.getSettings();
+    const context = options.multivibeCloud ? await options.multivibeCloud.teamWorkspace() :
+      { state: settings.multivibeTeam?.enabled ? "team" : "personal", role: null };
+    if (context.state !== "personal" && !(context.state === "team" && ["owner", "admin", "billing"].includes(context.role ?? ""))) {
+      return res.status(403).json({ error: "Billing access is unavailable for this workspace." });
+    }
+    return res.json(await invoiceOverview(await store.listAccounts(), options.multivibeCloud));
+  });
+
+  router.get("/accounts", async (_req, res) =>
+    res.json({ accounts: (await store.listAccounts()).map(redact) }),
+  );
+
+  router.get("/team/workspace", async (_req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.multivibeCloud) {
+      const settings = await store.getSettings();
+      return res.json({ state: settings.multivibeTeam?.enabled ? "team" : "personal", role: null });
+    }
+    return res.json(await options.multivibeCloud.teamWorkspace());
+  });
+  router.get("/team", async (_req,res)=>{
+    if(!options.teamSync)return res.status(503).json({error:"Multivibe Team Sync is unavailable"});
+    return res.json(await options.teamSync.status());
+  });
+  router.get("/team/managed-enrollment", async (_req,res)=>{
+    if(!options.managedTeamEnrollment)return res.status(503).json({error:"Managed Team enrollment is unavailable"});
+    res.setHeader("cache-control","no-store");
+    return res.json(await options.managedTeamEnrollment.status());
+  });
+  router.get("/team/providers/eligible",async(_req,res)=>{
+    if(!options.teamSync)return res.status(503).json({error:"Multivibe Team Sync is unavailable"});
+    return res.json({schemaVersion:"multivibe-team-import-preview-v1",providers:await options.teamSync.eligibleProviders()});
+  });
+  router.post("/team/sync",async(req,res)=>{
+    if(!options.teamSync)return res.status(503).json({error:"Multivibe Team Sync is unavailable"});
+    try{return res.json({ok:true,...await options.teamSync.applyManifest(req.body as TeamSyncManifest)});}catch(error){return res.status(409).json({error:error instanceof Error?error.message:"Team Sync failed"});}
+  });
+  router.post("/team/providers/:id/duplicate",async(req,res)=>{
+    if(!options.teamSync)return res.status(503).json({error:"Multivibe Team Sync is unavailable"});
+    try{return res.status(201).json({account:redact(await options.teamSync.duplicateAsLocal(req.params.id))});}catch(error){return res.status(404).json({error:error instanceof Error?error.message:"Team provider not found"});}
+  });
+  router.get("/team/analytics/outbox",(_req,res)=>{
+    if(!options.teamSync)return res.status(503).json({error:"Multivibe Team Sync is unavailable"});
+    return res.json(options.teamSync.analyticsBatch());
+  });
+  router.post("/team/disconnect",async(_req,res)=>{
+    if(!options.teamSync)return res.status(503).json({error:"Multivibe Team Sync is unavailable"});
+    await options.teamSync.detach();return res.json({ok:true});
+  });
+
+  router.get("/quota-reset-forecast", async (_req, res) => {
+    res.setHeader("cache-control", "no-store");
+    try {
+      return res.json({ forecast: await fetchCodexQuotaResetForecast() });
+    } catch {
+      return res.status(503).json({ error: "quota_reset_forecast_unavailable" });
+    }
+  });
+
+
+
+  router.post("/grok/import", createAuthRateLimiter({ limit: 5 }), async (_req, res) => {
+    try {
+      const credentials = await loadXaiAuthFile();
+      const existingAccounts = await store.listAccounts();
+      const imported: Account[] = [];
+      for (const credential of credentials) {
+        const existing = existingAccounts.find(
+          (account) =>
+            normalizeProvider(account) === "xai" &&
+            account.xaiAuthScope === credential.scope &&
+            (!credential.userId || account.xaiUserId === credential.userId),
+        );
+        const account: Account = {
+          ...existing,
+          id: existing?.id ?? randomUUID(),
+          provider: "xai",
+          upstreamMode: existing?.upstreamMode ?? "responses",
+          email: credential.email ?? existing?.email,
+          accessToken: credential.accessToken,
+          refreshToken: credential.refreshToken ?? existing?.refreshToken,
+          expiresAt: credential.expiresAt ?? existing?.expiresAt,
+          xaiUserId: credential.userId ?? existing?.xaiUserId,
+          xaiAuthScope: credential.scope,
+          oidcIssuer: credential.oidcIssuer,
+          oidcClientId: credential.oidcClientId,
+          enabled: existing?.enabled ?? true,
+          priority: existing?.priority ?? 0,
+          state: {
+            ...existing?.state,
+            needsTokenRefresh: false,
+            authBlockedUntil: undefined,
+            lastError: undefined,
+          },
+        };
+        await store.upsertAccount(account);
+        imported.push(account);
+      }
+      await store.flushIfDirty();
+      return res.json({
+        ok: true,
+        imported: imported.length,
+        accounts: imported.map(redact),
+      });
+    } catch (err: any) {
+      return res.status(400).json({
+        error: `Grok auth import failed: ${err?.message ?? String(err)}`,
+      });
+    }
+  });
+
+  router.get("/settings", async (_req, res) => {
+    const { multivibeCloud: _privateCloud, ...settings } = await store.getSettings();
+    return res.json({ ok: true, settings });
+  });
+
+  router.patch("/settings", async (req, res) => {
+    const body = req.body ?? {};
+    const patch: {
+      defaultPassthroughAccountId?: string | undefined;
+      imageRequestModelOverride?: string | undefined;
+      anonymousUsageSharingEnabled?: boolean;
+      communityBenchmarksSharingEnabled?: boolean;
+    } = {};
+
+    if ("communityBenchmarksSharingEnabled" in body) {
+      if (typeof body.communityBenchmarksSharingEnabled !== "boolean") {
+        return res.status(400).json({ error: "communityBenchmarksSharingEnabled must be a boolean" });
+      }
+      patch.communityBenchmarksSharingEnabled = body.communityBenchmarksSharingEnabled;
+    }
+
+    if ("anonymousUsageSharingEnabled" in body) {
+      if (typeof body.anonymousUsageSharingEnabled !== "boolean") {
+        return res.status(400).json({ error: "anonymousUsageSharingEnabled must be a boolean" });
+      }
+      patch.anonymousUsageSharingEnabled = body.anonymousUsageSharingEnabled;
+    }
+
+    if ("defaultPassthroughAccountId" in body) {
+      const accountId = String(body.defaultPassthroughAccountId ?? "").trim();
+      if (accountId) {
+        const account = (await store.listAccounts()).find((a) => a.id === accountId);
+        if (!isOpenAiEnabledAccount(account)) {
+          return res.status(400).json({
+            error: "defaultPassthroughAccountId must reference an enabled OpenAI account",
+          });
+        }
+        patch.defaultPassthroughAccountId = accountId;
+      } else {
+        patch.defaultPassthroughAccountId = undefined;
+      }
+    }
+
+    if ("imageRequestModelOverride" in body) {
+      const model = String(body.imageRequestModelOverride ?? "").trim();
+      if (model) {
+        const discoveredModels = await discoverModels(
+          store,
+          openaiBaseUrl,
+          mistralBaseUrl,
+          zaiBaseUrl,
+        );
+        const aliases = await store.listModelAliases();
+        const validModelKeys = new Set<string>([
+          ...discoveredModels
+            .map((entry: any) => normalizeModelLookupKey(entry?.id))
+            .filter(Boolean),
+          ...aliases
+            .filter((alias) => alias.enabled)
+            .map((alias) => normalizeModelLookupKey(alias.id))
+            .filter(Boolean),
+        ]);
+        const modelKey = normalizeModelLookupKey(model);
+        if (!validModelKeys.has(modelKey)) {
+          return res.status(400).json({
+            error: "imageRequestModelOverride must reference an exposed model or enabled alias",
+          });
+        }
+        patch.imageRequestModelOverride = model;
+      } else {
+        patch.imageRequestModelOverride = undefined;
+      }
+    }
+
+    const settings: StoreSettings = await store.patchSettings(patch);
+    if ("anonymousUsageSharingEnabled" in patch && options.anonymousUsageSharing) {
+      try {
+        await options.anonymousUsageSharing.applySettings(settings);
+      } catch {
+        return res.status(500).json({
+          error: "Anonymous usage sharing was disabled, but its unsent state could not be removed",
+        });
+      }
+    }
+    if ("communityBenchmarksSharingEnabled" in patch && options.communityBenchmarks) {
+      try {
+        await options.communityBenchmarks.applySettings(settings);
+      } catch {
+        return res.status(500).json({
+          error: "Community benchmark sharing was changed, but its unsent state could not be updated",
+        });
+      }
+    }
+    const { multivibeCloud: _privateCloud, ...publicSettings } = settings;
+    res.json({ ok: true, settings: publicSettings });
+  });
+
+  router.get("/cloud/accessible-models", async (_req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.multivibeCloud) return res.status(503).json({ error: "MultiVibe Cloud is unavailable" });
+    try { return res.json(await options.multivibeCloud.getAccessibleModels()); }
+    catch { return res.status(502).json({ error: "Cloud access could not be checked" }); }
+  });
+
+  router.get("/cloud/models", async (_req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.multivibeCloud) return res.status(503).json({ error: "MultiVibe Cloud is unavailable" });
+    try { return res.json(await options.multivibeCloud.getModelCatalog()); }
+    catch { return res.status(502).json({ error: "MultiVibe Cloud catalog could not be loaded" }); }
+  });
+
+  router.get("/cloud", async (_req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.multivibeCloud) {
+      return res.json({ status: "unavailable", topupUrl: "https://app.multivibe.cloud/billing" });
+    }
+    return res.json(await options.multivibeCloud.getStatus());
+  });
+
+  router.post("/cloud/disconnect", async (_req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.multivibeCloud) return res.status(503).json({ error: "MultiVibe Cloud is unavailable" });
+    try {
+      await options.multivibeCloud.disconnect();
+      return res.json({ ok: true });
+    } catch {
+      return res.status(503).json({ error: "MultiVibe Cloud disconnection failed" });
+    }
+  });
+
+  router.post("/cloud/connect", async (req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.multivibeCloud) return res.status(503).json({ error: "MultiVibe Cloud is unavailable" });
+    try {
+      const callbackOrigin = typeof req.body?.callbackOrigin === "string"
+        && req.body.callbackOrigin.trim() ? req.body.callbackOrigin : undefined;
+      return res.json(await options.multivibeCloud.startConnection(callbackOrigin));
+    } catch (error: any) {
+      return res.status(503).json({ error: error?.message ?? "MultiVibe Cloud connection failed" });
+    }
+  });
+
+  router.get("/cloud/oauth/callback", async (req, res) => {
+    res.setHeader("cache-control", "no-store");
+    if (!options.multivibeCloud) return res.status(404).send("MultiVibe Cloud is unavailable");
+    const allowedQueryKeys = new Set(["state", "code", "error", "error_description"]);
+    const queryKeys = Object.keys(req.query);
+    const hasUnexpectedQuery = queryKeys.some((key) => !allowedQueryKeys.has(key));
+    const hasDuplicateQuery = ["state", "code", "error", "error_description"].some((key) => Array.isArray(req.query[key]));
+    const state = typeof req.query.state === "string" ? req.query.state : "";
+    const error = typeof req.query.error === "string" ? req.query.error : "";
+    if (hasUnexpectedQuery || hasDuplicateQuery || !MULTIVIBE_CLOUD_FLOW_ID_PATTERN.test(state)) {
+      return res.redirect(303, "/?tab=accounts&cloud=error");
+    }
+    if (error) {
+      await options.multivibeCloud.failConnection(state, "Cloud authorization was cancelled");
+      return res.redirect(303, "/?tab=accounts&cloud=cancelled");
+    }
+    const code = typeof req.query.code === "string" ? req.query.code : "";
+    if (!state || !code) {
+      await options.multivibeCloud.failConnection(state, "Cloud authorization failed");
+      return res.redirect(303, "/?tab=accounts&cloud=error");
+    }
+    try {
+      await options.multivibeCloud.completeConnection(state, code);
+      return res.redirect(303, "/?tab=accounts&cloud=connected");
+    } catch {
+      await options.multivibeCloud.failConnection(state, "Cloud authorization failed");
+      return res.redirect(303, "/?tab=accounts&cloud=error");
+    }
+  });
+
+  router.get("/model-aliases", async (_req, res) =>
+    res.json({ modelAliases: await store.listModelAliases() }),
+  );
+
+  router.post("/model-aliases/simulate", (req, res) => {
+    if (!smartRouting) return res.status(503).json({ error: "smart routing is unavailable" });
+    const alias = migrateModelAlias(req.body?.alias ?? req.body);
+    const errors = validateSmartAlias(alias);
+    if (errors.length) return res.status(400).json({ error: errors[0], errors });
+    const input = req.body?.request ?? {};
+    const routing = parseRoutingHeaders(
+      {
+        "x-multivibe-priority": input.priority ?? "standard",
+        "x-multivibe-execution": input.executionMode ?? "sync",
+      },
+      input.application ?? "simulation",
+      typeof input.now === "number" ? input.now : Date.now(),
+    );
+    routing.effort = input.effort;
+    routing.modalities = Array.isArray(input.modalities) ? input.modalities : ["text"];
+    routing.requiresTools = Boolean(input.requiresTools);
+    routing.estimatedInputTokens = Math.max(0, Number(input.inputTokens) || 0);
+    const decision = evaluateAliasPolicy(
+      alias,
+      routing,
+      smartRouting.resources(alias.id, alias),
+      Math.max(1, Number(input.outputTokens) || 8_192),
+    );
+    res.json({
+      rule: decision.rule?.id,
+      onNoCapacity: decision.onNoCapacity,
+      decision: decision.eligible[0]
+        ? {
+            model: decision.eligible[0].config.model,
+            accountId: decision.eligible[0].resource.accountId,
+            location: decision.eligible[0].resource.location,
+            score: decision.eligible[0].score,
+          }
+        : undefined,
+      candidates: decision.candidates,
+    });
+  });
+
+  router.post("/model-aliases", async (req, res) => {
+    const body = req.body ?? {};
+    const id = sanitizeAliasId(body.id);
+    if (!id) return res.status(400).json({ error: "id required" });
+
+    if (typeof body.targets !== "undefined") {
+      const targets = normalizeAliasTargets(body.targets);
+      if (!targets.length)
+        return res.status(400).json({ error: "at least one target is required" });
+      const targetErr = validateAliasTargets(targets);
+      if (targetErr) return res.status(400).json({ error: targetErr });
+      body.targets = targets;
+    }
+    const alias = migrateModelAlias({ ...body, id });
+    const errors = validateSmartAlias(alias);
+    if (errors.length) return res.status(400).json({ error: errors[0], errors });
+    await store.upsertModelAlias(alias);
+    res.json({ ok: true, modelAlias: alias });
+  });
+
+  router.patch("/model-aliases/:id", async (req, res) => {
+    const body = req.body ?? {};
+    const current = (await store.listModelAliases()).find(
+      (alias) => alias.id === req.params.id,
+    );
+    if (!current) return res.status(404).json({ error: "not found" });
+    const patch: Partial<ModelAlias> = {};
+
+    if (typeof body.enabled !== "undefined") patch.enabled = Boolean(body.enabled);
+    if (typeof body.description !== "undefined") patch.description =
+      typeof body.description === "string" && body.description.trim()
+        ? body.description.trim()
+        : undefined;
+    if (typeof body.defaults !== "undefined") patch.defaults = body.defaults;
+    if (typeof body.rules !== "undefined") patch.rules = body.rules;
+    if (typeof body.targets !== "undefined") {
+      const targets = normalizeAliasTargets(body.targets);
+      if (!targets.length) {
+        return res
+          .status(400)
+          .json({ error: "at least one target is required" });
+      }
+      const targetErr = validateAliasTargets(targets);
+      if (targetErr) return res.status(400).json({ error: targetErr });
+      patch.rules = migrateModelAlias({ ...current, schemaVersion: 1, targets }).rules;
+    }
+    const candidate = migrateModelAlias({ ...current, ...patch, id: current.id });
+    const errors = validateSmartAlias(candidate);
+    if (errors.length) return res.status(400).json({ error: errors[0], errors });
+    const updated = await store.patchModelAlias(req.params.id, patch);
+    res.json({ ok: true, modelAlias: updated });
+  });
+
+  router.delete("/model-aliases/:id", async (req, res) => {
+    const ok = await store.deleteModelAlias(req.params.id);
+    if (!ok) return res.status(404).json({ error: "not found" });
+    res.json({ ok: true });
+  });
+
+  router.get("/traces", async (req, res) => {
+    const hasPaginationQuery =
+      typeof req.query.page !== "undefined" ||
+      typeof req.query.pageSize !== "undefined";
+    const hasLegacyLimit = typeof req.query.limit !== "undefined";
+
+    if (hasLegacyLimit && !hasPaginationQuery) {
+      const limit = Number(req.query.limit ?? 100);
+      return res.json({
+        traces: filterVisibleTraces(await readTracesLegacy(limit)),
+      });
+    }
+
+    const page = Math.max(1, Number(req.query.page ?? 1) || 1);
+    const pageSize = Math.max(
+      1,
+      Math.min(
+        pageSizeMax,
+        Number(req.query.pageSize ?? pageSizeMax) || pageSizeMax,
+      ),
+    );
+    const { sinceMs, untilMs } = parseTraceWindowBounds(
+      req.query as Record<string, unknown>,
+    );
+    const projectId =
+      typeof req.query.projectId === "string" ? req.query.projectId.trim() : "";
+    const traces = filterVisibleTraces(await readTraceListWindow());
+    const filtered = filterTracesByWindow(traces, sinceMs, untilMs).filter(
+      (trace) => !projectId || trace.projectId === projectId,
+    );
+    const sorted = [...filtered].sort((a, b) => b.at - a.at);
+    const total = sorted.length;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const start = (page - 1) * pageSize;
+    const paged = start >= total ? [] : sorted.slice(start, start + pageSize);
+    const stats = buildTraceStats(sorted);
+
+    return res.json({
+      traces: paged,
+      pagination: {
+        page,
+        pageSize,
+        total,
+        totalPages,
+        hasPrev: page > 1,
+        hasNext: page < totalPages,
+      },
+      stats,
+      filters: { sinceMs, untilMs, projectId: projectId || undefined },
+    });
+  });
+
+  router.get("/traces/export.zip", async (req, res) => {
+    const { sinceMs, untilMs } = parseTraceWindowBounds(
+      req.query as Record<string, unknown>,
+    );
+    const traces = filterTracesByWindow(
+      filterVisibleTraces(await readTraceWindow()),
+      sinceMs,
+      untilMs,
+    ).sort((a, b) => a.at - b.at);
+
+    const exportedAt = Date.now();
+    const files: Array<{ name: string; data: Buffer }> = [
+      {
+        name: "metadata.json",
+        data: Buffer.from(
+          JSON.stringify(
+            {
+              exportedAt,
+              count: traces.length,
+              filters: { sinceMs, untilMs },
+            },
+            null,
+            2,
+          ),
+          "utf8",
+        ),
+      },
+      {
+        name: "traces.jsonl",
+        data: Buffer.from(
+          traces.map((t) => JSON.stringify(t)).join("\n") + (traces.length ? "\n" : ""),
+          "utf8",
+        ),
+      },
+    ];
+
+    const zip = createZipBuffer(files);
+    const stamp = new Date(exportedAt).toISOString().replace(/[:.]/g, "-");
+    res.setHeader("content-type", "application/zip");
+    res.setHeader(
+      "content-disposition",
+      `attachment; filename="traces-export-${stamp}.zip"`,
+    );
+    res.setHeader("content-length", String(zip.length));
+    res.send(zip);
+  });
+
+  router.get("/traces/:id", async (req, res) => {
+    const trace = await readTraceById(req.params.id);
+    if (!trace || isHiddenTraceRoute(trace.route)) {
+      return res.status(404).json({ error: "not found" });
+    }
+    res.json({ trace });
+  });
+
+  router.use("/stats", (_req, res, next) => {
+    const analytics = traceManager.getPersistenceStatus?.().analytics;
+    if (analytics && (!analytics.ready || analytics.error)) {
+      res.setHeader("Retry-After", "5");
+      return res.status(503).json({ error: analytics.error ? "Statistics indexing needs attention" : "Statistics history is being indexed", analytics });
+    }
+    next();
+  });
+
+  router.get("/stats/usage", async (req, res) => {
+    const accountIdFilter =
+      typeof req.query.accountId === "string" ? req.query.accountId.trim() : "";
+    const routeFilter =
+      typeof req.query.route === "string" ? req.query.route.trim() : "";
+    const applicationFilter =
+      typeof req.query.application === "string"
+        ? req.query.application.trim()
+        : "";
+    const projectIdFilter =
+      typeof req.query.projectId === "string" ? req.query.projectId.trim() : "";
+    const sinceMs = parseQueryNumber(req.query.sinceMs);
+    const untilMs = parseQueryNumber(req.query.untilMs);
+
+    if (traceManager.queryAnalytics) {
+      const report = await traceManager.queryAnalytics("usage", { sinceMs, untilMs, accountId: accountIdFilter, route: routeFilter, application: applicationFilter, projectId: projectIdFilter });
+      const accounts = await store.listAccounts();
+      const meta = new Map(accounts.map(a => [a.id, { id: a.id, provider: a.provider ?? "openai", email: a.email, enabled: a.enabled }]));
+      report.byAccount = report.byAccount.map((entry: any) => ({ ...entry, account: meta.get(entry.accountId) ?? { id: entry.accountId } }));
+      return res.json({ ok: true, filters: { sinceMs, untilMs, accountId: accountIdFilter || undefined, route: routeFilter || undefined, application: applicationFilter || undefined, projectId: projectIdFilter || undefined }, ...report, analytics: traceManager.getPersistenceStatus().analytics });
+    }
+
+    const traces = filterVisibleTraces(await readStatsHistoryRange(sinceMs, untilMs));
+    const filtered = traces.filter((t) => {
+      if (accountIdFilter && t.accountId !== accountIdFilter) return false;
+      if (routeFilter && t.route !== routeFilter) return false;
+      if (applicationFilter && t.application !== applicationFilter) return false;
+      if (projectIdFilter && t.projectId !== projectIdFilter) return false;
+      return true;
+    });
+    const usageTraces = filtered.filter(
+      (trace) =>
+        trace.traceKind === undefined || trace.traceKind === "upstream-attempt",
+    );
+
+    const globalAgg = createUsageAggregate();
+    const byAccount = new Map<string, ReturnType<typeof createUsageAggregate>>();
+    const byRoute = new Map<string, ReturnType<typeof createUsageAggregate>>();
+    const byApplication = new Map<string, ReturnType<typeof createUsageAggregate>>();
+
+    for (const trace of usageTraces) {
+      addTraceToAggregate(globalAgg, trace);
+
+      const accountKey = trace.accountId ?? "unknown";
+      if (!byAccount.has(accountKey))
+        byAccount.set(accountKey, createUsageAggregate());
+      addTraceToAggregate(byAccount.get(accountKey)!, trace);
+
+      const routeKey = trace.route ?? "unknown";
+      if (!byRoute.has(routeKey)) byRoute.set(routeKey, createUsageAggregate());
+      addTraceToAggregate(byRoute.get(routeKey)!, trace);
+
+      const applicationKey = trace.application ?? "unattributed";
+      if (!byApplication.has(applicationKey))
+        byApplication.set(applicationKey, createUsageAggregate());
+      addTraceToAggregate(byApplication.get(applicationKey)!, trace);
+
+    }
+
+    const accounts = await store.listAccounts();
+    const accountMeta = new Map(
+      accounts.map((a) => [
+        a.id,
+        {
+          id: a.id,
+          provider: a.provider ?? "openai",
+          email: a.email,
+          enabled: a.enabled,
+        },
+      ]),
+    );
+
+    const byAccountOut = Array.from(byAccount.entries())
+      .map(([accountId, agg]) => ({
+        accountId,
+        account: accountMeta.get(accountId) ?? {
+          id: accountId,
+          provider: undefined,
+          email: undefined,
+          enabled: undefined,
+        },
+        ...finalizeAggregate(agg),
+      }))
+      .sort((a, b) => b.requests - a.requests);
+
+    const byRouteOut = Array.from(byRoute.entries())
+      .map(([route, agg]) => ({ route, ...finalizeAggregate(agg) }))
+      .sort((a, b) => b.requests - a.requests);
+    const byApplicationOut = Array.from(byApplication.entries())
+      .map(([application, agg]) => ({ application, ...finalizeAggregate(agg) }))
+      .sort((a, b) => b.requests - a.requests);
+    const byProjectOut = aggregateProjectUsage(usageTraces);
+
+    res.json({
+      ok: true,
+      filters: {
+        accountId: accountIdFilter || undefined,
+        route: routeFilter || undefined,
+        application: applicationFilter || undefined,
+        projectId: projectIdFilter || undefined,
+        sinceMs,
+        untilMs,
+      },
+      totals: finalizeAggregate(globalAgg),
+      byAccount: byAccountOut,
+      byRoute: byRouteOut,
+      byApplication: byApplicationOut,
+      byProject: byProjectOut,
+      tracesEvaluated: traces.length,
+      tracesMatched: usageTraces.length,
+    });
+  });
+
+  router.get("/stats/sessions", async (req, res) => {
+    const applicationFilter =
+      typeof req.query.application === "string"
+        ? req.query.application.trim()
+        : "";
+    const projectIdFilter =
+      typeof req.query.projectId === "string" ? req.query.projectId.trim() : "";
+    const sinceMs = parseQueryNumber(req.query.sinceMs);
+    const untilMs = parseQueryNumber(req.query.untilMs);
+    const limit = Math.max(
+      1,
+      Math.min(500, Math.floor(parseQueryNumber(req.query.limit) ?? 100)),
+    );
+    const offset = Math.max(
+      0,
+      Math.floor(parseQueryNumber(req.query.offset) ?? 0),
+    );
+
+    if (traceManager.queryAnalytics) {
+      const report = await traceManager.queryAnalytics("sessions", { sinceMs, untilMs, application: applicationFilter, projectId: projectIdFilter, limit, offset });
+      return res.json({ ok: true, filters: { sinceMs, untilMs, application: applicationFilter || undefined, projectId: projectIdFilter || undefined }, ...report,
+        coverage: { totalAttempts: report.summary.totalAttempts, identifiedAttempts: report.summary.attempts, ratio: report.summary.coverage }, analytics: traceManager.getPersistenceStatus().analytics });
+    }
+
+    const traces = filterVisibleTraces(
+      await readStatsHistoryRange(sinceMs, untilMs),
+    );
+    const filtered = traces.filter((t) => {
+      if (applicationFilter && t.application !== applicationFilter) return false;
+      if (projectIdFilter && t.projectId !== projectIdFilter) return false;
+      return true;
+    });
+    const { summary, sessions } = aggregateSessionUsage(filtered);
+
+    res.json({
+      ok: true,
+      filters: {
+        application: applicationFilter || undefined,
+        projectId: projectIdFilter || undefined,
+        sinceMs,
+        untilMs,
+      },
+      coverage: {
+        totalAttempts: summary.totalAttempts,
+        identifiedAttempts: summary.attempts,
+        ratio: summary.coverage,
+      },
+      summary,
+      total: sessions.length,
+      sessions: sessions.slice(offset, offset + limit),
+    });
+  });
+
+  router.get("/stats/sessions/:key/turns", async (req, res) => {
+    const sessionKey = String(req.params.key ?? "").trim().toLowerCase();
+    if (!/^[0-9a-f]{8,64}$/.test(sessionKey)) {
+      return res.status(400).json({ error: "invalid session key" });
+    }
+    const sinceMs = parseQueryNumber(req.query.sinceMs);
+    const untilMs = parseQueryNumber(req.query.untilMs);
+    if (traceManager.queryAnalytics) {
+      const report = await traceManager.queryAnalytics("turns", { sinceMs, untilMs, sessionKey, limit: parseQueryNumber(req.query.limit), offset: parseQueryNumber(req.query.offset) });
+      if (!report.total) return res.status(404).json({ error: "not found" });
+      return res.json({ ok: true, filters: { sinceMs, untilMs }, sessionKey, ...report, analytics: traceManager.getPersistenceStatus().analytics });
+    }
+    const traces = filterVisibleTraces(
+      await readStatsHistoryRange(sinceMs, untilMs),
+    );
+    const turns = sessionTurnsFor(traces, sessionKey);
+    if (!turns.length) return res.status(404).json({ error: "not found" });
+    res.json({ ok: true, filters: { sinceMs, untilMs }, sessionKey, turns });
+  });
+
+  router.get("/stats/traces", async (req, res) => {
+    const sinceMs = parseQueryNumber(req.query.sinceMs);
+    const untilMs = parseQueryNumber(req.query.untilMs);
+    const { totalStored, matched, stats } = await getTraceStats(
+      sinceMs,
+      untilMs,
+    );
+
+    res.json({
+      ok: true,
+      filters: { sinceMs, untilMs },
+      totalStored,
+      matched,
+      stats,
+      analytics: traceManager.getPersistenceStatus().analytics,
+    });
+  });
+
+  router.post("/accounts", async (req, res) => {
+    const body = req.body ?? {};
+    if (body.provider === "github-copilot") {
+      return res.status(400).json({ error: "Connect GitHub Copilot using device sign-in" });
+    }
+    if (!body.accessToken)
+      return res.status(400).json({ error: "accessToken required" });
+    const provider =
+      body.provider === "ai-sdk" ? "ai-sdk" :
+      body.provider === "mistral"
+        ? "mistral"
+        : body.provider === "zai"
+          ? "zai"
+          : body.provider === "xai"
+            ? "xai"
+          : body.provider === "opencode"
+            ? "opencode"
+          : body.provider === "openai-compatible"
+            ? "openai-compatible"
+            : "openai";
+    if (provider === "ai-sdk") {
+      try { validateSdkAccount(body); } catch (error: any) {
+        return res.status(400).json({ error: error.message });
+      }
+    }
+    const baseUrl = normalizeBaseUrl(body.baseUrl);
+    const upstreamMode = normalizeUpstreamMode(body.upstreamMode);
+    const compatibilityMode = normalizeCompatibilityMode(
+      body.compatibilityMode,
+    );
+    if (provider === "openai-compatible" && !baseUrl) {
+      return res.status(400).json({ error: "baseUrl required for openai-compatible accounts" });
+    }
+    let capacityProfile: CapacityProfile | undefined;
+    try {
+      capacityProfile = normalizeCapacityProfile(body.capacityProfile);
+    } catch (error: any) {
+      return res.status(400).json({ error: error?.message ?? String(error) });
+    }
+    const account: Account = {
+      id: body.id ?? randomUUID(),
+      provider,
+      sdkProvider: provider === "ai-sdk" ? body.sdkProvider : undefined,
+      sdkModels: provider === "ai-sdk" ? body.sdkModels : undefined,
+      upstreamMode: provider === "ai-sdk" ? "chat/completions" : upstreamMode,
+      compatibilityMode,
+      email: body.email,
+      accessToken: body.accessToken,
+      refreshToken: body.refreshToken,
+      expiresAt: body.expiresAt,
+      chatgptAccountId: body.chatgptAccountId,
+      xaiUserId: body.xaiUserId,
+      xaiAuthScope:
+        provider === "xai"
+          ? body.xaiAuthScope ??
+            `${XAI_OAUTH_ISSUER}::${XAI_OAUTH_CLIENT_ID}`
+          : undefined,
+      oidcIssuer:
+        provider === "xai"
+          ? body.oidcIssuer ?? XAI_OAUTH_ISSUER
+          : body.oidcIssuer,
+      oidcClientId:
+        provider === "xai"
+          ? body.oidcClientId ?? XAI_OAUTH_CLIENT_ID
+          : body.oidcClientId,
+      baseUrl: provider === "opencode" ? baseUrl ?? OPENCODE_BASE_URL : baseUrl,
+      location:
+        body.location === "local" || body.location === "personal-cluster" || body.location === "cloud"
+          ? body.location
+          : inferAccountLocation({ provider, baseUrl }),
+      capacityProfile,
+      enabled: body.enabled ?? true,
+      priority: body.priority ?? 0,
+      usage: body.usage,
+      state: body.state,
+    };
+    if (provider === "opencode") {
+      await refreshUsageIfNeeded(account, account.baseUrl!, true);
+    }
+    await store.addOrUpdate(account);
+    res.json({ ok: true, account: redact(account) });
+  });
+
+  router.patch("/accounts/:id", async (req, res) => {
+    const body = { ...(req.body ?? {}) };
+    if ("baseUrl" in body) {
+      body.baseUrl = normalizeBaseUrl(body.baseUrl);
+    }
+    if ("upstreamMode" in body) {
+      body.upstreamMode = normalizeUpstreamMode(body.upstreamMode);
+    }
+    if ("compatibilityMode" in body) {
+      body.compatibilityMode = normalizeCompatibilityMode(
+        body.compatibilityMode,
+      );
+    }
+    if ("location" in body && body.location !== "local" && body.location !== "personal-cluster" && body.location !== "cloud") {
+      return res.status(400).json({ error: "location must be local, personal-cluster, or cloud" });
+    }
+    if ("capacityProfile" in body) {
+      try {
+        body.capacityProfile = normalizeCapacityProfile(body.capacityProfile);
+      } catch (error: any) {
+        return res.status(400).json({ error: error?.message ?? String(error) });
+      }
+    }
+    const existing = (await store.listAccounts()).find((a) => a.id === req.params.id);
+    if (!existing) return res.status(404).json({ error: "not found" });
+    if (existing.multivibeTeam?.readOnly) return res.status(409).json({ error: "Synchronized Team providers are read-only; duplicate the provider for local changes" });
+    const next = { ...existing, ...body };
+    if (next.provider === "github-copilot") {
+      if (existing.provider !== "github-copilot") return res.status(400).json({ error: "Connect GitHub Copilot using device sign-in" });
+      try { trustedCopilotBaseUrl(next.baseUrl); } catch (error: any) { return res.status(400).json({ error: error.message }); }
+    }
+    if (next.provider === "ai-sdk") {
+      try { validateSdkAccount(next); } catch (error: any) { return res.status(400).json({ error: error.message }); }
+      body.upstreamMode = "chat/completions";
+    }
+    if (normalizeProvider(next) === "openai-compatible" && !next.baseUrl) {
+      return res.status(400).json({ error: "baseUrl required for openai-compatible accounts" });
+    }
+    const updated = await store.patchAccount(req.params.id, body);
+    if (!updated) return res.status(404).json({ error: "not found" });
+    await store.flushIfDirty();
+    res.json({ ok: true, account: redact(updated) });
+  });
+
+  router.delete("/accounts/:id", async (req, res) => {
+    const existing=(await store.listAccounts()).find(account=>account.id===req.params.id);
+    if(existing?.multivibeTeam?.readOnly)return res.status(409).json({error:"Synchronized Team providers must be removed from Multivibe Cloud"});
+    const ok = await store.deleteAccount(req.params.id);
+    if (!ok) return res.status(404).json({ error: "not found" });
+    res.json({ ok: true });
+  });
+
+  router.post("/accounts/:id/unblock", async (req, res) => {
+    const account = (await store.listAccounts()).find(
+      (a) => a.id === req.params.id,
+    );
+    if (!account) return res.status(404).json({ error: "not found" });
+    const targetModel = typeof req.query.model === "string" && req.query.model.trim()
+      ? req.query.model.trim().toLowerCase()
+      : undefined;
+    if (targetModel) {
+      const modelBlocks = { ...account.state?.modelBlocks };
+      delete modelBlocks[targetModel];
+      account.state = { ...account.state, modelBlocks };
+    } else {
+      account.state = { ...account.state, modelBlocks: {} };
+    }
+    await store.addOrUpdate(account);
+    res.json({ ok: true, account: redact(account) });
+  });
+
+  router.post("/accounts/:id/refresh-usage", async (req, res) => {
+    let account = (await store.listAccounts()).find(
+      (a) => a.id === req.params.id,
+    );
+    if (!account) return res.status(404).json({ error: "not found" });
+    account = await ensureValidToken(account, oauthConfig);
+    await refreshUsageIfNeeded(account, usageBaseUrlForAccount(account), true);
+    await store.addOrUpdate(account);
+    await maybeConsumeScheduledWeeklyReset(account.id, store, openaiBaseUrl);
+    res.json({ ok: true, account: redact(account) });
+  });
+
+  router.get("/accounts/:id/rate-limit-reset-credit", async (req, res) => {
+    let account = (await store.listAccounts()).find(
+      (candidate) => candidate.id === req.params.id,
+    );
+    if (!account) return res.status(404).json({ error: "not found" });
+    if (normalizeProvider(account) !== "openai") {
+      return res.status(400).json({ error: "only OpenAI accounts support reset credits" });
+    }
+    account = await ensureValidToken(account, oauthConfig);
+    await store.addOrUpdate(account);
+    try {
+      const credit = await rateLimitResetCreditRequest(account, openaiBaseUrl, false);
+      res.json({ ok: true, credit });
+    } catch (error: any) {
+      res.status(502).json({ error: error?.message ?? String(error) });
+    }
+  });
+
+  router.post("/accounts/:id/rate-limit-reset-credit/consume", async (req, res) => {
+    let account = (await store.listAccounts()).find(
+      (candidate) => candidate.id === req.params.id,
+    );
+    if (!account) return res.status(404).json({ error: "not found" });
+    if (normalizeProvider(account) !== "openai") {
+      return res.status(400).json({ error: "only OpenAI accounts support reset credits" });
+    }
+    account = await ensureValidToken(account, oauthConfig);
+    await store.addOrUpdate(account);
+    try {
+      const result = await rateLimitResetCreditRequest(account, openaiBaseUrl, true);
+      await refreshUsageIfNeeded(account, openaiBaseUrl, true);
+      await store.addOrUpdate(account);
+      res.json({ ok: true, result, account: redact(account) });
+    } catch (error: any) {
+      res.status(502).json({ error: error?.message ?? String(error) });
+    }
+  });
+
+  router.post("/accounts/:id/rate-limit-reset-credit/schedule", async (req, res) => {
+    let account = (await store.listAccounts()).find(
+      (candidate) => candidate.id === req.params.id,
+    );
+    if (!account) return res.status(404).json({ error: "not found" });
+    if (normalizeProvider(account) !== "openai") {
+      return res.status(400).json({ error: "only OpenAI accounts support reset credits" });
+    }
+    if (account.state?.scheduledWeeklyReset) {
+      return res.status(409).json({ error: "an automatic weekly reset is already scheduled" });
+    }
+
+    // Scheduling is a local, persisted operation. Do not refresh usage,
+    // refresh authentication, check credit availability, or contact the reset
+    // endpoint until the monitor observes the configured quota threshold.
+    await scheduleWeeklyReset(account, store);
+    res.json({ ok: true, account: redact(account) });
+  });
+
+  router.delete("/accounts/:id/rate-limit-reset-credit/schedule", async (req, res) => {
+    const account = (await store.listAccounts()).find(
+      (candidate) => candidate.id === req.params.id,
+    );
+    if (!account) return res.status(404).json({ error: "not found" });
+    const { scheduledWeeklyReset: _cancelled, ...remainingState } =
+      account.state ?? {};
+    account.state = remainingState;
+    await store.addOrUpdate(account);
+    res.json({ ok: true, account: redact(account) });
+  });
+
+  router.post("/usage/refresh", async (_req, res) => {
+    const accounts = await refreshAccountsUsage(true);
+    res.json({
+      ok: true,
+      accounts: accounts.map(redact),
+    });
+  });
+
+  // The dashboard uses this endpoint for lightweight polling. Fresh usage
+  // snapshots are left untouched; snapshots whose cache TTL or quota reset
+  // has elapsed are refreshed before the current account state is returned.
+  router.post("/usage/refresh-stale", async (_req, res) => {
+    const accounts = await refreshStaleAccountsUsage();
+    res.json({
+      ok: true,
+      accounts: accounts.map(redact),
+    });
+  });
+
+  async function completeOpenAiOAuthFlow(
+    flow: NonNullable<Awaited<ReturnType<OAuthStateStore["get"]>>>,
+    code: string,
+    codeVerifier: string,
+    redirectUri?: string,
+  ) {
+    const tokenData = await exchangeCodeForToken(
+      oauthConfig,
+      code,
+      codeVerifier,
+      redirectUri,
+    );
+    let account: Account;
+    const accounts = await store.listAccounts();
+    if (flow.targetAccountId) {
+      const existing = accounts.find((a) => a.id === flow.targetAccountId);
+      if (!existing) {
+        throw new Error("target account not found for reauth");
+      }
+      account = mergeTokenIntoAccount(existing, tokenData);
+    } else {
+      const created = accountFromOAuth(flow, tokenData);
+      const duplicate = created.chatgptAccountId
+        ? accounts.find((candidate) =>
+            candidate.chatgptAccountId === created.chatgptAccountId,
+          )
+        : undefined;
+      account = duplicate
+        ? mergeTokenIntoAccount(duplicate, tokenData)
+        : created;
+    }
+    account = await refreshUsageIfNeeded(account, openaiBaseUrl, true);
+    await store.addOrUpdate(account);
+    await oauthStore.update(flow.id, {
+      status: "success",
+      completedAt: Date.now(),
+      accountId: account.id,
+    });
+    return account;
+  }
+
+  function deviceExpiresAt(device: { expires_at?: number | string; expires_in?: number | string }) {
+    if (device.expires_at !== undefined) {
+      const raw = device.expires_at;
+      const numeric = Number(raw);
+      if (Number.isFinite(numeric)) {
+        return numeric > 10_000_000_000 ? numeric : numeric * 1000;
+      }
+      const parsed = Date.parse(String(raw));
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return Date.now() + (Number(device.expires_in ?? 900) || 900) * 1000;
+  }
+
+  router.post("/oauth/start", createAuthRateLimiter({ limit: 10 }), async (req, res) => {
+    const email = String(req.body?.email ?? "").trim();
+    const targetAccountId = String(req.body?.accountId ?? "").trim() || undefined;
+    const provider =
+      req.body?.provider === "github-copilot" ? "github-copilot" :
+      req.body?.provider === "xai"
+        ? "xai"
+        : req.body?.provider === "opencode"
+          ? "opencode"
+          : "openai";
+    const method =
+      provider === "github-copilot" || provider === "xai" || provider === "opencode" || req.body?.method === "device"
+        ? "device"
+        : "browser";
+    if (provider === "openai" && !email) {
+      return res.status(400).json({ error: "email required" });
+    }
+    if (targetAccountId) {
+      const account = (await store.listAccounts()).find((a) => a.id === targetAccountId);
+      if (!account) return res.status(404).json({ error: "account not found" });
+      if (normalizeProvider(account) !== provider) {
+        return res.status(400).json({
+          error: `oauth reauth target must be a ${provider} account`,
+        });
+      }
+    }
+    const flow = createOAuthState(email, targetAccountId, method, provider);
+    if (method === "device") {
+      try {
+        if (provider === "xai") {
+          const device = await requestXaiDeviceCode();
+          await oauthStore.create({
+            ...flow,
+            deviceAuthId: device.deviceCode,
+            userCode: device.userCode,
+            verificationUrl:
+              device.verificationUrlComplete ?? device.verificationUrl,
+            intervalSeconds: device.intervalSeconds,
+            expiresAt: device.expiresAt,
+          });
+          if (options.hostApplication) publishDeviceSignIn({ id: flow.id, provider, code: device.userCode, expiresAt: device.expiresAt });
+          return res.json({
+            ok: true,
+            flowId: flow.id,
+            provider,
+            method,
+            userCode: device.userCode,
+            verificationUrl:
+              device.verificationUrlComplete ?? device.verificationUrl,
+            intervalSeconds: device.intervalSeconds,
+            expiresAt: device.expiresAt,
+          });
+        }
+        if (provider === "opencode" || provider === "github-copilot") {
+          const device = provider === "github-copilot" ? await requestCopilotDeviceCode() : await requestOpenCodeDeviceCode();
+          await oauthStore.create({
+            ...flow,
+            deviceAuthId: device.deviceCode,
+            userCode: device.userCode,
+            verificationUrl: device.verificationUrl,
+            intervalSeconds: device.intervalSeconds,
+            expiresAt: device.expiresAt,
+          });
+          if (options.hostApplication) publishDeviceSignIn({ id: flow.id, provider, code: device.userCode, expiresAt: device.expiresAt });
+          return res.json({
+            ok: true,
+            flowId: flow.id,
+            provider,
+            method,
+            userCode: device.userCode,
+            verificationUrl: device.verificationUrl,
+            intervalSeconds: device.intervalSeconds,
+            expiresAt: device.expiresAt,
+          });
+        }
+        const device = await requestDeviceCode(oauthConfig);
+        const intervalSeconds = Number(device.interval ?? 5) || 5;
+        const expiresAt = deviceExpiresAt(device);
+        const verificationUrl =
+          device.verification_url ??
+          device.verification_uri ??
+          oauthConfig.deviceVerificationUrl;
+        await oauthStore.create({
+          ...flow,
+          deviceAuthId: device.device_auth_id,
+          userCode: device.user_code,
+          verificationUrl,
+          intervalSeconds,
+          expiresAt,
+        });
+        if (options.hostApplication) publishDeviceSignIn({ id: flow.id, provider, code: device.user_code, expiresAt });
+        return res.json({
+          ok: true,
+          flowId: flow.id,
+          method,
+          userCode: device.user_code,
+          verificationUrl,
+          intervalSeconds,
+          expiresAt,
+        });
+      } catch (err: any) {
+        return res.status(500).json({
+          error: `Device authorization failed: ${err?.message ?? String(err)}`,
+        });
+      }
+    }
+
+    await oauthStore.create(flow);
+    const authorizeUrl = buildAuthorizationUrl(oauthConfig, flow);
+    res.json({
+      ok: true,
+      flowId: flow.id,
+      method,
+      authorizeUrl,
+      expectedRedirectUri: oauthConfig.redirectUri,
+    });
+  });
+
+  router.get("/oauth/status/:flowId", async (req, res) => {
+    const flow = await oauthStore.get(req.params.flowId);
+    if (!flow) return res.status(404).json({ error: "not found" });
+    res.json({
+      ok: true,
+      flow: {
+        ...flow,
+        codeVerifier: undefined,
+        deviceAuthId: undefined,
+      },
+    });
+  });
+
+  router.post("/oauth/complete", createAuthRateLimiter({ limit: 30 }), async (req, res) => {
+    const flowId = String(req.body?.flowId ?? "").trim();
+    const input = String(req.body?.input ?? "").trim();
+    if (!flowId || !input)
+      return res
+        .status(400)
+        .json({ error: "flowId and input are required" });
+
+    const flow = await oauthStore.get(flowId);
+    if (!flow) return res.status(404).json({ error: "flow not found" });
+    if (flow.provider === "github-copilot" || flow.provider === "xai" || flow.provider === "opencode") {
+      return res.status(400).json({
+        error: `${flow.provider === "github-copilot" ? "GitHub Copilot" : flow.provider === "xai" ? "Grok Build" : "OpenCode"} OAuth uses the device-code completion endpoint`,
+      });
+    }
+
+    const parsed = parseAuthorizationInput(input);
+    if (!parsed.code)
+      return res.status(400).json({ error: "missing code in pasted input" });
+    if (parsed.state && parsed.state !== flow.id)
+      return res.status(400).json({ error: "state mismatch" });
+
+    try {
+      const account = await completeOpenAiOAuthFlow(flow, parsed.code, flow.codeVerifier);
+      return res.json({ ok: true, account: redact(account) });
+    } catch (err: any) {
+      const message = err?.message ?? String(err);
+      await oauthStore.update(flow.id, {
+        status: "error",
+        error: message,
+        completedAt: Date.now(),
+      });
+      return res
+        .status(500)
+        .json({ error: `OAuth exchange failed: ${message}` });
+    }
+  });
+
+  router.post("/oauth/device/poll", createAuthRateLimiter({ limit: 60 }), async (req, res) => {
+    const flowId = String(req.body?.flowId ?? "").trim();
+    if (!flowId) return res.status(400).json({ error: "flowId is required" });
+
+    const flow = await oauthStore.get(flowId);
+    if (!flow) return res.status(404).json({ error: "flow not found" });
+    if (flow.method !== "device") {
+      return res.status(400).json({ error: "flow is not a device authorization flow" });
+    }
+    // Authorization codes are single-use. A dashboard refresh failure must not
+    // exchange an already completed code again on the next poll.
+    if (flow.status === "success") {
+      const account = (await store.listAccounts()).find((account) => account.id === flow.accountId);
+      return res.json({ ok: true, status: "success", account: account ? redact(account) : undefined });
+    }
+    if (flow.status === "error") return res.status(400).json({ error: "Device authorization failed. Start a new sign-in." });
+    if (flow.expiresAt && flow.expiresAt < Date.now()) {
+      await oauthStore.update(flow.id, {
+        status: "error",
+        error: "device code expired",
+        completedAt: Date.now(),
+      });
+      return res.status(410).json({ error: "device code expired" });
+    }
+
+    try {
+      if (flow.provider === "github-copilot") {
+        if (!flow.deviceAuthId) throw new Error("GitHub device code is missing");
+        const result = await pollCopilotDeviceCode(flow.deviceAuthId, flow.intervalSeconds);
+        if (result.status === "pending") {
+          await oauthStore.update(flow.id, { intervalSeconds: result.intervalSeconds });
+          return res.json({ ok: true, status: "pending", intervalSeconds: result.intervalSeconds });
+        }
+        const existing = flow.targetAccountId
+          ? (await store.listAccounts()).find((account) => account.id === flow.targetAccountId)
+          : undefined;
+        if (flow.targetAccountId && (!existing || normalizeProvider(existing) !== "github-copilot")) {
+          throw new Error("Target GitHub Copilot account not found for reauth");
+        }
+        const account = await accountFromCopilotOAuth(flow, result.githubToken, existing);
+        await refreshUsageIfNeeded(account, account.baseUrl ?? COPILOT_BASE_URL, true);
+        await store.addOrUpdate(account);
+        await oauthStore.update(flow.id, { status: "success", completedAt: Date.now(), accountId: account.id });
+        return res.json({ ok: true, status: "success", account: redact(account) });
+      }
+      if (flow.provider === "opencode") {
+        if (!flow.deviceAuthId) {
+          throw new Error("OpenCode device authorization is missing its device code");
+        }
+        const result = await pollOpenCodeDeviceCode(
+          flow.deviceAuthId,
+          flow.intervalSeconds,
+        );
+        if (result.status === "pending") {
+          await oauthStore.update(flow.id, {
+            intervalSeconds: result.intervalSeconds,
+          });
+          return res.json({
+            ok: true,
+            status: "pending",
+            intervalSeconds: result.intervalSeconds,
+          });
+        }
+        const accounts = await store.listAccounts();
+        const existing = flow.targetAccountId
+          ? accounts.find((account) => account.id === flow.targetAccountId)
+          : undefined;
+        if (flow.targetAccountId && !existing) {
+          throw new Error("target OpenCode account not found for reauth");
+        }
+        let account = await accountFromOpenCodeOAuth(flow, result.token, existing);
+        if (!existing && account.opencodeAccountId) {
+          const duplicate = accounts.find(
+            (candidate) =>
+              normalizeProvider(candidate) === "opencode" &&
+              candidate.opencodeAccountId === account.opencodeAccountId &&
+              candidate.opencodeOrgId === account.opencodeOrgId,
+          );
+          if (duplicate) {
+            account = await accountFromOpenCodeOAuth(flow, result.token, duplicate);
+          }
+        }
+        account = await refreshUsageIfNeeded(
+          account,
+          account.baseUrl ?? OPENCODE_BASE_URL,
+          true,
+        );
+        await store.addOrUpdate(account);
+        await oauthStore.update(flow.id, {
+          status: "success",
+          completedAt: Date.now(),
+          accountId: account.id,
+        });
+        return res.json({
+          ok: true,
+          status: "success",
+          account: redact(account),
+        });
+      }
+      if (flow.provider === "xai") {
+        if (!flow.deviceAuthId) {
+          throw new Error("xAI device authorization is missing its device code");
+        }
+        const result = await pollXaiDeviceCode(
+          flow.deviceAuthId,
+          flow.intervalSeconds,
+        );
+        if (result.status === "pending") {
+          await oauthStore.update(flow.id, {
+            intervalSeconds: result.intervalSeconds,
+          });
+          return res.json({
+            ok: true,
+            status: "pending",
+            intervalSeconds: result.intervalSeconds,
+          });
+        }
+        const existing = flow.targetAccountId
+          ? (await store.listAccounts()).find(
+              (account) => account.id === flow.targetAccountId,
+            )
+          : undefined;
+        if (flow.targetAccountId && !existing) {
+          throw new Error("target xAI account not found for reauth");
+        }
+        const account = accountFromXaiOAuth(flow, result.token, existing);
+        await refreshUsageIfNeeded(
+          account,
+          account.baseUrl ?? XAI_BASE_URL,
+          true,
+        );
+        await store.addOrUpdate(account);
+        await oauthStore.update(flow.id, {
+          status: "success",
+          completedAt: Date.now(),
+          accountId: account.id,
+        });
+        return res.json({
+          ok: true,
+          status: "success",
+          account: redact(account),
+        });
+      }
+      console.log("[oauth-device] polling OpenAI", {
+        flowId: flow.id,
+        userCode: flow.userCode,
+      });
+      const codeData = await pollDeviceCode(oauthConfig, flow);
+      console.log("[oauth-device] OpenAI approved", { flowId: flow.id });
+      if (!codeData.code_verifier) {
+        throw new Error("device authorization response missing code_verifier");
+      }
+      const account = await completeOpenAiOAuthFlow(
+        flow,
+        codeData.authorization_code,
+        codeData.code_verifier,
+        oauthConfig.deviceRedirectUri,
+      );
+      return res.json({ ok: true, status: "success", account: redact(account) });
+    } catch (err: any) {
+      const message = err?.message ?? String(err);
+      const pendingErrors = new Set([
+        "authorization_pending",
+        "deviceauth_authorization_pending",
+        "deviceauth_authorization_unknown",
+      ]);
+      if (pendingErrors.has(message)) {
+        console.log("[oauth-device] OpenAI pending", {
+          flowId: flow.id,
+          status: message,
+        });
+        return res.json({
+          ok: true,
+          status: "pending",
+          intervalSeconds: flow.intervalSeconds ?? 5,
+        });
+      }
+      await oauthStore.update(flow.id, {
+        status: "error",
+        error: message,
+        completedAt: Date.now(),
+      });
+      console.error("[oauth-device] OpenAI poll failed", {
+        flowId: flow.id,
+        error: message,
+      });
+      return res.status(500).json({ error: `Device authorization failed: ${message}` });
+    }
+  });
+
+  return router;
+}

@@ -1,0 +1,144 @@
+import { useDashboardApi, useDashboardRuntime } from "../../adapter";
+import { useEffect, useMemo, useState } from 'react';
+import type { Account, ExposedModel } from '../../types';
+
+import { aggregateModels, filterCatalog, mergeCloudModelPage, type CloudModel, type ModelRoute } from '../../lib/modelCatalog';
+import type { CloudProvider } from '../ProviderPicker';
+import './ModelsTab.css';
+import { verifiedCloudCatalog, type CloudAccess } from '../../lib/modelGuidance';
+
+const coreSources = [{ id: 'all', label: 'All sources' }, { id: 'provider', label: 'Providers' }, { id: 'cloud', label: 'MultiVibe Cloud' }];
+const PAGE_SIZE = 20;
+
+export function ModelsTab({ canConfigure = true, models, accounts, cloudConnected, onUse, onConfigure, onConnectCloud, onDetails }: {
+  canConfigure?: boolean; models: ExposedModel[]; accounts: Account[]; cloudConnected: boolean;
+  onDetails?: (id: string) => void;
+  onUse: (id: string) => void; onConfigure: (route: ModelRoute) => void; onConnectCloud: () => Promise<void>;
+}) {
+  const api = useDashboardApi();
+  const { capabilities } = useDashboardRuntime();
+  const sources = capabilities.host ? coreSources : [{id:'all',label:'All sources'},{id:'cloud',label:'MultiVibe'},{id:'personal',label:'Personal connections'},{id:'team',label:'Team'}];
+  const [cloudAccess, setCloudAccess] = useState<CloudAccess>();
+  const [accessRequest, setAccessRequest] = useState(0);
+  useEffect(() => {
+    setCloudAccess(undefined);
+    if (!cloudConnected || !canConfigure) return;
+    const controller = new AbortController();
+    void api('cloud/accessible-models', { signal: controller.signal }).then((result: CloudAccess) => {
+      if (!controller.signal.aborted) setCloudAccess(result);
+    }).catch(() => { if (!controller.signal.aborted) setCloudAccess({ status: 'unavailable', modelIds: [], checkedAt: '' }); });
+    return () => controller.abort();
+  }, [cloudConnected, canConfigure, accessRequest]);
+  const [cloud, setCloud] = useState<CloudModel[]>([]);
+  const [catalogCursor, setCatalogCursor] = useState('');
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [catalogMoreError, setCatalogMoreError] = useState('');
+  const [catalogError, setCatalogError] = useState('');
+  const [catalogRequest, setCatalogRequest] = useState(0);
+  const [providers, setProviders] = useState<CloudProvider[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [connectionError, setConnectionError] = useState('');
+  const [query, setQuery] = useState('');
+  const [source, setSource] = useState('all');
+  const [provider, setProvider] = useState('all');
+  const [readyOnly, setReadyOnly] = useState(false);
+  const [sort, setSort] = useState('ready');
+  const [page, setPage] = useState(0);
+  const [connecting, setConnecting] = useState(false);
+  useEffect(() => {
+    let active = true;
+    if (!canConfigure) { setLoading(false); return; }
+    setLoading(true);
+    setCatalogError('');
+    void Promise.allSettled([api('cloud/models'), api('provider-catalog')]).then(([cloudResult, providerResult]) => {
+      if (!active) return;
+      if (cloudResult.status === 'fulfilled') {
+        setCloud(cloudResult.value.models);
+        setCatalogCursor(typeof cloudResult.value.nextCursor === 'string' ? cloudResult.value.nextCursor : '');
+      }
+      if (providerResult.status === 'fulfilled') setProviders(providerResult.value.providers);
+      setCatalogError([cloudResult.status === 'rejected' ? 'MultiVibe Cloud discovery catalog could not be loaded.' : '', providerResult.status === 'rejected' ? 'Provider discovery catalog could not be loaded.' : ''].filter(Boolean).join(' '));
+      setLoading(false);
+    });
+    return () => { active = false; };
+  }, [canConfigure, catalogRequest]);
+  const loadMoreCatalog = async () => {
+    if (!catalogCursor || loadingMore) return;
+    const cursor = catalogCursor;
+    setLoadingMore(true);
+    setCatalogMoreError('');
+    try {
+      const result = await api(`cloud/models?cursor=${encodeURIComponent(cursor)}`);
+      setCloud(current => mergeCloudModelPage(current, result.models ?? []));
+      const next = typeof result.nextCursor === 'string' ? result.nextCursor : '';
+      if (next === cursor) {
+        setCatalogCursor('');
+        setCatalogMoreError('The catalog did not advance. Refresh it before trying again.');
+      } else setCatalogCursor(next);
+    } catch {
+      setCatalogMoreError('More models could not be loaded. Try again.');
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+  const rawCatalog = useMemo(() => aggregateModels(models, accounts, canConfigure ? cloud : [], canConfigure ? providers : []), [models, accounts, cloud, providers, canConfigure]);
+  const catalog = useMemo(() => canConfigure ? verifiedCloudCatalog(rawCatalog, cloudAccess, cloudConnected) : rawCatalog, [rawCatalog, cloudAccess, cloudConnected, canConfigure]);
+  const providerOptions = useMemo(() => [...new Set(catalog.flatMap(model => model.routes.filter(route => source === 'all' || (route.source === source || route.accessSource === source)).map(route => route.label)))].sort((a, b) => a.localeCompare(b)), [catalog, source]);
+  const filtered = useMemo(() => filterCatalog(catalog, { query, source, provider, readyOnly, sort }), [catalog, query, source, provider, readyOnly, sort]);
+  const pages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const currentPage = Math.min(page, pages - 1);
+  const activeFilters = Boolean(query || source !== 'all' || provider !== 'all' || readyOnly);
+  const reset = () => { setQuery(''); setSource('all'); setProvider('all'); setReadyOnly(false); setPage(0); };
+  const connect = async () => {
+    setConnecting(true);
+    setConnectionError('');
+    try { await onConnectCloud(); } catch { setConnectionError('Could not connect to MultiVibe Cloud. Please try again.'); }
+    finally { setConnecting(false); }
+  };
+  const useRoute = (route: ModelRoute) => {
+    if (!canConfigure && !cloudConnected) return;
+    if (route.ready) onUse(route.modelId);
+    else if (!canConfigure) return;
+    else if (capabilities.cloudConnection && route.source === 'cloud' && !cloudConnected) void connect();
+    else onConfigure(route);
+  };
+  const actionLabel = (route: ModelRoute) => route.ready ? canConfigure ? 'Use model' : 'Open chat' : !canConfigure ? 'Ask your admin' : route.source === 'cloud' ? cloudConnected || !capabilities.cloudConnection ? 'View access' : 'Connect Cloud' : 'Set up';
+  return <section className="models-catalog" aria-label="Models">
+    <header className="models-page-heading"><div><h2>Find the right model</h2><p>Explore your connected providers and MultiVibe Cloud models.</p></div></header>
+    {cloudConnected && canConfigure && <div className="models-access-notice" role="status">
+      {!cloudAccess ? 'Checking your Cloud access…' : cloudAccess.status === 'available'
+        ? !cloudAccess.modelIds.length ? 'No models exposed for your Cloud account.'
+          : !catalog.some(model => model.routes.some(route => route.source === 'cloud' && route.ready)) ? 'Cloud exposes models, but no matching chat route is available here.' : 'Cloud catalog verified for your account.'
+        : cloudAccess.status === 'access_denied' ? 'Cloud access denied or expired. Check your connection.' : cloudAccess.status === 'disconnected' ? 'Cloud account disconnected.' : 'Could not verify your Cloud access.'}
+      <button className="models-text-button" disabled={!cloudAccess} onClick={() => { setCloudAccess(undefined); setAccessRequest(value => value + 1); }}>Check again</button>
+    </div>}
+    <div className="models-layout models-expert-library">
+      <details className="models-expert-filters"><summary>Filters{activeFilters ? ' · Active filters' : ''}</summary><div className="models-sidebar" aria-label="Model filters">
+        <div className="models-filter-heading"><strong>Filters</strong>{activeFilters && <button className="models-text-button" onClick={reset}>Reset</button>}</div>
+        <fieldset><legend>Source</legend>{sources.map(item => <button key={item.id} className="models-source" aria-pressed={source === item.id} onClick={() => { setSource(item.id); setProvider('all'); setPage(0); }}><span>{item.label}</span><span>{catalog.filter(model => item.id === 'all' || model.routes.some(route => (route.source === item.id || route.accessSource === item.id))).length.toLocaleString('en-US')}</span></button>)}</fieldset>
+        <fieldset><legend>Availability</legend><label className="models-ready"><input type="checkbox" checked={readyOnly} onChange={event => { setReadyOnly(event.target.checked); setPage(0); }} /> Ready to use</label><p className="muted">Models with a connected, available account.</p></fieldset>
+        <label className="models-provider">Provider<select value={provider} onChange={event => { setProvider(event.target.value); setPage(0); }}><option value="all">All providers</option>{providerOptions.map(name => <option key={name} value={name}>{name}</option>)}</select></label>
+        <div className="models-cloud-card"><strong>MultiVibe Cloud</strong><p className="muted">Cloud access depends on your plan and available capacity.</p>{capabilities.cloudConnection && !cloudConnected && <button className="btn ghost" disabled={connecting} onClick={() => void connect()}>{connecting ? 'Connecting…' : 'Connect Cloud'}</button>}</div>
+      </div></details>
+      <div className="models-results" aria-busy={loading}>
+        {catalogError && <p className="models-error" role="alert">{catalogError} <button className="btn ghost" disabled={loading} onClick={() => setCatalogRequest(value => value + 1)}>Retry catalogs</button></p>}
+        <div className="models-toolbar"><label className="models-search"><span className="sr-only">Search models</span><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg><input type="search" value={query} placeholder="Search models or providers…" onChange={event => { setQuery(event.target.value); setPage(0); }} /></label><select aria-label="Sort models" value={sort} onChange={event => { setSort(event.target.value); setPage(0); }}><option value="ready">Ready to use first</option><option value="name">Name: A–Z</option><option value="name-desc">Name: Z–A</option></select></div>
+        {connectionError && <p className="models-error" role="alert">{connectionError}</p>}
+        <div className="models-result-bar"><span role="status"><strong>{filtered.length.toLocaleString('en-US')}</strong> models{loading ? ' · Updating catalogs…' : filtered.length ? ` · Showing ${currentPage * PAGE_SIZE + 1}–${Math.min((currentPage + 1) * PAGE_SIZE, filtered.length)}` : ''}</span>{activeFilters && <button className="models-text-button" onClick={reset}>Clear filters</button>}</div>
+        <div className="models-list-head" aria-hidden="true"><span>Model / provider</span><span>Availability</span><span /></div>
+        <ul className="models-list">{filtered.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE).map(model => {
+          const ready = model.routes.find(route => route.ready);
+          const preferred = ready ?? model.routes.find(route => route.accountId) ?? model.routes.find(route => route.source === 'cloud') ?? model.routes[0];
+          return <li key={model.id}><div className="models-row"><div className="models-identity"><span className={`models-mark${model.logo ? ' has-logo' : ''}`} aria-hidden="true">{model.logo ? <img src={`/assets/catalog-icons/models/${model.logo}`} alt="" loading="lazy" decoding="async" /> : model.name.replace(/^(hf|openrouter):/, '').slice(0, 2).toUpperCase()}</span><div className="models-copy"><strong>{model.name}</strong><code>{model.id}</code><span className="muted">{[...new Set(model.routes.map(route => route.label))].join(' · ')}</span>{preferred.priceSummary && <span className="muted">{preferred.priceSummary}</span>}</div></div><span className={`models-status${ready ? ' is-ready' : ''}`}><i />{ready ? 'Ready to use' : (preferred.availabilityLabel ?? 'Unavailable')}</span><div className="inline wrap">{onDetails && <button className="btn ghost" aria-label={`Details: ${model.name}`} onClick={() => onDetails(model.id)}>Details</button>}{(canConfigure || cloudConnected) && <button className={`btn ${ready ? '' : 'ghost'}`} disabled={connecting || (!canConfigure && !preferred.ready)} aria-label={`${actionLabel(preferred)}: ${model.name}`} onClick={() => useRoute(preferred)}>{actionLabel(preferred)}<span aria-hidden="true"> →</span></button>}</div></div>
+            {model.routes.length > 1 && <details className="models-routes"><summary>View {model.routes.length} connection options</summary><ul>{model.routes.map((route, index) => <li key={index}><div><strong>{route.label}</strong><span className="muted">{route.availabilityLabel ?? (route.ready ? 'Ready to use' : 'Unavailable')}{route.priceSummary ? ` · ${route.priceSummary}` : ''} · {route.source === 'local' ? 'Local' : route.source === 'cloud' ? 'Cloud' : 'Provider'}</span></div>{(canConfigure || cloudConnected) && <button className="btn ghost" disabled={connecting || (!canConfigure && !route.ready)} onClick={() => useRoute(route)}>{actionLabel(route)}</button>}</li>)}</ul></details>}
+          </li>;
+        })}</ul>
+        {!filtered.length && <div className="models-empty"><h3>{loading ? 'Loading your model library…' : activeFilters ? 'No models match your filters' : 'Your model library is empty'}</h3><p className="muted">{loading ? 'Connected models will appear as catalogs become available.' : activeFilters ? 'Try a different search, source, or provider.' : 'Connect a provider or refresh the catalog to get started.'}</p>{activeFilters && <button className="btn ghost" onClick={reset}>Clear filters</button>}</div>}
+        {pages > 1 && <nav className="models-pagination" aria-label="Model pages"><button className="btn ghost" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>← Previous</button><label>Page<select aria-label="Go to page" value={currentPage} onChange={event => setPage(Number(event.target.value))}>{Array.from({ length: pages }, (_, index) => <option key={index} value={index}>{index + 1}</option>)}</select>of {pages}</label><button className="btn ghost" disabled={currentPage + 1 === pages} onClick={() => setPage(currentPage + 1)}>Next →</button></nav>}
+        {catalogCursor && <div className="models-pagination"><button className="btn ghost" disabled={loadingMore} onClick={() => void loadMoreCatalog()}>{loadingMore ? 'Loading more…' : 'Load more models'}</button></div>}
+        {catalogMoreError && <p className="models-error" role="alert">{catalogMoreError}{catalogCursor && <button className="models-text-button" disabled={loadingMore} onClick={() => void loadMoreCatalog()}>Try again</button>}</p>}
+
+      </div>
+    </div>
+  </section>;
+}

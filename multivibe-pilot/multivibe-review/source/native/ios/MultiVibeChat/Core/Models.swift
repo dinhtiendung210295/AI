@@ -1,0 +1,929 @@
+import MultiVibeSDK
+
+// Preserve the app-internal parser names for existing native tests.
+typealias SSEParser = MultiVibeSDK.SSEParser
+typealias SSEByteParser = MultiVibeSDK.SSEByteParser
+import AuthenticationServices
+import Foundation
+
+/// App-owned limits for both on-device inference adapters, independent of Cloud consent.
+struct HermesOnDeviceCapabilities: Encodable, Sendable {
+    static let current = HermesOnDeviceCapabilities()
+    let schemaVersion = 1
+    let profile = "ios_degraded"
+    let linuxShell = false
+    let packageInstallation = false
+    let skillScriptExecution = false
+    let directCloudFilesystemAccess = false
+
+    var title: String { "Hermes · sur cet appareil" }
+    var summary: String {
+        "Mode local limité : commandes Linux, installation de paquets et scripts de skills indisponibles. Les outils proposés conservent leurs autorisations habituelles."
+    }
+
+    func promptInstructions() throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let descriptor = String(decoding: try encoder.encode(self), as: UTF8.self)
+        return """
+        App-owned Hermes runtime capabilities: \(descriptor)
+        This is the degraded iOS on-device runtime. Only supplied tools and explicitly selected cached context are available; Cloud authorization does not grant Linux shell commands, package installation, skill script execution or direct Cloud filesystem access.
+        Supplied Internet, device and local automation tools remain subject to their existing permissions and availability. If no tools are supplied, do not claim tool access or execution. Do not infer that Internet is always unavailable from local inference.
+        Successful queued writes are saved on this device with synchronization pending; they are not already Cloud writes. Never claim Cloud synchronization completed without confirmation.
+        """
+    }
+}
+
+struct HomeSuggestion: Codable, Identifiable, Equatable, Sendable {
+    enum InputSource: String, Codable, CaseIterable, Sendable { case none, clipboard }
+    enum Behavior: String, Codable, CaseIterable, Sendable { case prepare, send }
+    var id: UUID
+    var title: String
+    var systemImage: String
+    var instruction: String
+    var inputSource: InputSource
+    var behavior: Behavior
+
+    static let defaults: [HomeSuggestion] = [
+        .init(id: UUID(uuidString: "7FD514A0-2A15-48C4-A099-000000000001")!, title: "Trouver l’inspiration", systemImage: "lightbulb", instruction: "Aide-moi à trouver des idées pour", inputSource: .none, behavior: .prepare),
+        .init(id: UUID(uuidString: "7FD514A0-2A15-48C4-A099-000000000002")!, title: "M’aider à écrire", systemImage: "pencil.line", instruction: "Aide-moi à rédiger", inputSource: .none, behavior: .prepare),
+        .init(id: UUID(uuidString: "7FD514A0-2A15-48C4-A099-000000000003")!, title: "Comprendre un sujet", systemImage: "text.book.closed", instruction: "Explique-moi simplement", inputSource: .none, behavior: .prepare)
+    ]
+}
+
+@MainActor enum HomeSuggestionStore {
+    static let key = "cloud.multivibe.chat.home-suggestions-v1"
+    static func load(from defaults: UserDefaults = .standard) -> [HomeSuggestion] {
+        guard let data = defaults.data(forKey: key),
+              let values = try? JSONDecoder().decode([HomeSuggestion].self, from: data), !values.isEmpty else {
+            return HomeSuggestion.defaults
+        }
+        return Array(values.prefix(12))
+    }
+    static func save(_ values: [HomeSuggestion], to defaults: UserDefaults = .standard) {
+        let bounded = Array(values.prefix(12))
+        guard !bounded.isEmpty, let data = try? JSONEncoder().encode(bounded) else { return }
+        defaults.set(data, forKey: key)
+    }
+}
+
+struct ChatMessage: Codable, Identifiable, Equatable, Sendable {
+    var id: UUID = UUID()
+    var role: String
+    var content: String
+    enum Completion: String, Codable, Sendable { case streaming, completed, stopped, failed }
+    // Optional for compatibility with conversations saved before completion tracking.
+    var localEvents: [LocalAgentEvent]?
+    var memoryReferences: [MemoryReference]?
+    /// Rich, device-owned presentation data. Cloud history deliberately serializes only `content`.
+    var nativeContent: NativeContentPayload?
+    var completion: Completion?
+    var canRetry: Bool { role == "assistant" && (completion == .stopped || completion == .failed) }
+}
+
+struct NativeContentPayload: Codable, Equatable, Sendable {
+    static let currentVersion = 1
+    var version = currentVersion
+    var blocks: [NativeContentBlock]
+    init(blocks: [NativeContentBlock]) { self.blocks = Array(blocks.prefix(50)) }
+}
+
+enum NativeContentBlock: Codable, Equatable, Sendable, Identifiable {
+    struct CalendarEvent: Codable, Equatable, Sendable, Identifiable {
+        let id: String
+        let title: String
+        let start: Date
+        let end: Date
+        let calendar: String
+        let location: String?
+        let isAllDay: Bool
+    }
+    struct Reminder: Codable, Equatable, Sendable, Identifiable {
+        let id: String
+        let title: String
+        let due: Date?
+        var isCompleted: Bool
+        let list: String
+    }
+    struct Contact: Codable, Equatable, Sendable, Identifiable {
+        let id: String
+        let name: String
+        let phones: [String]
+        let emails: [String]
+    }
+    struct Location: Codable, Equatable, Sendable {
+        let latitude: Double
+        let longitude: Double
+        let accuracy: Double
+        let measuredAt: Date
+    }
+    struct WebSource: Codable, Equatable, Sendable {
+        let url: URL
+        let status: Int
+        let contentType: String
+        let excerpt: String
+    }
+    struct Document: Codable, Equatable, Sendable {
+        let id: UUID
+        let name: String
+        let excerpt: String
+    }
+
+    case agenda(title: String, events: [CalendarEvent])
+    case reminders(title: String, items: [Reminder])
+    case contacts(title: String, items: [Contact])
+    case location(Location)
+    case web(WebSource)
+    case document(Document)
+
+    var id: String {
+        switch self {
+        case .agenda(let title, let events): "agenda:\(title):\(events.first?.id ?? "empty")"
+        case .reminders(let title, let items): "reminders:\(title):\(items.first?.id ?? "empty")"
+        case .contacts(let title, let items): "contacts:\(title):\(items.first?.id ?? "empty")"
+        case .location(let value): "location:\(value.latitude):\(value.longitude)"
+        case .web(let value): "web:\(value.url.absoluteString)"
+        case .document(let value): "document:\(value.id.uuidString)"
+        }
+    }
+}
+
+struct LocalToolResult: Sendable {
+    let modelText: String
+    let blocks: [NativeContentBlock]
+    init(_ modelText: String, blocks: [NativeContentBlock] = []) {
+        self.modelText = modelText
+        self.blocks = blocks
+    }
+}
+struct Conversation: Codable, Identifiable, Equatable, Sendable {
+    var id: UUID = UUID()
+    var title = "Nouvelle conversation"
+    var internetPermission: ConversationInternetPermission?
+    var memorySourceID: UUID?
+    var memoryScope: String?
+    var memoryReviewedThrough: UUID?
+    /// Marker for the user message whose background title summarization was already
+    /// requested. It prevents a second request and protects a settled title.
+    var titleGeneratedFor: UUID?
+    var model: String = ""
+    var modelAccess: SelectedModelAccess?
+    var messages: [ChatMessage] = []
+    var updatedAt = Date()
+}
+enum ModelExecution: Equatable, Sendable {
+    case remote, apple, downloaded
+    init(_ id: String) {
+        self = id == LocalModel.id ? .apple : id.hasPrefix("device-gguf:") ? .downloaded : .remote
+    }
+    var isLocal: Bool { self != .remote }
+}
+
+struct ModelOption: Codable, Identifiable, Sendable, Equatable {
+    let id: String
+    var name: String?
+    var author: String?
+    var description: String?
+    var metadata: CatalogMetadata?
+    var logoPublisher: String?
+    var popularityRank: Int?
+    var displayName: String { name ?? id }
+}
+
+enum ModelProvider: String, CaseIterable, Identifiable, Sendable {
+    case multivibe, apple, openAI, anthropic, google, mistral, meta, deepSeek, other
+    var id: String { rawValue }
+    var displayName: String {
+        switch self {
+        case .multivibe: "MultiVibe Cloud"
+        case .apple: "Apple"
+        case .openAI: "OpenAI"
+        case .anthropic: "Anthropic"
+        case .google: "Google"
+        case .mistral: "Mistral AI"
+        case .meta: "Meta"
+        case .deepSeek: "DeepSeek"
+        case .other: "Autre fournisseur"
+        }
+    }
+    var assetName: String? {
+        switch self {
+        case .apple: "ProviderApple"
+        case .openAI: "ProviderOpenAI"
+        case .anthropic: "ProviderAnthropic"
+        case .google: "ProviderGemini"
+        case .mistral: "ProviderMistral"
+        case .meta: "ProviderMeta"
+        case .deepSeek: "ProviderDeepSeek"
+        case .multivibe, .other: nil
+        }
+    }
+}
+
+enum ModelUseCase: String, CaseIterable, Identifiable, Sendable {
+    case writing, coding, analysis, creation, local
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .writing: "Écrire"
+        case .coding: "Coder"
+        case .analysis: "Analyser"
+        case .creation: "Créer"
+        case .local: "Sur cet appareil"
+        }
+    }
+    var systemImage: String {
+        switch self {
+        case .writing: "pencil.line"
+        case .coding: "chevron.left.forwardslash.chevron.right"
+        case .analysis: "doc.text.magnifyingglass"
+        case .creation: "paintpalette"
+        case .local: "iphone"
+        }
+    }
+}
+
+struct ModelPresentation: Identifiable, Sendable {
+    let model: ModelOption
+    let provider: ModelProvider
+    let useCases: Set<ModelUseCase>
+    let summary: String
+    let badges: [String]
+    let popularity: Int
+    let usesCloudCredit: Bool
+    var id: String { model.id }
+}
+
+extension ModelOption {
+    var presentation: ModelPresentation {
+        let local = ModelExecution(id).isLocal
+        let provider: ModelProvider = id == LocalModel.id ? .apple : ["openai": .openAI, "anthropic": .anthropic, "google": .google, "mistralai": .mistral, "mistral": .mistral, "meta": .meta, "meta-llama": .meta, "deepseek": .deepSeek][author?.lowercased() ?? ""] ?? .other
+        let uses: Set<ModelUseCase> = local ? [.local, .writing, .analysis] : []
+        return ModelPresentation(model: self, provider: provider, useCases: uses,
+            summary: description ?? (local ? "Réponses privées sur cet appareil." : "Consultez les capacités et les accès disponibles pour ce modèle."),
+            badges: local ? ["Hors ligne"] : metadata?.modalities ?? [],
+            popularity: popularityRank.map { 100000 - $0 } ?? 0, usesCloudCredit: !local)
+    }
+}
+
+@MainActor enum ModelFavoriteStore {
+    static let key = "cloud.multivibe.chat.favorite-models-v1"
+    static func load(from defaults: UserDefaults = .standard) -> Set<String> {
+        Set(defaults.stringArray(forKey: key) ?? [])
+    }
+    static func save(_ identifiers: Set<String>, to defaults: UserDefaults = .standard) {
+        defaults.set(identifiers.sorted(), forKey: key)
+    }
+}
+
+/// Summarizes a first user request into a short conversation title.
+///
+/// This runs as a non-blocking side request against the same model as the
+/// conversation. The result is only a preference: any failure keeps the local
+/// truncation fallback, and a title the user or a previous run already settled is
+/// never overwritten.
+enum ConversationTitle {
+    /// Upper bound for a stored title, matching the existing truncation fallback.
+    static let maximumCharacters = 70
+    /// Keeps the title prompt small; the first message is already the whole evidence.
+    static let maximumInputCharacters = 4_000
+    static let instructions = """
+    Tu résumes la demande de l'utilisateur pour titrer une conversation.
+    Réponds UNIQUEMENT par le titre, sur une seule ligne, en 2 à 6 mots, dans la langue de la demande.
+    Pas de guillemets, pas de ponctuation finale, pas de préfixe comme « Titre : », pas d'explication.
+    """
+    /// Deterministic fallback used when no summary is available yet.
+    static func fallback(for request: String) -> String {
+        let collapsed = request
+            .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
+            .joined(separator: " ")
+        return String(collapsed.prefix(maximumCharacters))
+    }
+    /// Extracts a usable title from a raw model reply, or nil when it is unusable.
+    static func normalize(_ output: String) -> String? {
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Keep the first meaningful line: models often append a sentence after the title.
+        let firstLine = trimmed
+            .split(whereSeparator: { $0.isNewline })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { !$0.isEmpty } ?? ""
+        var value = firstLine
+        for prefix in ["Titre :", "Titre:", "Title:", "**", "\"", "'", "«", "”"] where value.hasPrefix(prefix) {
+            value.removeFirst(prefix.count); value = value.trimmingCharacters(in: .whitespaces)
+        }
+        for suffix in ["**", "\"", "'", "»", "”", "."] where value.hasSuffix(suffix) {
+            value.removeLast(suffix.count); value = value.trimmingCharacters(in: .whitespaces)
+        }
+        guard !value.isEmpty, value.count <= maximumCharacters else { return value.isEmpty ? nil : String(value.prefix(maximumCharacters)) }
+        return value
+    }
+}
+
+/// Remembers the last model each account actually used, so a new conversation
+/// starts on that model instead of falling back to the local model. The value is
+/// only a preference: callers must revalidate it against the available catalog
+/// and keep a safe fallback when it is gone or no longer usable.
+@MainActor enum LastUsedModelStore {
+    static let key = "cloud.multivibe.chat.last-used-model-v1"
+    static let maximumAccounts = 20
+    /// Ordered oldest-first so eviction is deterministic rather than dictionary-order.
+    private struct Entry: Codable { var account: String; var model: String }
+    static func load(from defaults: UserDefaults = .standard) -> [String: String] {
+        Dictionary(entries(from: defaults).map { ($0.account, $0.model) }, uniquingKeysWith: { _, last in last })
+    }
+    static func model(for account: String, from defaults: UserDefaults = .standard) -> String? {
+        guard !account.isEmpty else { return nil }
+        return entries(from: defaults).last { $0.account == account }?.model
+    }
+    static func save(_ identifier: String, for account: String, to defaults: UserDefaults = .standard) {
+        guard !account.isEmpty else { return }
+        var values = entries(from: defaults).filter { $0.account != account }
+        if !identifier.isEmpty { values.append(Entry(account: account, model: identifier)) }
+        // Drop the oldest accounts first, never the one being written.
+        if values.count > maximumAccounts { values.removeFirst(values.count - maximumAccounts) }
+        persist(values, to: defaults)
+    }
+    static func clear(for account: String, from defaults: UserDefaults = .standard) {
+        guard !account.isEmpty else { return }
+        let values = entries(from: defaults)
+        let remaining = values.filter { $0.account != account }
+        guard remaining.count != values.count else { return }
+        persist(remaining, to: defaults)
+    }
+    private static func entries(from defaults: UserDefaults) -> [Entry] {
+        guard let data = defaults.data(forKey: key),
+              let decoded = try? JSONDecoder().decode([Entry].self, from: data) else { return [] }
+        return decoded.filter { !$0.account.isEmpty && !$0.model.isEmpty }
+    }
+    private static func persist(_ values: [Entry], to defaults: UserDefaults) {
+        guard !values.isEmpty, let data = try? JSONEncoder().encode(values) else {
+            defaults.removeObject(forKey: key); return
+        }
+        defaults.set(data, forKey: key)
+    }
+}
+struct ModelList: Decodable { let data: [ModelOption] }
+struct VoiceModelOption: Codable, Identifiable, Equatable, Sendable {
+    let id: String
+    let name: String
+}
+struct VoiceOption: Codable, Identifiable, Equatable, Sendable {
+    let id: String
+    let name: String
+    var model: String? = nil
+    var voice: String? = nil
+}
+struct VoiceCapabilities: Decodable, Sendable {
+    let enabled: Bool
+    let voices: [VoiceOption]
+    let backgroundAudio: Bool
+    let tools: Bool
+    let retainsAudio: Bool
+    var transcriptionModels: [VoiceModelOption]? = nil
+    var synthesisModels: [VoiceModelOption]? = nil
+}
+struct VoiceCredential: Decodable, Sendable {
+    let protocolName: String
+    let transport: String
+    let endpoint: URL
+    let token: String
+    let expiresAt: Date
+    enum CodingKeys: String, CodingKey { case protocolName = "protocol", transport, endpoint, token, expiresAt }
+}
+struct VoiceSession: Decodable, Sendable {
+    let id: String
+    let route: String
+    let sessionToken: String
+    let expiresAt: Date
+    let credential: VoiceCredential
+    let retainsAudio: Bool
+    let transcriptPersistence: String
+}
+struct NativeSession: Codable, Sendable {
+    let accessToken: String
+    let refreshToken: String
+    let expiresAt: Date
+    let accountId: String
+}
+struct AuthReply: Decodable, Sendable {
+    var accessToken: String?
+    var refreshToken: String?
+    var expiresAt: Date?
+    var accountId: String?
+    var challenge: String?
+    var status: String?
+    var passkeyOptions: NativePasskeyOptions?
+    func session() throws -> NativeSession {
+        guard let accessToken, let refreshToken, let expiresAt, let accountId else { throw APIError.invalidResponse }
+        return NativeSession(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt, accountId: accountId)
+    }
+}
+enum APIError: LocalizedError {
+    case authenticationRequired, invalidResponse, server(Int, String), noModel
+    var errorDescription: String? {
+        switch self {
+        case .authenticationRequired: "Connectez-vous à MultiVibe pour continuer."
+        case .invalidResponse: "La réponse du serveur est invalide. Réessayez."
+        case .server(503, "memory_sync_not_supported"):
+            "Le serveur ne prend pas encore en charge la mémoire. Vos souvenirs restent sur cet appareil."
+        case .server(let status, let code):
+            switch status {
+            case 401: "Connexion refusée ou expirée. Vérifiez vos identifiants."
+            case 402: "Votre compte ne dispose pas de crédits suffisants."
+            case 429: "Trop de demandes. Patientez avant de réessayer."
+            case 503: "Ce service est temporairement indisponible."
+            default: "La demande a échoué (\(status), \(code))."
+            }
+        case .noModel: "Choisissez un modèle disponible sur votre compte."
+        }
+    }
+}
+struct CompletionDelta: Decodable {
+    struct Choice: Decodable {
+        struct Delta: Decodable { var content: String? }
+        var delta: Delta
+    }
+    var choices: [Choice]
+}
+
+/// Parse only the exact first-party recovery URL. Never navigate to a pasted
+/// URL or send its fragment to a destination chosen by the clipboard content.
+enum PasswordResetLink {
+    static func token(from raw: String) -> String? {
+        guard raw.utf8.count <= 512,
+              let url = URLComponents(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              url.scheme == "https", url.host == "auth.multivibe.cloud",
+              url.user == nil, url.password == nil, url.port == nil,
+              url.path == "/password/reset", url.query == nil,
+              let fragment = url.percentEncodedFragment,
+              fragment.hasPrefix("token=") else { return nil }
+        let token = String(fragment.dropFirst(6))
+        guard token.utf8.count == 43, token.utf8.allSatisfy({
+            (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0) || $0 == 45 || $0 == 95
+        }) else { return nil }
+        return token
+    }
+}
+
+struct PasswordRecoveryRequest: Identifiable {
+    let id = UUID()
+    let link: String
+    let email: String
+    init(email: String) { self.email = email; link = "" }
+    init?(url: URL) {
+        guard PasswordResetLink.token(from: url.absoluteString) != nil else { return nil }
+        link = url.absoluteString
+        email = ""
+    }
+}
+
+/// Retain unknown web fields and off-screen branches instead of flattening the
+/// server snapshot on the next native save.
+indirect enum HistoryJSON: Codable, Equatable, Sendable {
+    case object([String: HistoryJSON]), array([HistoryJSON]), string(String), number(Double), bool(Bool), null
+    init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer()
+        if value.decodeNil() { self = .null }
+        else if let bool = try? value.decode(Bool.self) { self = .bool(bool) }
+        else if let number = try? value.decode(Double.self) { self = .number(number) }
+        else if let string = try? value.decode(String.self) { self = .string(string) }
+        else if let array = try? value.decode([HistoryJSON].self) { self = .array(array) }
+        else { self = .object(try value.decode([String: HistoryJSON].self)) }
+    }
+    func encode(to encoder: Encoder) throws {
+        var value = encoder.singleValueContainer()
+        switch self {
+        case .object(let object): try value.encode(object)
+        case .array(let array): try value.encode(array)
+        case .string(let string): try value.encode(string)
+        case .number(let number): try value.encode(number)
+        case .bool(let bool): try value.encode(bool)
+        case .null: try value.encodeNil()
+        }
+    }
+    var object: [String: HistoryJSON]? { if case .object(let value) = self { value } else { nil } }
+    var array: [HistoryJSON]? { if case .array(let value) = self { value } else { nil } }
+    var string: String? { if case .string(let value) = self { value } else { nil } }
+    var number: Double? { if case .number(let value) = self { value } else { nil } }
+}
+
+struct AccountHistorySnapshot: Codable, Sendable {
+    var accountId: String
+    var revision: Int
+    var conversations: [HistoryJSON]
+    var folders: [HistoryJSON]?
+    var memory: [AgentMemory]?
+
+    /// Display only the selected branch. Keep the raw snapshot alongside this
+    /// projection: web identifiers need not be UUIDs and must never be rewritten.
+    func projectedConversation(at index: Int, id: UUID, messageIDs: inout [String: UUID]) throws -> Conversation {
+        guard conversations.indices.contains(index), let item = conversations[index].object,
+              let title = item["title"]?.string, let timestamp = item["updatedAt"]?.number,
+              let repository = item["repository"]?.object, let entries = repository["messages"]?.array else {
+            throw APIError.invalidResponse
+        }
+        var nodes: [String: [String: HistoryJSON]] = [:]
+        for entry in entries {
+            guard let node = entry.object, let message = node["message"]?.object,
+                  let key = message["id"]?.string, nodes[key] == nil else { throw APIError.invalidResponse }
+            nodes[key] = node
+        }
+        var cursor = repository["headId"]?.string
+        var visited = Set<String>(), messages: [ChatMessage] = []
+        while let key = cursor {
+            guard visited.insert(key).inserted, let node = nodes[key],
+                  let message = node["message"]?.object, let role = message["role"]?.string,
+                  ["user", "assistant", "system"].contains(role), let parts = message["content"]?.array else { throw APIError.invalidResponse }
+            let text = try parts.map { part -> String in
+                guard let object = part.object, object["type"]?.string == "text", let text = object["text"]?.string else { throw APIError.invalidResponse }
+                return text
+            }.joined(separator: "\n")
+            let localID = messageIDs[key] ?? UUID()
+            messageIDs[key] = localID
+            let status = message["status"]?.object?["type"]?.string
+            let completion: ChatMessage.Completion? = role != "assistant" ? nil : status == "complete" ? .completed : status == "incomplete" ? .stopped : nil
+            let events = try message["multivibeLocalEvents"].map {
+                try JSONDecoder().decode([LocalAgentEvent].self, from: JSONEncoder().encode($0))
+            }
+            let references = try message["multivibeMemoryReferences"].map {
+                try JSONDecoder().decode([MemoryReference].self, from: JSONEncoder().encode($0))
+            }
+            messages.append(ChatMessage(id: localID, role: role, content: text, localEvents: events, memoryReferences: references, completion: completion))
+            if node["parentId"] == .null { cursor = nil }
+            else if let parent = node["parentId"]?.string { cursor = parent }
+            else { throw APIError.invalidResponse }
+        }
+        return Conversation(id: id, title: title, memorySourceID: item["multivibeSourceID"]?.string.flatMap(UUID.init(uuidString:)), memoryScope: item["multivibeMemoryScope"]?.string, memoryReviewedThrough: item["multivibeMemoryReviewedThrough"]?.string.flatMap(UUID.init(uuidString:)), model: item["model"]?.string ?? "", modelAccess: SelectedModelAccess.fromHistory(item["modelAccess"]), messages: messages.reversed(), updatedAt: Date(timeIntervalSince1970: timestamp / 1000))
+    }
+}
+
+extension AccountHistorySnapshot {
+    /// Replace the selected branch projection, retaining all original graph nodes
+    /// and metadata. Changed native nodes receive new IDs, so alternate web
+    /// branches that reference the originals remain untouched.
+    mutating func store(_ conversation: Conversation, serverID: String,
+                        messageIDs: inout [String: UUID]) throws {
+        let index = conversations.firstIndex { $0.object?["id"]?.string == serverID }
+        var item = index.flatMap { conversations[$0].object } ?? [:]
+        var repository = item["repository"]?.object ?? [:]
+        var entries = repository["messages"]?.array ?? []
+        var nodes: [String: HistoryJSON] = [:]
+        for entry in entries {
+            guard let id = entry.object?["message"]?.object?["id"]?.string,
+                  nodes.updateValue(entry, forKey: id) == nil else { throw APIError.invalidResponse }
+        }
+        var parent: HistoryJSON = .null
+        for message in conversation.messages {
+            let candidates = messageIDs.filter { $0.value == message.id }.map(\.key).sorted()
+            let matching = candidates.first { id in
+                guard let entry = nodes[id]?.object, entry["parentId"] == parent,
+                      let original = entry["message"]?.object, original["role"]?.string == message.role,
+                      let parts = original["content"]?.array else { return false }
+                if message.role == "assistant" {
+                    let expected = message.completion == .completed ? "complete" : "incomplete"
+                    guard original["status"]?.object?["type"]?.string == expected else { return false }
+                }
+                return parts.compactMap { $0.object?["text"]?.string }.joined(separator: "\n") == message.content
+            }
+            if let matching { parent = .string(matching); continue }
+            let id = UUID().uuidString
+            var node: [String: HistoryJSON] = [
+                "id": .string(id), "role": .string(message.role),
+                "createdAt": .string(ISO8601DateFormatter().string(from: conversation.updatedAt)),
+                "content": .array([.object(["type": .string("text"), "text": .string(message.content)])])
+            ]
+            if let events = message.localEvents {
+                node["multivibeLocalEvents"] = try JSONDecoder().decode(HistoryJSON.self, from: JSONEncoder().encode(events))
+            }
+            if let references = message.memoryReferences {
+                node["multivibeMemoryReferences"] = try JSONDecoder().decode(HistoryJSON.self, from: JSONEncoder().encode(references))
+            }
+            if message.role == "assistant" {
+                let complete = message.completion == .completed
+                node["status"] = .object(["type": .string(complete ? "complete" : "incomplete"),
+                                          "reason": .string(complete ? "stop" : "cancelled")])
+            }
+            let entry = HistoryJSON.object(["parentId": parent, "message": .object(node)])
+            entries.append(entry); nodes[id] = entry; messageIDs[id] = message.id
+            parent = .string(id)
+        }
+        repository["messages"] = .array(entries); repository["headId"] = parent
+        item["multivibeSourceID"] = .string((conversation.memorySourceID ?? conversation.id).uuidString)
+        item["id"] = .string(serverID); item["title"] = .string(conversation.title)
+        item["updatedAt"] = .number(conversation.updatedAt.timeIntervalSince1970 * 1000)
+        item["model"] = .string(conversation.model)
+        item["modelAccess"] = conversation.modelAccess?.historyValue ?? .null
+        if let reviewed = conversation.memoryReviewedThrough { item["multivibeMemoryReviewedThrough"] = .string(reviewed.uuidString) }
+        if let scope = conversation.memoryScope { item["multivibeMemoryScope"] = .string(scope) }
+        if item["renamed"] == nil { item["renamed"] = .bool(false) }
+        if item["draft"] == nil { item["draft"] = .string("") }
+        item["repository"] = .object(repository)
+        if let index { conversations[index] = .object(item) }
+        else { conversations.append(.object(item)) }
+    }
+}
+
+/// Same pre-normalization UTF-8 limits as the Cloud email/password identity service.
+/// Never trim or normalize the submitted secret in the native client.
+enum NativePasswordPolicy {
+    static func accepts(_ password: String) -> Bool {
+        let length = password.utf8.count
+        return (12...256).contains(length) && password.unicodeScalars.contains { scalar in
+            // ECMAScript WhiteSpace + LineTerminator, matching the server's \S.
+            switch scalar.value {
+            case 0x0009...0x000D, 0x0020, 0x00A0, 0x1680, 0x2000...0x200A,
+                 0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF: false
+            default: true
+            }
+        }
+    }
+}
+
+/// A deliberately small block subset; unsupported Markdown remains readable text.
+/// Fences are recognized even before their closing delimiter arrives in a stream.
+enum MessageBlock: Equatable {
+    case prose(String)
+    case heading(String, Int)
+    case bullet(String)
+    case checklist(String, Bool)
+    case quote(String)
+    case table([[String]])
+    case code(String, String)
+
+    static func parse(_ source: String) -> [MessageBlock] {
+        var result: [MessageBlock] = []
+        var prose: [String] = []
+        var code: [String] = []
+        var fence: Character?
+        var fenceLength = 0
+        var language = ""
+        func flushProse() {
+            if !prose.isEmpty { result.append(.prose(prose.joined(separator: "\n"))); prose = [] }
+        }
+        let sourceLines = source.components(separatedBy: "\n")
+        var lineIndex = 0
+        while lineIndex < sourceLines.count {
+            let line = sourceLines[lineIndex]
+            let leading = line.prefix(while: { $0 == " " }).count
+            let candidate = line.dropFirst(min(leading, 3))
+            let delimiter = candidate.first
+            let length = candidate.prefix(while: { $0 == delimiter }).count
+            if let open = fence {
+                if leading <= 3, delimiter == open, length >= fenceLength,
+                   candidate.dropFirst(length).trimmingCharacters(in: .whitespaces).isEmpty {
+                    result.append(.code(code.joined(separator: "\n"), language))
+                    code = []; fence = nil
+                } else { code.append(line) }
+                lineIndex += 1; continue
+            }
+            if leading <= 3, let delimiter, delimiter == "`" || delimiter == "~", length >= 3 {
+                let info = String(candidate.dropFirst(length)).trimmingCharacters(in: .whitespaces)
+                if delimiter != "`" || !info.contains("`") {
+                    flushProse(); fence = delimiter; fenceLength = length; language = String(info.prefix(80))
+                    lineIndex += 1; continue
+                }
+            }
+            if line.contains("|"), lineIndex + 1 < sourceLines.count,
+               sourceLines[lineIndex + 1].range(of: #"^\s*\|?\s*:?-{3,}"#, options: .regularExpression) != nil {
+                flushProse()
+                var rows: [[String]] = [tableCells(line)]
+                lineIndex += 2
+                while lineIndex < sourceLines.count, sourceLines[lineIndex].contains("|") {
+                    rows.append(tableCells(sourceLines[lineIndex])); lineIndex += 1
+                }
+                result.append(.table(rows)); continue
+            }
+            let hashes = candidate.prefix(while: { $0 == "#" }).count
+            if leading <= 3, (1...6).contains(hashes), candidate.dropFirst(hashes).first == " " {
+                flushProse(); result.append(.heading(String(candidate.dropFirst(hashes + 1)), hashes))
+            } else if leading <= 3, candidate.range(of: #"^[-*+] \[[ xX]\] "#, options: .regularExpression) != nil {
+                flushProse(); result.append(.checklist(String(candidate.dropFirst(6)), candidate.dropFirst(3).first?.lowercased() == "x"))
+            } else if leading <= 3, candidate.hasPrefix("> ") {
+                flushProse(); result.append(.quote(String(candidate.dropFirst(2))))
+            } else if leading <= 3, ["- ", "* ", "+ "].contains(where: { candidate.hasPrefix($0) }) {
+                flushProse(); result.append(.bullet(String(candidate.dropFirst(2))))
+            } else if line.isEmpty {
+                flushProse()
+            } else { prose.append(line) }
+            lineIndex += 1
+        }
+        if fence != nil { result.append(.code(code.joined(separator: "\n"), language)) }
+        flushProse()
+        return result
+    }
+
+    private static func tableCells(_ line: String) -> [String] {
+        line.trimmingCharacters(in: CharacterSet(charactersIn: " |")).split(separator: "|", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    /// Model text may propose links, but must not launch app/deep-link schemes.
+    static func inline(_ text: String) -> AttributedString {
+        let presented = presentationText(text)
+        var value = (try? AttributedString(markdown: presented, options: .init(
+            interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(presented)
+        let unsafeRanges = value.runs.compactMap { run -> Range<AttributedString.Index>? in
+            guard let link = run.link else { return nil }
+            guard ["https", "http"].contains(link.scheme?.lowercased() ?? ""),
+                  link.host != nil, link.user == nil, link.password == nil else { return run.range }
+            return nil
+        }
+        for range in unsafeRanges { value[range].link = nil }
+        return value
+    }
+
+    /// Hosted web-search citations can arrive as private-use framing tokens without
+    /// a URL. Keep them in the stored message, but do not expose transport syntax.
+    private static func presentationText(_ text: String) -> String {
+        let framed = "\u{E200}cite\u{E202}[^\u{E200}\u{E201}\n]{1,240}\u{E201}"
+        let orphaned = "\u{E202}turn[0-9]+(?:search|news|image)[0-9]+(?:\u{E202}turn[0-9]+(?:search|news|image)[0-9]+)*\u{E201}?"
+        return text
+            .replacingOccurrences(of: framed, with: "", options: [.regularExpression, .caseInsensitive])
+            .replacingOccurrences(of: orphaned, with: "", options: [.regularExpression, .caseInsensitive])
+    }
+}
+
+struct NativePasskeyOptions: Decodable, Sendable {
+    struct Credential: Decodable, Sendable { let id: String; let type: String }
+    let challenge: String
+    let rpId: String
+    let allowCredentials: [Credential]
+    func request() throws -> ASAuthorizationPlatformPublicKeyCredentialAssertionRequest {
+        guard rpId == "app.multivibe.cloud", let bytes = Self.decode(challenge), !bytes.isEmpty,
+              !allowCredentials.isEmpty, allowCredentials.count <= 100 else { throw APIError.invalidResponse }
+        let request = ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier: rpId)
+            .createCredentialAssertionRequest(challenge: bytes)
+        request.userVerificationPreference = .required
+        request.allowedCredentials = try allowCredentials.map {
+            guard $0.type == "public-key", let id = Self.decode($0.id), !id.isEmpty else { throw APIError.invalidResponse }
+            return ASAuthorizationPlatformPublicKeyCredentialDescriptor(credentialID: id)
+        }
+        return request
+    }
+    static func decode(_ value: String) -> Data? {
+        guard !value.isEmpty, value.count <= 4096, value.range(of: "^[A-Za-z0-9_-]+$", options: .regularExpression) != nil else { return nil }
+        let encoded = value.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        return Data(base64Encoded: encoded + String(repeating: "=", count: (4 - encoded.count % 4) % 4))
+    }
+}
+
+/// The Cloud contract expresses available USD as a decimal string, never a float.
+struct CloudCreditBalance: Decodable, Sendable {
+    let available: Decimal
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let currency = try values.decode(String.self, forKey: .currency)
+        let raw = try values.decode(String.self, forKey: .totalAvailableUsd)
+        guard currency == "USD", raw.range(of: #"^[0-9]+(?:\.[0-9]+)?$"#, options: .regularExpression) != nil,
+              let amount = Decimal(string: raw, locale: Locale(identifier: "en_US_POSIX")), !amount.isNaN else {
+            throw APIError.invalidResponse
+        }
+        available = amount
+    }
+    private enum CodingKeys: String, CodingKey { case currency, totalAvailableUsd }
+    var formatted: String {
+        let number = available.formatted(.number.precision(.fractionLength(0...6)))
+        return "\(number) \(available == 1 ? "crédit" : "crédits")"
+    }
+}
+
+
+struct CloudBillingSession: Decodable, Sendable {
+    private let sessionToken: String
+    let expiresAt: Date
+    static let pageURL = URL(string: "https://app.multivibe.cloud/billing")!
+
+    func cookie(now: Date = Date()) throws -> HTTPCookie {
+        guard sessionToken.range(of: #"^[A-Za-z0-9_-]{43}$"#, options: .regularExpression) != nil,
+              expiresAt > now,
+              let cookie = HTTPCookie(properties: [
+                .name: "__Host-mv_dashboard_session", .value: sessionToken,
+                .originURL: Self.pageURL, .path: "/", .secure: "TRUE",
+                .init("HttpOnly"): "TRUE", .expires: expiresAt,
+              ]), cookie.isSecure, cookie.isHTTPOnly else { throw APIError.invalidResponse }
+        return cookie
+    }
+}
+
+
+struct NativeAccountProfile: Decodable, Sendable {
+    struct Team: Decodable, Identifiable, Sendable {
+        let id: String
+        let name: String
+    }
+    let accountId: String
+    let email: String?
+    let teams: [Team]
+}
+
+struct CatalogMetadata: Codable, Sendable, Equatable {
+    var modalities: [String]?
+    var contextLength: Int?
+    var maxOutputTokens: Int?
+    var license: String?
+}
+struct CatalogEntry: Decodable, Sendable {
+    let id: String
+    let displayName: String
+    let author: String?
+    let description: String?
+    let metadata: CatalogMetadata?
+    let popularityRank: Int?
+    var option: ModelOption { ModelOption(id: id, name: displayName, author: author, description: description, metadata: metadata, popularityRank: popularityRank) }
+}
+struct CatalogPage: Decodable, Sendable { let data: [CatalogEntry]; let nextCursor: String? }
+struct ProviderCapability: Decodable, Identifiable, Sendable { let id: String; let name: String; let authenticationMethods: [String] }
+struct ProviderCapabilities: Decodable, Sendable { let providers: [ProviderCapability] }
+struct ProviderConnection: Decodable, Identifiable, Sendable {
+    let id: String; let provider: String; let displayName: String; let state: String
+    let models: [String]; let authenticationMethod: String
+}
+struct ProviderConnections: Decodable, Sendable { let data: [ProviderConnection] }
+struct ProviderChallenge: Decodable, Sendable {
+    let provider: String; let userCode: String; let verificationUrl: URL; let intervalSeconds: Double
+    let expiresAt: Double; let flowToken: String
+    var expiry: Date { Date(timeIntervalSince1970: expiresAt / 1000) }
+}
+struct ProviderPoll: Decodable, Sendable { let status: String; let intervalSeconds: Double?; let providerId: String? }
+struct ModelAccessOption: Decodable, Identifiable, Sendable {
+    let id: String; let modelId: String; let method: String; let provider: String; let label: String
+    let state: String; let connectionId: String?; let billing: String
+    var selection: SelectedModelAccess { .init(id: id, modelId: modelId, label: label, method: method) }
+}
+struct ModelAccessReply: Decodable, Sendable { let model: CatalogEntry; let data: [ModelAccessOption]; let preferred: String? }
+struct SelectedModelAccess: Codable, Equatable, Sendable {
+    let id: String; let modelId: String; let label: String; let method: String
+    var historyValue: HistoryJSON { .object(["id": .string(id), "modelId": .string(modelId), "label": .string(label), "method": .string(method)]) }
+    static func fromHistory(_ value: HistoryJSON?) -> Self? {
+        guard let o = value?.object, let id = o["id"]?.string, let model = o["modelId"]?.string,
+              let label = o["label"]?.string, let method = o["method"]?.string else { return nil }
+        return .init(id: id, modelId: model, label: label, method: method)
+    }
+}
+
+
+// Canonical publisher identities shared with the Cloud catalog. Never guess from
+// a namespaced repository's model name: fine-tunes retain their own identity.
+enum ModelPublisher {
+    static let known: Set<String> = ["aion-labs", "alibaba", "amazon", "anthracite-org", "anthropic", "arcee-ai", "baai", "baidu", "black-forest-labs", "bytedance-seed", "bytedance", "canopylabs", "cohere", "deepgram", "deepseek-ai", "deepseek", "dots-studio", "fish-audio", "google", "gryphe", "hexgrad", "heygen", "ibm-granite", "inception", "inclusionai", "intfloat", "krea", "kwaipilot", "kwaivgi", "liquid", "mancer", "meituan", "meta-llama", "meta", "microsoft", "minimax", "mistralai", "moonshotai", "morph", "nex-agi", "nousresearch", "nvidia", "openai", "openrouter", "perceptron", "perplexity", "poolside", "qwen", "recraft", "rekaai", "relace", "runway", "sakana", "sao10k", "sentence-transformers", "sesame", "sourceful", "stepfun", "tencent", "thedrummer", "thenlper", "thinkingmachines", "undi95", "upstage", "venice", "voyageai", "writer", "x-ai", "xiaomi", "z-ai"]
+    static func canonical(_ value: String?) -> String? {
+        let value = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let aliases = ["google deepmind": "google", "meta ai": "meta", "mistral": "mistralai",
+                       "mistral ai": "mistralai", "xai": "x-ai", "x.ai": "x-ai",
+                       "zai": "z-ai", "z.ai": "z-ai", "zai-org": "z-ai",
+                       "liquidai": "liquid", "cohereforai": "cohere"]
+        let key = aliases[value] ?? value
+        return known.contains(key) ? key : nil
+    }
+    static func resolve(repository: String, baseModels: [String] = []) -> String? {
+        let owners = Set(baseModels.compactMap { canonical($0.split(separator: "/").first.map(String.init)) })
+        if owners.count == 1 { return owners.first }
+        return canonical(repository.split(separator: "/").first.map(String.init))
+    }
+}
+
+/// Contract and renderer are generated together from the web chat's OpenUI library.
+enum OpenUIPresentation {
+    static let html: String? = Bundle.main.url(forResource: "OpenUI", withExtension: "html")
+        .flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+    static let instructions: String = Bundle.main.url(forResource: "OpenUI-prompt", withExtension: "txt")
+        .flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? ""
+    struct Segment { let text: String; let ui: Bool; let streaming: Bool }
+    static func segments(_ text: String) -> [Segment] {
+        guard let marker = try? NSRegularExpression(pattern: #"^(`{3,}|~{3,})([^\r\n]*)\r?\n?$"#) else {
+            return [.init(text: text, ui: false, streaming: false)]
+        }
+        let string = text as NSString; var offset = 0; var position = 0
+        var codeFence: String?; var uiStart: Int?; var output: [Segment] = []
+        let lines = text.components(separatedBy: "\n")
+        for (index, value) in lines.enumerated() {
+            let line = value + (index < lines.count - 1 ? "\n" : "")
+            let ns = line as NSString
+            if let match = marker.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) {
+                let ticks = ns.substring(with: match.range(at: 1))
+                let info = ns.substring(with: match.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                if let fence = codeFence {
+                    if ticks.first == fence.first && ticks.count >= fence.count && info.isEmpty { codeFence = nil }
+                } else if let start = uiStart {
+                    if ticks == "```" && info.isEmpty {
+                        output.append(.init(text: string.substring(with: NSRange(location: start, length: position - start)), ui: true, streaming: false))
+                        offset = position + ns.length; uiStart = nil
+                    }
+                } else if ticks == "```" && info == "openui" && line.hasSuffix("\n") {
+                    if position > offset { output.append(.init(text: string.substring(with: NSRange(location: offset, length: position - offset)), ui: false, streaming: false)) }
+                    uiStart = position + ns.length
+                } else { codeFence = ticks }
+            }
+            position += ns.length
+        }
+        if let start = uiStart { output.append(.init(text: string.substring(from: start), ui: true, streaming: true)) }
+        else if offset < string.length { output.append(.init(text: string.substring(from: offset), ui: false, streaming: false)) }
+        return output
+    }
+    static func history(_ messages: [HistoryJSON]) -> [HistoryJSON] {
+        guard !instructions.isEmpty else { return messages }
+        return [.object(["role": .string("system"), "content": .string(instructions)])] + messages.filter {
+            !($0.object?["role"]?.string == "system" && $0.object?["content"]?.string?.hasPrefix("MultiVibe OpenUI presentation v1.") == true)
+        }
+    }
+}

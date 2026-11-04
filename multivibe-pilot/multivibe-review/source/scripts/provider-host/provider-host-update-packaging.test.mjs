@@ -1,0 +1,189 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const read = (name) => readFile(path.join(root, name), "utf8");
+
+test("the macOS status item uses a transparent high-resolution template image", async () => {
+  const image = await readFile(path.join(root, "packaging", "macos", "MultiVibeMenuBarTemplate.png"));
+  assert.deepEqual(image.subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  assert.equal(image.readUInt32BE(16), 36);
+  assert.equal(image.readUInt32BE(20), 36);
+  const colorType = image[25];
+  const transparencyChunk = image.indexOf(Buffer.from("tRNS"));
+  const hasAlphaChannel = colorType === 4 || colorType === 6;
+  const hasTransparentPaletteEntry = transparencyChunk >= 4
+    && image.subarray(transparencyChunk + 4, transparencyChunk + 4 + image.readUInt32BE(transparencyChunk - 4)).some((alpha) => alpha < 255);
+  assert.ok(hasAlphaChannel || hasTransparentPaletteEntry);
+});
+
+test("the macOS popover header uses the official application icon", async () => {
+  const [layout, packager, verifier] = await Promise.all([
+    read("packaging/macos/HostPopoverController+Layout.swift"),
+    read("scripts/provider-host/package-provider-host.mjs"),
+    read("scripts/provider-host/verify-provider-host.mjs"),
+  ]);
+  assert.match(layout, /icon\.image = NSApplication\.shared\.applicationIconImage/u);
+  assert.doesNotMatch(layout, /waveform\.path|MultiVibeMenuBarIcon\.png/u);
+  assert.doesNotMatch(packager, /MultiVibeMenuBarIcon\.png/u);
+  assert.doesNotMatch(verifier, /MultiVibeMenuBarIcon\.png/u);
+});
+
+test("the macOS disk image uses a non-interactive drag-to-install layout", async () => {
+  const [image, packager, verifier] = await Promise.all([
+    readFile(path.join(root, "packaging", "macos", "dmg-background.png")),
+    read("scripts/provider-host/package-provider-host.mjs"),
+    read("scripts/provider-host/verify-provider-host.mjs"),
+  ]);
+  assert.deepEqual(image.subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  assert.equal(image.readUInt32BE(16), 720);
+  assert.equal(image.readUInt32BE(20), 440);
+  assert.doesNotMatch(packager, /osascript/u);
+  assert.match(packager, /"create", "-quiet", "-volname", "MultiVibe Host", "-srcfolder", diskImageRoot/u);
+  assert.match(packager, /"-format", "UDZO"/u);
+  assert.match(verifier, /disk image background is invalid/u);
+});
+
+test("native packages include the updater and platform schedulers", async () => {
+  const [packager, macosInfo, linux, macos, windows, verifier, uninstall] = await Promise.all([
+    read("scripts/provider-host/package-provider-host.mjs"), read("packaging/macos/Info.plist"),
+    read("packaging/linux/install.sh"), read("packaging/macos/install.sh"), read("packaging/windows/install.ps1"),
+    read("scripts/provider-host/verify-provider-host.mjs"), read("packaging/linux/uninstall.sh"),
+  ]);
+  assert.match(packager, /const macOSMinimumVersion = "13\.0"/u);
+  assert.match(packager, /minimum: macOSMinimumVersion/u);
+  assert.match(await read("scripts/provider-host/build-macos-native.mjs"), /apple-macos\$\{minimum\}/u);
+  assert.match(macosInfo, /<key>LSMinimumSystemVersion<\/key>\s*<string>__MULTIVIBE_MACOS_MINIMUM_VERSION__<\/string>/u);
+  assert.match(verifier, /minimumSystemVersion !== "13\.0"/u);
+  assert.match(packager, /buildGo\(path\.join\(repositoryRoot, "host", "updater"\)/u);
+  assert.match(packager, /buildRustEdge\(edgeDestination\)/u);
+  assert.match(packager, /path\.join\(contents, "Helpers", "multivibe-v1-edge"\)/u);
+  assert.match(packager, /buildGo\(\s*path\.join\(repositoryRoot, "host", "menu"\)/u);
+  assert.match(packager, /CGO_ENABLED: selectedTarget\.goos === "linux" \? "1" : "0"/u);
+  assert.match(packager, /favicon-1024\.png/u);
+  assert.match(packager, /MultiVibeMenuBarTemplate\.png/u);
+  assert.match(verifier, /MultiVibeMenuBarTemplate\.png/u);
+  assert.match(packager, /path\.join\(contents, "Resources", "update", "install\.sh"\)/u);
+  assert.match(packager, /install-docker-updater\.sh/u);
+  assert.match(
+    packager,
+    /await command\("codesign", \["--verify", "--strict", "--verbose=2", node\]\)/u,
+  );
+  assert.match(
+    packager,
+    /await command\(node, \["--eval", betterSQLiteSmokeTest\]/u,
+  );
+  assert.doesNotMatch(
+    packager,
+    /\.\.\.native,\s*path\.join\(contents, "Frameworks", "node"\)/u,
+  );
+  assert.match(linux, /multivibe-host-update\.timer/u);
+  assert.match(linux, /multivibe-host-updater" auto/u);
+  assert.match(linux, /cat > "\$UPDATE_SERVICE_STAGING" <<EOF/u);
+  assert.doesNotMatch(linux, /cat > "\$UPDATE_SERVICE_STAGING" <<'EOF'/u);
+  assert.match(linux, /body\.version!==process\.argv\[1\]/u);
+  assert.match(linux, /SOURCE_MENU/u);
+  assert.match(linux, /multivibe-host-menu\.desktop/u);
+  assert.match(linux, /X-GNOME-Autostart-enabled=true/u);
+  assert.match(linux, /x-scheme-handler\/multivibe/u);
+  assert.match(macos, /cloud\.multivibe\.host\.update/u);
+  assert.match(macos, /Contents\/Helpers\/multivibe-host-updater/u);
+  assert.match(macos, /MULTIVIBE_CONTROL_PLANE_PORT[\s\S]*1456/u);
+  assert.doesNotMatch(
+    macos,
+    /Contents\/Helpers\/multivibe-host-updater<\/string>[\s\S]*<key>RunAtLoad<\/key>/u,
+  );
+  assert.match(macos, /UPDATE_SERVICE_KEPT_LOADED/u);
+  assert.match(macos, /esac\s+shift\s+done/u);
+  assert.match(macos, /body\.version!==process\.argv\[1\]/u);
+  assert.match(verifier, /multivibe-host-updater/u);
+  assert.match(verifier, /multivibe-v1-edge/u);
+  assert.match(verifier, /multivibe-host-menu/u);
+  assert.match(uninstall, /multivibe-host-menu\.desktop/u);
+  assert.match(packager, /windows-amd64.*zip/su);
+  assert.match(packager, /install\.ps1/u);
+  assert.match(packager, /uninstall\.ps1/u);
+  assert.match(packager, /multivibe-host\.ico/u);
+  assert.match(windows, /Register-ScheduledTask/u);
+  assert.match(macos, /--managed-profile/u);
+  assert.match(macos, /managed-team-enrollment\.json/u);
+  assert.match(macos, /must use mode 0600/u);
+  assert.match(linux, /--managed-profile/u);
+  assert.match(linux, /managed-team-enrollment\.json/u);
+  assert.match(windows, /ManagedProfilePath/u);
+  assert.match(windows, /managed-team-enrollment\.json/u);
+  assert.match(windows, /Assert-PrivateAcl \$sourcePath/u);
+  assert.match(windows, /Restore-ManagedTaskSnapshot/u);
+  assert.match(windows, /Stop-ScheduledTask/u);
+  assert.match(windows, /Get-Process -Name \$name/u);
+  assert.match(windows, /Test-PathWithin \$processPath \$VersionsRoot/u);
+  assert.match(windows, /"node", "ollama", "llama-server"/u);
+  assert.match(packager, /Expand-Archive|Compress-Archive/u);
+  const windowsUninstall = await read("packaging/windows/uninstall.ps1");
+  assert.match(windowsUninstall, /"node", "ollama", "llama-server"/u);
+  assert.match(windowsUninstall, /Test-PathWithin \$processPath \$VersionsRoot/u);
+});
+
+test("Docker updates stay outside the container and roll back through Compose", async () => {
+  const [dockerfile, installer, updater] = await Promise.all([
+    read("packaging/container/Dockerfile"), read("packaging/docker/install-host-updater.sh"), read("host/updater/docker.go"),
+  ]);
+  assert.match(dockerfile, /MULTIVIBE_HOST_CONTAINER=true/u);
+  assert.doesNotMatch(dockerfile, /docker\.sock/u);
+  assert.match(installer, /multivibe-host-docker-update\.timer/u);
+  assert.match(updater, /ImmutableReference/u);
+  assert.match(updater, /the previous image was restored/u);
+  assert.match(updater, /RepoDigests/u);
+});
+
+test("scheduler cadence supports bounded retry and Linux installer writes", async () => {
+  const linux = await read("packaging/linux/install.sh");
+  const macos = await read("packaging/macos/install.sh");
+  const windows = await read("packaging/windows/install.ps1");
+  const writable = linux.match(/^ReadWritePaths=(.*)$/mu)?.[1];
+  for (const directory of ["LIBRARY_DIRECTORY", "BIN_DIRECTORY", "DATA_DIRECTORY", "SYSTEMD_DIRECTORY", "AUTOSTART_DIRECTORY", "APPLICATIONS_DIRECTORY"]) {
+    assert.ok(writable?.includes(`"$${directory}"`), `${directory} must be writable by the installer`);
+  }
+  assert.match(linux, /OnUnitInactiveSec=1m/u);
+  assert.match(macos, /<key>StartInterval<\/key>\s*<integer>60<\/integer>/u);
+  assert.match(windows, /-RepetitionInterval \(New-TimeSpan -Minutes 1\)/u);
+});
+
+test("native installer health probes reject stalled responses and wrong versions", async (t) => {
+  const { createServer } = await import("node:http");
+  const { spawn } = await import("node:child_process");
+  const scripts = await Promise.all(["linux/install.sh", "macos/install.sh", "windows/install.ps1"].map(async (name) => {
+    const source = await read(`packaging/${name}`);
+    const probe = source.match(/"(fetch\('http:\/\/127\.0\.0\.1:'.*?)"/u)?.[1];
+    assert.ok(probe, `${name}: missing health probe`);
+    return probe;
+  }));
+  // Execute the exact expression embedded by all three installers, not a copy.
+  assert.equal(new Set(scripts).size, 1);
+  let mode = "healthy";
+  const server = createServer((request, response) => {
+    if (mode === "stalled") return;
+    if (mode === "stalled-body") { response.writeHead(200, {"content-type": "application/json"}); response.write('{'); return; }
+    response.writeHead(mode === "error" ? 500 : 200, {"content-type": "application/json"});
+    response.end(JSON.stringify({version: mode === "wrong-version" ? "1.0.0" : "2.0.0"}));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  for (const scenario of ["healthy", "wrong-version", "error", "stalled", "stalled-body"]) {
+    await t.test(scenario, async () => {
+      mode = scenario;
+      const result = await new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, ["--eval", scripts[0], "2.0.0"], {
+          env: {...process.env, MULTIVIBE_HOST_PORT: String(server.address().port)}, stdio: "ignore",
+        });
+        const watchdog = setTimeout(() => { child.kill(); reject(new Error("health probe exceeded its deadline")); }, 9000);
+        child.once("error", (error) => { clearTimeout(watchdog); reject(error); });
+        child.once("exit", (code) => { clearTimeout(watchdog); resolve(code); });
+      });
+      assert.equal(result, scenario === "healthy" ? 0 : 1);
+    });
+  }
+});

@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>fr</string>
+  <key>CFBundleDisplayName</key>
+  <string>MultiVibe Host</string>
+  <key>CFBundleExecutable</key>
+  <string>MultiVibe Host</string>
+  <key>CFBundleIdentifier</key>
+  <string>cloud.multivibe.host</string>
+  <key>CFBundleIconFile</key>
+  <string>MultiVibe.icns</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>MultiVibe Host</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>NSPrincipalClass</key>
+  <string>MVCEFApplication</string>
+  <key>CFBundleShortVersionString</key>
+  <string>__MULTIVIBE_VERSION__</string>
+  <key>CFBundleVersion</key>
+  <string>__MULTIVIBE_BUILD__</string>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>CFBundleURLName</key>
+      <string>cloud.multivibe.host.url</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>multivibe</string>
+      </array>
+    </dict>
+  </array>
+  <key>NSServices</key>
+  <array><dict>
+    <key>NSMenuItem</key><dict><key>default</key><string>Demander à MultiVibe</string></dict>
+    <key>NSMessage</key><string>askSelection</string>
+    <key>NSPortName</key><string>MultiVibe Host</string>
+    <key>NSSendTypes</key><array><string>NSStringPboardType</string></array>
+  </dict></array>
+  <key>LSMinimumSystemVersion</key>
+  <string>__MULTIVIBE_MACOS_MINIMUM_VERSION__</string>
+  <key>LSUIElement</key>
+  <false/>
+  <key>LSMultipleInstancesProhibited</key>
+  <true/>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSCameraUsageDescription</key>
+  <string>MultiVibe peut reconnaître votre compte sur ce Mac, si vous activez cette option. La caméra ne s’allume que quelques secondes et aucune photo n’est conservée ni envoyée.</string>
+</dict>
+</plist>

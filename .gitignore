@@ -1,6 +1,7 @@
 multivibe-pilot/local/*
 !multivibe-pilot/local/README.md
 **/node_modules/
+**/target/
 **/.env
 **/.env.local
 *.log

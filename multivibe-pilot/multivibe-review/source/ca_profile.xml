@@ -1,0 +1,5 @@
+<CommunityApplications>
+  <Profile>MultiVibe Host connects AI provider accounts through an API proxy and dashboard. The container supports Linux amd64 without a GPU or local inference engine. Private credentials and application state remain in persistent appdata.</Profile>
+  <Icon>https://raw.githubusercontent.com/thibautrey/multivibe/main/assets/brand/favicon/favicon-256x256.png</Icon>
+  <WebPage>https://github.com/thibautrey/multivibe</WebPage>
+</CommunityApplications>

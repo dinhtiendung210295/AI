@@ -1,0 +1,112 @@
+name: Immutable Core source release
+
+on:
+  push:
+    tags: ["source-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  managed-validation:
+    runs-on: multivibe-linux
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts
+      - run: npm run build:api
+      - run: node --test dist/managed/*.test.js
+      - run: node scripts/managed/verify-distribution.mjs
+  managed-images:
+    needs: managed-validation
+    runs-on: multivibe-docker
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile: [Dockerfile.managed, Dockerfile.injector]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build isolated runtime without publishing
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          build-args: CORE_SHA=${{ github.sha }}
+          pull: true
+          no-cache: true
+          push: false
+          provenance: mode=max
+          sbom: true
+  release:
+    needs: managed-validation
+    # Cloud verifies this attestation with --deny-self-hosted-runners.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Require immutable annotated source tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/verify-source-release-tag.mjs
+      - name: Build deterministic source archive and approval
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/build-source-release.mjs "$GITHUB_REF_NAME" "$GITHUB_SHA" release-out
+          node scripts/build-source-approval.mjs release-out/source-release.json release/source-distribution-decision.json release-out/distribution-approval.json
+          sha256sum release-out/distribution-approval.json >> release-out/SHA256SUMS
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            release-out/*.tar.gz
+            release-out/distribution-approval.json
+            release-out/source-release.json
+            release-out/SHA256SUMS
+      - name: Generate release notes and platform download links
+        id: release-notes
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_NOTES_API_BASE_URL: ${{ vars.RELEASE_NOTES_API_BASE_URL }}
+          RELEASE_NOTES_API_KEY: ${{ secrets.RELEASE_NOTES_API_KEY }}
+          RELEASE_NOTES_MODEL: ${{ vars.RELEASE_NOTES_MODEL }}
+        run: node scripts/generate-release-notes.mjs release-out release-notes.md
+      - name: Publish immutable source release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_NOTES_OUTCOME: ${{ steps.release-notes.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "::error::A source release already exists; refusing to overwrite it."
+            exit 1
+          fi
+          if [[ "$RELEASE_NOTES_OUTCOME" == success && -s release-notes.md ]]; then
+            notes_args=(--notes-file release-notes.md)
+          else
+            echo "::warning::Optional release notes generation failed; using the original release notes."
+            notes_args=(--notes "Immutable Apache-2.0 source release with GitHub OIDC build provenance.")
+          fi
+          gh release create "$GITHUB_REF_NAME" release-out/* --verify-tag --title "MultiVibe Core source $GITHUB_REF_NAME" "${notes_args[@]}"

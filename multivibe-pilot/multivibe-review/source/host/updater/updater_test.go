@@ -1,0 +1,216 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return function(request)
+}
+
+func testStore(t *testing.T) stateStore {
+	t.Helper()
+	directory := t.TempDir()
+	cache := filepath.Join(directory, "updates")
+	if err := os.Mkdir(cache, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return stateStore{directory: directory, path: filepath.Join(directory, "state.json"), cache: cache, log: filepath.Join(directory, "update.log")}
+}
+
+func TestNotModifiedFeedCannotAuthorizeCachedTarget(t *testing.T) {
+	store := testStore(t)
+	download := filepath.Join(store.cache, "multivibe-host_1.2.3.tar.gz")
+	if err := os.WriteFile(download, []byte("archive"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state, err := defaultState("1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Status = "downloaded"
+	state.FeedETag = `"feed"`
+	state.AvailableVersion = "1.2.3"
+	state.RolloutEligible = true
+	state.DownloadedPath = download
+	state.DownloadedSHA256 = "a"
+	state.Target = &updateTarget{Kind: "archive", Size: 7, SHA256: "a"}
+	if err := store.save(state); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Header.Get("If-None-Match") != "" {
+			t.Fatalf("cannot use conditional requests without a signed cached envelope")
+		}
+		return &http.Response{StatusCode: http.StatusNotModified, Header: make(http.Header), Body: http.NoBody}, nil
+	})}
+	update := updater{store: store, httpClient: client, now: func() time.Time { return time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC) }}
+	if err := update.check(context.Background(), &state, true); err == nil {
+		t.Fatal("unsigned not-modified response authorized a cached target")
+	}
+	if state.Status != "failed" || state.LastErrorCode != "feed_verification_failed" {
+		t.Fatalf("missing verification failure: %#v", state)
+	}
+}
+
+func TestRequestApplyIsPersistedForTheSeparateScheduler(t *testing.T) {
+	store := testStore(t)
+	state, err := defaultState("1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Status = "available"
+	state.AvailableVersion = "1.2.3"
+	state.RolloutEligible = true
+	state.Target = &updateTarget{Kind: "archive", Size: 7, SHA256: "a"}
+	update := updater{store: store}
+	if err := requestOperation(&update, &state, true); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.load("1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.DownloadRequested || !loaded.InstallRequested {
+		t.Fatalf("manual installation request was not persisted: %#v", loaded)
+	}
+}
+
+func TestMissingCachedDownloadIsNotPreserved(t *testing.T) {
+	target := updateTarget{Kind: "archive", Size: 7, SHA256: "a"}
+	if downloadLooksPresent(filepath.Join(t.TempDir(), "missing.tar.gz"), target.Size) {
+		t.Fatal("missing cached download was accepted")
+	}
+}
+
+func TestInstalledVersionClearsObsoleteQueuedUpdate(t *testing.T) {
+	for _, version := range []string{"0.2.32", "0.2.47"} {
+		state, _ := defaultState("0.2.31")
+		state.AvailableVersion = version
+		state.Target = &updateTarget{Kind: "archive"}
+		state.InstallRequested = true
+		state.DownloadRequested = true
+		state.RolloutEligible = true
+		state.DownloadedPath = "/obsolete"
+		state.FeedETag = "old-feed"
+		state.NextCheckAt = time.Now().Add(time.Hour).Format(time.RFC3339Nano)
+		reconcileCurrentVersion(&state, "0.2.47")
+		if state.AvailableVersion != "" || state.InstallRequested || state.DownloadRequested || state.Target != nil || state.DownloadedPath != "" || state.FeedETag != "" || state.NextCheckAt != "" || state.Status != "current" {
+			t.Fatalf("obsolete update survived: %#v", state)
+		}
+	}
+}
+
+func TestObsoleteUpdateCannotBeRequestedDownloadedOrApplied(t *testing.T) {
+	for _, version := range []string{"0.2.32", "0.2.47", "invalid"} {
+		state, _ := defaultState("0.2.47")
+		state.AvailableVersion = version
+		state.Target = &updateTarget{Kind: "archive"}
+		state.RolloutEligible = true
+		update := updater{store: testStore(t)}
+		if requestOperation(&update, &state, true) == nil {
+			t.Fatal("obsolete request accepted")
+		}
+		if update.download(context.Background(), &state) == nil {
+			t.Fatal("obsolete download accepted")
+		}
+		if verifyDownloadedArchive(state) == nil {
+			t.Fatal("obsolete install accepted")
+		}
+		restoreCachedStatus(&state)
+		if state.AvailableVersion != "" {
+			t.Fatal("cached obsolete update restored")
+		}
+	}
+}
+
+func TestPartialReleaseWithoutCurrentPlatformClearsUnavailableUpdate(t *testing.T) {
+	now := time.Now().UTC()
+	document := validDocument(now)
+	name, err := targetName(false)
+	if err != nil {
+		t.Skip(err)
+	}
+	delete(document.Targets, name)
+	payload := signedFixture(t, document)
+	state, err := defaultState("1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.AvailableVersion = "1.1.0"
+	state.DownloadRequested = true
+	state.InstallRequested = true
+	state.Target = &updateTarget{Kind: "archive", Size: 7, SHA256: "a"}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(payload))}, nil
+	})}
+	update := updater{store: testStore(t), httpClient: client, now: func() time.Time { return now }}
+	if err := update.check(context.Background(), &state, true); err != nil {
+		t.Fatal(err)
+	}
+	if state.Status != "current" || state.AvailableVersion != "" || state.Target != nil || state.DownloadRequested || state.InstallRequested {
+		t.Fatalf("absent platform retained an update: %#v", state)
+	}
+}
+
+func TestFailureSchedulesShortRetry(t *testing.T) {
+	store := testStore(t)
+	state, _ := defaultState("1.0.0")
+	state.NextCheckAt = time.Now().Add(14 * time.Hour).Format(time.RFC3339Nano)
+	before := time.Now()
+	_ = setFailure(store, &state, "artifact_download_failed", io.ErrUnexpectedEOF)
+	next, err := time.Parse(time.RFC3339Nano, state.NextCheckAt)
+	if err != nil || next.Before(before.Add(5*time.Minute)) || next.After(time.Now().Add(5*time.Minute)) {
+		t.Fatalf("invalid retry: %s", state.NextCheckAt)
+	}
+	loaded, err := store.load("1.0.0")
+	if err != nil || loaded.Status != "failed" || loaded.NextCheckAt != state.NextCheckAt {
+		t.Fatalf("retry not persisted: %#v %v", loaded, err)
+	}
+}
+
+func TestInterruptedOperationRechecksImmediately(t *testing.T) {
+	for _, status := range []string{"checking", "downloading", "installing"} {
+		t.Run(status, func(t *testing.T) {
+			store := testStore(t)
+			state, _ := defaultState("1.0.0")
+			state.Status = status
+			state.NextCheckAt = time.Now().Add(14 * time.Hour).Format(time.RFC3339Nano)
+			called := false
+			update := updater{store: store, now: time.Now, httpClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				called = true
+				return &http.Response{StatusCode: http.StatusNotModified, Header: make(http.Header), Body: http.NoBody}, nil
+			})}}
+			if err := update.check(context.Background(), &state, false); err == nil {
+				t.Fatal("unexpected 304 must fail verification")
+			}
+			if !called {
+				t.Fatal("interrupted operation stranded until next scheduled check")
+			}
+		})
+	}
+}
+
+func TestProductionHTTPClientDoesNotLimitArtifactBodyToOneMinute(t *testing.T) {
+	t.Setenv("MULTIVIBE_HOST_DATA_DIR", t.TempDir())
+	update, _, err := newUpdater(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if update.httpClient.Timeout != 0 {
+		t.Fatal("whole artifact response has a short timeout")
+	}
+	transport := update.httpClient.Transport.(*http.Transport)
+	if transport.ResponseHeaderTimeout <= 0 || transport.TLSHandshakeTimeout <= 0 {
+		t.Fatal("connection establishment must remain bounded")
+	}
+}

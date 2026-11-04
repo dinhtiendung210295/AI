@@ -1,0 +1,2973 @@
+import CryptoKit
+import Foundation
+import Observation
+import Network
+
+/// Injectable boundary so rotation races can be exercised without real tokens,
+/// network requests, or changes to the user's Keychain.
+@MainActor struct SessionServices {
+    var writeHistory: (Data, URL) throws -> Void = { data, url in
+        try data.write(to: url, options: [.atomic, .completeFileProtection])
+        var values = URLResourceValues(); values.isExcludedFromBackup = true
+        var file = url; try file.setResourceValues(values)
+    }
+    var load: () -> NativeSession? = { SecureStore.load() }
+    var save: (NativeSession) throws -> Void = { try SecureStore.save($0) }
+    var clear: () -> Void = { SecureStore.clear() }
+    var refresh: @MainActor (NativeSession) async throws -> NativeSession = { try await ChatAPI.shared.refresh($0) }
+    var revoke: @MainActor (String) async throws -> Void = { try await ChatAPI.shared.revoke(token: $0) }
+    var readHistory: @MainActor (String) async throws -> AccountHistorySnapshot = { try await ChatAPI.shared.history(token: $0) }
+    var saveHistory: @MainActor (AccountHistorySnapshot, String) async throws -> AccountHistorySnapshot = { try await ChatAPI.shared.saveHistory($0, token: $1) }
+    var stream: @MainActor (String, [ChatMessage], String, @Sendable (String) async -> Void) async throws -> Void = {
+        try await ChatAPI.shared.stream(model: $0, messages: $1, token: $2, onDelta: $3)
+    }
+    var hermesChanges: @MainActor (Int64,String) async throws -> CloudAgentPage = { try await ChatAPI.shared.hermesChanges(after:$0,token:$1) }
+    var hermesMutations: @MainActor (String,[CloudAgentMutation],String) async throws -> CloudAgentReceipts = { try await ChatAPI.shared.hermesMutations(accountId:$0,operations:$1,token:$2) }
+    var artifactImport: @MainActor (String,URL) async throws -> CloudArtifactLocalFile = { try await CloudWorkspaceArtifactStore.shared.importFile(accountId:$0,source:$1) }
+    var artifactLocalChunk: @MainActor (String,CloudArtifactLocalFile,Int) async throws -> Data = { try await CloudWorkspaceArtifactStore.shared.readChunk(accountId:$0,file:$1,index:$2) }
+    var artifactRemove: @MainActor (String,CloudArtifactLocalFile) async throws -> Void = { try await CloudWorkspaceArtifactStore.shared.remove(accountId:$0,file:$1) }
+    var artifactBegin: @MainActor (String,CloudArtifactIdentity,String) async throws -> CloudArtifactManifest = { try await ChatAPI.shared.hermesArtifactBegin(accountId:$0,artifact:$1,token:$2) }
+    var artifactPut: @MainActor (String,CloudArtifactIdentity,Int,Data,String) async throws -> CloudArtifactManifest = { try await ChatAPI.shared.hermesArtifactPutChunk(accountId:$0,artifact:$1,index:$2,data:$3,token:$4) }
+    var artifactComplete: @MainActor (String,CloudArtifactIdentity,String) async throws -> CloudArtifactManifest = { try await ChatAPI.shared.hermesArtifactComplete(accountId:$0,artifact:$1,token:$2) }
+    var artifactRead: @MainActor (String,CloudArtifactIdentity,String) async throws -> CloudArtifactManifest = { try await ChatAPI.shared.hermesArtifactRead(accountId:$0,artifact:$1,token:$2) }
+    var artifactReadChunk: @MainActor (String,CloudArtifactIdentity,Int,String) async throws -> Data = { try await ChatAPI.shared.hermesArtifactReadChunk(accountId:$0,artifact:$1,index:$2,token:$3) }
+    var artifactDownloadBegin: @MainActor (String,CloudArtifactIdentity) async throws -> CloudArtifactLocalFile = { try await CloudWorkspaceArtifactStore.shared.beginDownload(accountId:$0,artifact:$1) }
+    var artifactDownloadAppend: @MainActor (String,CloudArtifactLocalFile,Int,Data) async throws -> Void = { try await CloudWorkspaceArtifactStore.shared.appendDownload(accountId:$0,file:$1,index:$2,data:$3) }
+    var artifactDownloadFinish: @MainActor (String,CloudArtifactLocalFile) async throws -> CloudArtifactLocalFile = { try await CloudWorkspaceArtifactStore.shared.finishDownload(accountId:$0,file:$1) }
+    var artifactURL: @MainActor (String,CloudArtifactLocalFile) async throws -> URL = { try await CloudWorkspaceArtifactStore.shared.url(accountId:$0,file:$1) }
+    var hermesConsent: @MainActor (String) async throws -> CloudHermesConsent = { try await ChatAPI.shared.hermesConsent(token:$0) }
+    var hermesEnable: @MainActor (String, Int, String) async throws -> CloudHermesConsent = { try await ChatAPI.shared.hermesSetConsent(accountId:$0,revision:$1,enabled:true,token:$2) }
+    var hermesAuthorizeSources: @MainActor (String,Int,[String],String) async throws -> CloudHermesConsent = { try await ChatAPI.shared.hermesSetConsent(accountId:$0,revision:$1,enabled:true,token:$3,exportSources:$2) }
+    /// General consent CAS; disabling/revoking must preserve the caller's Cloud flag.
+    var hermesUpdateConsent: @MainActor (String, Int, Bool, [String], String) async throws -> CloudHermesConsent = { account, revision, enabled, sources, token in
+        try await ChatAPI.shared.hermesSetConsent(accountId: account, revision: revision, enabled: enabled, token: token, exportSources: sources)
+    }
+    var hermesLocalCheckpoint: @Sendable (HermesRunContext) async throws -> String? = { try await HermesCheckpointStore.shared.completedMessages($0,engine:CloudHermesBinding.mobileEngine) }
+    var hermesPrepare: @MainActor (String, CloudHermesBinding, String) async throws -> Void = { try await ChatAPI.shared.hermesPrepare(accountId:$0,binding:$1,token:$2) }
+    var hermesCreate: @MainActor (String, CloudHermesRunInput, String) async throws -> CloudHermesRun = { try await ChatAPI.shared.hermesRun(accountId:$0,run:$1,token:$2) }
+    var hermesRead: @MainActor (String, String, String, Bool) async throws -> CloudHermesRun = { try await ChatAPI.shared.hermesRead(accountId:$0,runId:$1,token:$2,cancel:$3) }
+    var remoteHermesModel: @MainActor (String,String) async throws -> CloudHermesModel = { model,token in
+        if model.hasPrefix("relay/") { return try CloudHermesModel.selected(model,access:nil) }
+        let reply = try await ChatAPI.shared.modelAccess(model:model,token:token)
+        guard let cloud = reply.data.first(where: { $0.method == "cloud" && $0.state == "ready" && $0.modelId == model }) else { throw APIError.server(409,"model_access_unavailable") }
+        return try CloudHermesModel.selected(model,access:cloud.selection)
+    }
+    var hermesPollDelay: @Sendable () async throws -> Void = { try await Task.sleep(for:.seconds(1.5)) }
+    var streamAccess: (@MainActor (String, SelectedModelAccess?, [ChatMessage], String, @Sendable (String) async -> Void) async throws -> Void)?
+    var readLocalHistory: @MainActor (URL) throws -> Data = { try Data(contentsOf: $0) }
+    var localAvailability: @MainActor () -> String? = { LocalModel.unavailableReason }
+    var downloadedModels: @MainActor () -> [ModelOption] = { LocalModelLibrary.shared.installed.map(\.option) }
+    var downloadedAvailability: @MainActor (String) -> String? = { id in
+        LocalModelLibrary.shared.installation(id)?.state == .installed ? nil : "Téléchargez ce modèle pour l’utiliser sur cet appareil."
+    }
+    var downloadedRespond: @MainActor (String, [ChatMessage], LocalAgentWorkspace?, @escaping @Sendable (String) async -> Void) async throws -> Void = { id, messages, workspace, delta in
+        guard let entry = LocalModelLibrary.shared.installation(id), entry.state == .installed else {
+            throw LocalAgentError.unavailable("Téléchargez ce modèle pour l’utiliser sur cet appareil.")
+        }
+        try await DownloadedModelRuntime.shared.respond(model: LocalModelLibrary.shared.validated(entry.model), path: LocalModelLibrary.shared.file(entry.model),
+            messages: messages, workspace: workspace, onText: delta)
+    }
+
+    var localRespond: @Sendable ([ChatMessage], LocalAgentWorkspace, @escaping @Sendable (String) async -> Void) async throws -> Void = {
+        try await LocalAgent.respond(messages: $0, workspace: $1, onText: $2)
+    }
+    var webFetch: @Sendable (URL, String) async throws -> LocalWebResponse = { try await LocalWebFetch.fetch(url: $0, method: $1) }
+    var memoryIndex: @MainActor (URL) throws -> MemoryIndex = { try MemoryIndex(url: $0) }
+    var reviewLocalMemory: @Sendable (String) async throws -> String = { try await LocalAgent.reviewMemory($0) }
+    /// Dedicated, workspace-free title summarization for local and downloaded
+    /// models. It never reuses the chat responder, which expects a real turn.
+    var summarizeTitle: @Sendable (String, String) async throws -> String = { model, prompt in
+        try await TitleSummarizer.summarize(model: model, prompt: prompt)
+    }
+    var memoryReviewDelay: @Sendable () async throws -> Void = { try await Task.sleep(for: .seconds(2)) }
+    var monitorConnectivity = true
+    var syncDelay: @Sendable (Int) async throws -> Void = { attempt in try await Task.sleep(for: .seconds(min(60, 2 << attempt))) }
+    var hermesSyncDelay: @Sendable (Int) async throws -> Void = { attempt in try await Task.sleep(for: .seconds(min(60, 2 << min(5, max(0, attempt))))) }
+    var models: @MainActor (String) async throws -> [ModelOption] = { try await ChatAPI.shared.models(token: $0) }
+    var lastUsedModel: @MainActor (String) -> String? = { LastUsedModelStore.model(for: $0) }
+    var rememberLastUsedModel: @MainActor (String, String) -> Void = { LastUsedModelStore.save($0, for: $1) }
+    /// Device-only raw preservation and local conversion; this grants no inference or Cloud consent.
+    var preserveLegacyHistory: @MainActor (Data, URL, String?) async throws -> Void = { data, source, account in
+        let root = source.deletingLastPathComponent().appendingPathComponent("hermes-legacy", isDirectory: true)
+        try await HermesLegacyLedger(root: root).preserveHistory(data, accountID: account)
+    }
+    var legacySnapshot: @MainActor (URL, String) async throws -> HermesLegacyLedgerSnapshot? = { source, account in
+        try await HermesLegacyLedger(root: source.deletingLastPathComponent().appendingPathComponent("hermes-legacy", isDirectory: true)).snapshot(accountID: account)
+    }
+    var legacyExportSnapshot: @MainActor (URL, String) async throws -> HermesLegacyExportJournal.Snapshot = { source, account in
+        try await HermesLegacyExportJournal(root: source.deletingLastPathComponent().appendingPathComponent("hermes-legacy-export", isDirectory: true)).snapshot(accountID: account)
+    }
+    var legacyExportPrepare: @MainActor (URL, HermesLegacyConversion, String, String, [String], CloudHermesConsent) async throws -> HermesLegacyExportJournal.Intent = { source, conversion, account, device, parents, consent in
+        try await HermesLegacyExportJournal(root: source.deletingLastPathComponent().appendingPathComponent("hermes-legacy-export", isDirectory: true))
+            .prepare(conversion, accountID: account, deviceID: device, parents: parents, consent: consent)
+    }
+    var legacyExportQueue: @MainActor (URL, String, String, CloudHermesConsent) async throws -> HermesLegacyExportJournal.Intent = { source, account, operation, consent in
+        try await HermesLegacyExportJournal(root: source.deletingLastPathComponent().appendingPathComponent("hermes-legacy-export", isDirectory: true))
+            .queue(accountID: account, operationID: operation, consent: consent)
+    }
+    var legacyExportReconcile: @MainActor (URL, String, [CloudAgentChange]) async throws -> HermesLegacyExportJournal.Snapshot = { source, account, changes in
+        try await HermesLegacyExportJournal(root: source.deletingLastPathComponent().appendingPathComponent("hermes-legacy-export", isDirectory: true))
+            .reconcile(accountID: account, changes: changes)
+    }
+    var legacyExportAcknowledge: @MainActor (URL, String, [CloudAgentMutation], CloudAgentReceipts) async throws -> HermesLegacyExportJournal.Snapshot = { source, account, submitted, receipts in
+        try await HermesLegacyExportJournal(root: source.deletingLastPathComponent().appendingPathComponent("hermes-legacy-export", isDirectory: true))
+            .acknowledge(accountID: account, submitted: submitted, reply: receipts)
+    }
+
+}
+
+@MainActor @Observable final class ConversationManager {
+    static let shared = makeShared()
+    private static func makeShared() -> ConversationManager {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-local-agent-ui-fixture") {
+            // Deterministic UI transport: no account, disk data, live inference, or network.
+            let manager = ConversationManager(services: SessionServices(writeHistory: { _, _ in }, load: { nil },
+                readLocalHistory: { _ in throw CocoaError(.fileReadNoSuchFile) }, localAvailability: { nil },
+                localRespond: { _, workspace, output in
+                    if ProcessInfo.processInfo.arguments.contains("-local-agent-ui-immediate-reply") {
+                        await output("FIXTURE-REPLY")
+                        return
+                    }
+                    if ProcessInfo.processInfo.arguments.contains("-local-agent-ui-progress") {
+                        await workspace.recordHarness(tool: "harness_message", input: "", output: "Je consulte la page demandée.", status: "info", kind: "message")
+                        await workspace.recordHarness(tool: "Plan", input: "", output: "Lire la source puis vérifier le résultat.", status: "success", kind: "plan")
+                        await workspace.recordHarness(tool: "Sous-agent recherche", input: "", output: "Recherche déléguée disponible.", status: "success", kind: "agent")
+                    }
+                    let result = try await workspace.execute(action: "fetch_website", query: "https://example.com", documentID: "", text: "", lhs: 0, rhs: 0)
+                    await output(result)
+                }, webFetch: { url, _ in
+                    if ProcessInfo.processInfo.arguments.contains("-local-agent-ui-progress") { try await Task.sleep(for: .seconds(5)) }
+                    return LocalWebResponse(url: url, status: 200, contentType: "text/plain", text: "EXAMPLE-FETCH-SUCCEEDED")
+                }, memoryIndex: { _ in try MemoryIndex(url: nil) }, monitorConnectivity: false))
+            if ProcessInfo.processInfo.arguments.contains("-native-intent-local-draft") {
+                manager.queueNativeShortcut(.init(localDraft: "NATIVE-SHORTCUT-DRAFT"))
+            }
+            if ProcessInfo.processInfo.arguments.contains("-native-intent-memory") {
+                manager.queueNativeShortcut(.init(memoryText: "NATIVE-SHORTCUT-MEMORY"))
+            }
+            return manager
+        }
+        #endif
+        return ConversationManager()
+    }
+    private let services: SessionServices
+    var localUnavailableReason: String? { services.localAvailability() }
+    var localDocuments: [LocalDocument] = []
+    var localEvents: [LocalAgentEvent] = []
+    var calendarEnabled = false
+    var remindersEnabled = false
+    var automaticSync = false
+    var memorySyncEnabled = false
+    private(set) var memoryRecords: [AgentMemory] = []
+    private var memoryBaseline: [AgentMemory] = []
+    private var memoryIndex: MemoryIndex?
+    var memoryError: String?
+    var memoryPresented = false
+    var memoryDraft: MemoryDraft?
+    private var memoryReviews: [UUID: Task<Void, Never>] = [:]
+    /// One background title request per conversation; never blocks the main reply.
+    private var titleTasks: [UUID: Task<Void, Never>] = [:]
+    var memoryItems: [MemoryItem] { MemoryPolicy.items(memoryRecords) }
+
+    struct HermesRecovery {
+        let context: HermesRunContext
+        let replyID: UUID
+        let accountRevision: UUID
+        let detail: String
+    }
+    var hermesRecovery: HermesRecovery?
+    private var remoteHermes: [String: RemoteHermesSession] = [:]
+    private(set) var remoteHermesBusy = false
+    private(set) var remoteHermesError: String?
+    struct PendingCloudArtifact: Codable, Equatable {
+        enum Phase: String, Codable { case copied, uploading, uploaded }
+        let account: String
+        let artifact: CloudWorkspaceArtifact
+        let file: CloudArtifactLocalFile
+        let projectParents: [String]
+        let operation: CloudAgentMutation
+        var phase: Phase
+        var identity: CloudArtifactIdentity { .init(artifactId:artifact.artifactId,projectId:artifact.projectId,fileId:artifact.id,byteLength:artifact.byteLength,sha256:artifact.sha256) }
+    }
+    private var pendingCloudArtifacts: [PendingCloudArtifact] = []
+    private var artifactDownloads: [URL:(String,CloudArtifactLocalFile)] = [:]
+    private var cloudAgentState: CloudAgentState?
+    private(set) var cloudAgentSyncing = false
+    private var cloudAgentSyncEpoch:UUID?
+    private var cloudAgentSyncToken:UUID?
+    private var cloudAgentSyncRequested=false
+    private(set) var cloudAgentSyncError: String?
+    struct CloudAgentSummary:Identifiable {
+        let id:String;let kind:String;let title:String;let conflicted:Bool;let deleted:Bool;let value:HistoryJSON?
+    }
+    var cloudAgentObjects:[CloudAgentSummary] {
+        (cloudAgentState?.objects ?? [:]).map { id,object in
+            let value = object.heads.count == 1 ? object.versions[object.heads[0]]?.value : nil
+            return CloudAgentSummary(id:id,kind:object.kind,title:value?.object?["title"]?.string ?? value?.object?["target"]?.string ?? object.kind,
+                conflicted:object.heads.count > 1,deleted:object.deleted,value:value)
+        }.sorted { $0.id < $1.id }
+    }
+    struct CloudWorkspaceDraft {
+        let account:String
+        let epoch:UUID
+        let projectId:String
+        let objectId:String
+        let path:String
+        let content:String
+        let parents:[String]
+        let projectParents:[String]
+    }
+    func cloudWorkspaceDraft(projectId:String,fileId:String?) throws -> CloudWorkspaceDraft {
+        guard let state=cloudAgentState,state.accountId==session?.accountId else { throw APIError.invalidResponse }
+        let project=try state.workspaceProject(projectId)
+        guard let fileId else { return .init(account:state.accountId,epoch:sessionRevision,projectId:projectId,objectId:"",path:"",content:"",parents:[],projectParents:project.heads) }
+        let value:HistoryJSON?
+        let parents:[String]
+        if let pending=state.outbox.first(where:{$0.objectId==fileId}) {
+            guard pending.kind=="file",!pending.deleted else { throw APIError.server(409,"workspace_file_pending_delete") }
+            value=pending.value;parents=pending.parents
+        } else {
+            guard let file=state.objects[fileId],file.kind=="file",!file.deleted,file.heads.count==1 else { throw APIError.server(409,"workspace_file_unavailable") }
+            value=file.versions[file.heads[0]]?.value;parents=file.heads
+        }
+        guard let raw=value?.object,raw["type"]?.string=="hermes_workspace_file",raw["projectId"]?.string==projectId,
+            let path=raw["path"]?.string,let content=raw["content"]?.string,
+            CloudAgentState.workspaceFileID(projectId:projectId,path:path)==fileId else { throw APIError.invalidResponse }
+        try CloudAgentState.validateWorkspaceText(path:path,content:content)
+        return .init(account:state.accountId,epoch:sessionRevision,projectId:projectId,objectId:fileId,path:path,content:content,parents:parents,projectParents:project.heads)
+    }
+    func cloudWorkspaceArtifactDraft(projectId:String,fileId:String?) throws -> CloudWorkspaceDraft {
+        guard let state=cloudAgentState,state.accountId==session?.accountId else { throw APIError.invalidResponse }
+        let project=try state.workspaceProject(projectId)
+        guard let fileId else { return try cloudWorkspaceDraft(projectId:projectId,fileId:nil) }
+        guard let object=state.objects[fileId],!object.deleted,object.kind=="file",object.heads.count==1,
+            let raw=object.versions[object.heads[0]]?.value?.object,raw["projectId"]?.string==projectId,
+            let path=raw["path"]?.string else { throw APIError.invalidResponse }
+        return .init(account:state.accountId,epoch:sessionRevision,projectId:projectId,objectId:fileId,path:path,content:"",parents:object.heads,projectParents:project.heads)
+    }
+    func beginCloudWorkspaceArtifactImport(_ draft:CloudWorkspaceDraft,path:String,sourceURL:URL) async throws -> String {
+        guard cloudWorkspaceDraftVisible(draft) else { throw CancellationError() }
+        try CloudAgentState.validateWorkspacePath(path)
+        let file=try await services.artifactImport(draft.account,sourceURL)
+        guard cloudWorkspaceDraftVisible(draft) else {
+            try? await services.artifactRemove(draft.account,file)
+            throw CancellationError()
+        }
+        return try await importCloudWorkspaceArtifact(draft,path:path,file:file)
+    }
+    func importCloudWorkspaceArtifact(_ draft:CloudWorkspaceDraft,path:String,file:CloudArtifactLocalFile) async throws -> String {
+        let operation:CloudAgentMutation
+        do {
+            guard cloudWorkspaceDraftVisible(draft),let state=cloudAgentState else { throw CancellationError() }
+            let artifact=CloudWorkspaceArtifact(id:CloudAgentState.workspaceFileID(projectId:draft.projectId,path:path),projectId:draft.projectId,path:path,artifactId:UUID().uuidString.lowercased(),byteLength:file.byteLength,sha256:file.sha256)
+            guard !pendingCloudArtifacts.contains(where:{$0.artifact.id==artifact.id}) else { throw APIError.server(409,"workspace_file_pending") }
+            operation=try state.workspaceArtifactMutation(projectId:draft.projectId,objectId:draft.objectId,path:path,artifact:artifact,parents:draft.parents,projectParents:draft.projectParents)
+            pendingCloudArtifacts.append(.init(account:draft.account,artifact:artifact,file:file,projectParents:draft.projectParents,operation:operation,phase:.copied))
+            guard persist() else { pendingCloudArtifacts.removeLast();throw APIError.server(0,"history_cache_write_failed") }
+        } catch { try? await services.artifactRemove(draft.account,file);throw error }
+        await synchronizeCloudAgentState()
+        guard draft.account==session?.accountId,draft.epoch==sessionRevision else { throw CancellationError() }
+        return operation.versionId
+    }
+    func downloadCloudWorkspaceArtifact(projectId:String,fileId:String) async throws -> URL {
+        let draft=try cloudWorkspaceArtifactDraft(projectId:projectId,fileId:fileId)
+        guard let raw=cloudAgentState?.objects[fileId]?.versions[draft.parents[0]]?.value?.object,
+            raw["type"]?.string=="hermes_artifact_file",let artifactId=raw["artifactId"]?.string,
+            let length=raw["byteLength"]?.number,length.isFinite,length.rounded()==length,length>=0,length<=Double(CloudArtifactIdentity.maxFileBytes),let hash=raw["sha256"]?.string else { throw APIError.invalidResponse }
+        let identity=CloudArtifactIdentity(artifactId:artifactId,projectId:projectId,fileId:fileId,byteLength:Int(length),sha256:hash)
+        func current() throws {
+            guard cloudWorkspaceDraftVisible(draft),cloudAgentState?.objects[fileId]?.heads==draft.parents else { throw CancellationError() }
+            try Task.checkCancellation()
+        }
+        let auth=try await validSession();try current()
+        let manifest=try await services.artifactRead(draft.account,identity,auth.accessToken);try current()
+        guard try manifest.checked(expected:identity).state=="complete" else { throw APIError.invalidResponse }
+        let file=try await services.artifactDownloadBegin(draft.account,identity)
+        do {
+        try current()
+        for index in 0..<identity.chunkCount {
+            let bytes=try await services.artifactReadChunk(draft.account,identity,index,auth.accessToken);try current()
+            try await services.artifactDownloadAppend(draft.account,file,index,bytes);try current()
+        }
+        let complete=try await services.artifactDownloadFinish(draft.account,file);try current()
+        let url=try await services.artifactURL(draft.account,complete);try current()
+        artifactDownloads[url]=(draft.account,complete)
+        return url
+        } catch { try? await services.artifactRemove(draft.account,file);throw error }
+    }
+    func releaseCloudWorkspaceArtifactDownload(_ url:URL) async {
+        guard let (account,file)=artifactDownloads.removeValue(forKey:url) else { return }
+        try? await services.artifactRemove(account,file)
+    }
+    func cloudWorkspaceDraftVisible(_ draft:CloudWorkspaceDraft) -> Bool {
+        guard draft.account==session?.accountId,draft.epoch==sessionRevision,let state=cloudAgentState,state.accountId==draft.account,
+            (try? state.workspaceProject(draft.projectId)) != nil else { return false }
+        return draft.objectId.isEmpty || state.objects[draft.objectId]?.deleted != true
+    }
+    func cloudWorkspaceFiles(projectId:String) -> [CloudAgentSummary] {
+        guard let state=cloudAgentState,state.accountId==session?.accountId,(try? state.workspaceProject(projectId)) != nil else { return [] }
+        var files:[String:CloudAgentSummary]=[:]
+        for (id,object) in state.objects where object.kind=="file" && !object.deleted {
+            let values=object.heads.compactMap{object.versions[$0]?.value}.filter{["hermes_workspace_file","hermes_artifact_file"].contains($0.object?["type"]?.string ?? "") && $0.object?["projectId"]?.string==projectId}
+            guard !values.isEmpty else { continue }
+            let paths=Set(values.compactMap{$0.object?["path"]?.string})
+            files[id] = .init(id:id,kind:"file",title:paths.count==1 ? paths.first! : "Versions concurrentes",conflicted:object.heads.count>1,deleted:false,value:object.heads.count==1 ? values.first : nil)
+        }
+        for pending in cloudWorkspacePendingFiles(projectId:projectId) {
+            if let old=files[pending.id],old.conflicted { continue }
+            files[pending.id]=pending
+        }
+        return files.values.sorted{$0.title<$1.title}
+    }
+    func cloudWorkspacePendingFiles(projectId:String) -> [CloudAgentSummary] {
+        guard let state=cloudAgentState,state.accountId==session?.accountId,(try? state.workspaceProject(projectId)) != nil else { return [] }
+        let operations=state.outbox.filter{$0.kind=="file"} + pendingCloudArtifacts.filter{pending in !state.outbox.contains(where:{$0.operationId==pending.operation.operationId})}.map(\.operation)
+        return operations.compactMap { operation in
+            let raw=operation.value?.object ?? state.objects[operation.objectId]?.versions.values.first(where:{$0.value?.object?["projectId"]?.string==projectId})?.value?.object
+            guard ["hermes_workspace_file","hermes_artifact_file"].contains(raw?["type"]?.string ?? ""),raw?["projectId"]?.string==projectId else { return nil }
+            return .init(id:operation.objectId,kind:"file",title:raw?["path"]?.string ?? "Fichier",conflicted:state.conflicts[operation.objectId] != nil,deleted:operation.deleted,value:operation.value)
+        }.sorted{$0.id<$1.id}
+    }
+    func saveCloudWorkspaceFile(_ draft:CloudWorkspaceDraft,path:String,content:String,delete:Bool=false) async throws -> String {
+        guard cloudWorkspaceDraftVisible(draft),let state=cloudAgentState else { throw CancellationError() }
+        let operation=try state.workspaceMutation(projectId:draft.projectId,objectId:draft.objectId,path:path,content:content,
+            parents:draft.parents,projectParents:draft.projectParents,delete:delete)
+        try enqueueCloudAgentMutation(operation)
+        // Offline edits are durable immediately. The existing consent-gated journal retries this exact operation.
+        await synchronizeCloudAgentState()
+        guard draft.account==session?.accountId,draft.epoch==sessionRevision else { throw CancellationError() }
+        return operation.versionId
+    }
+    func cloudWorkspaceWriteStatus(_ draft:CloudWorkspaceDraft,version:String) -> String {
+        guard draft.account==session?.accountId,draft.epoch==sessionRevision,let state=cloudAgentState,state.accountId==draft.account,
+            (try? state.workspaceProject(draft.projectId)) != nil else { return "unavailable" }
+        if let pending=pendingCloudArtifacts.first(where:{$0.operation.versionId==version}) {
+            if let object=state.objects[pending.artifact.id],object.heads != pending.operation.parents && !object.heads.contains(version) { return object.deleted ? "unavailable" : "conflicted" }
+            return "pending"
+        }
+        if let operation=state.outbox.first(where:{$0.versionId==version}) {
+            if state.conflicts[operation.objectId] != nil { return "conflicted" }
+            if let object=state.objects[operation.objectId], !object.heads.contains(operation.versionId), Set(object.heads) != Set(operation.parents) { return "conflicted" }
+            return "pending"
+        }
+        for object in state.objects.values where object.kind=="file" {
+            if let change=object.versions[version] {
+                if object.heads==[version] && (!object.deleted || change.deleted) { return "synced" }
+                return object.deleted ? "unavailable" : "conflicted"
+            }
+        }
+        return "unavailable"
+    }
+    struct CloudConflictReview {
+        let account: String
+        let epoch: UUID
+        let objectId: String
+        let versions: [CloudAgentChange]
+    }
+    func cloudConflictReview(_ id: String) -> CloudConflictReview? {
+        guard let state = cloudAgentState, state.accountId == session?.accountId,
+            let object = state.objects[id], !object.deleted, object.heads.count > 1,
+            CloudAgentState.resolvableKinds.contains(object.kind) else { return nil }
+        let versions = object.heads.sorted().compactMap { object.versions[$0] }
+        guard versions.count == object.heads.count, versions.allSatisfy({ !$0.erased && !$0.deleted && $0.value != nil }) else { return nil }
+        return .init(account:state.accountId,epoch:sessionRevision,objectId:id,versions:versions)
+    }
+    func cloudConflictReviewVisible(_ review: CloudConflictReview) -> Bool {
+        review.epoch == sessionRevision && review.account == session?.accountId &&
+            cloudAgentState?.accountId == review.account &&
+            cloudAgentState?.objects[review.objectId]?.deleted == false
+    }
+    func pendingCloudConflictVersion(_ review: CloudConflictReview) -> String? {
+        guard cloudConflictReviewVisible(review) else { return nil }
+        return cloudAgentState?.outbox.first(where: {
+            $0.objectId == review.objectId && Set($0.parents) == Set(review.versions.map(\.versionId))
+        })?.versionId
+    }
+    func cloudConflictResolved(_ review: CloudConflictReview, version: String) -> Bool {
+        cloudConflictReviewVisible(review) && cloudAgentSyncError == nil &&
+            cloudAgentState?.objects[review.objectId]?.heads == [version] &&
+            cloudAgentState?.outbox.contains(where: { $0.versionId == version }) == false
+    }
+    struct CloudHistoryChoice: Identifiable {
+        let id:String
+        let selectedHead:String
+        let cursor:Int64
+        let anchor:HistoryJSON
+        let history:[HistoryJSON]
+    }
+    private func sessionResolutionSafe(_ id:String) throws {
+        guard let state=cloudAgentState,state.accountId == session?.accountId,
+            !state.outbox.contains(where:{$0.objectId == id || $0.value?.object?["sessionId"]?.string == id}),
+            !cloudHermesBindings.values.contains(where:{$0.sessionId == id}),
+            activeCloudHermes == nil, !remoteHermesBusy else { throw APIError.server(409,"hermes_session_pending_state") }
+        if let local=remoteHermes[id] {
+            guard local.requests.allSatisfy({ request in
+                guard let run=local.results[request.input.runId] else { return false }
+                return ["completed","cancelled"].contains(run.state)
+            }) else { throw APIError.server(409,"hermes_session_pending_state") }
+        }
+        for object in state.objects.values where object.kind == "task" {
+            let values=object.versions.values.filter{$0.value?.object?["sessionId"]?.string == id}
+            if values.isEmpty { continue }
+            guard !object.deleted,object.heads.count == 1 else { throw APIError.server(409,"hermes_session_pending_state") }
+            for change in values {
+                guard let value=change.value?.object,let runId=value["runId"]?.string,let run=discoveredCloudRuns[runId],
+                    run.sessionId == id,run.branchId == value["branchId"]?.string,
+                    ["completed","cancelled"].contains(run.state) else { throw APIError.server(409,"hermes_session_pending_state") }
+            }
+        }
+    }
+    func cloudHistoryChoices(_ review:CloudConflictReview, selectedHead:String) async throws -> [CloudHistoryChoice] {
+        guard cloudConflictReviewVisible(review),!cloudAgentSyncing else { throw CancellationError() }
+        await synchronizeCloudAgentState()
+        guard cloudConflictReviewVisible(review),cloudAgentSyncError == nil,
+            let state=cloudAgentState,Set(state.objects[review.objectId]?.heads ?? []) == Set(review.versions.map(\.versionId)),
+            let selected=review.versions.first(where:{$0.versionId == selectedHead}),selected.kind == "session",
+            let branch=selected.value?.object?["branchId"]?.string,CloudAgentState.uuid(branch)
+        else { throw APIError.server(409,"agent_resolution_review_stale_or_unavailable") }
+        try sessionResolutionSafe(review.objectId)
+        var choices:[CloudHistoryChoice]=[]
+        func append(_ anchor:HistoryJSON,_ id:String) throws {
+            let history=try state.anchoredHistory(anchor,sessionId:review.objectId,account:review.account,runs:discoveredCloudRuns)
+            choices.append(.init(id:id,selectedHead:selectedHead,cursor:state.cursor,anchor:anchor,history:history))
+        }
+        for run in discoveredCloudRuns.values.sorted(by:{$0.runId<$1.runId}) where run.sessionId == review.objectId && run.branchId == branch && run.state == "completed" {
+            try append(.object(["type":.string("hermes_history_anchor"),"source":.string("run"),"runId":.string(run.runId),"sourceBranchId":.string(branch)]),run.runId)
+        }
+        if let local=selected.value?.object?["localTurnId"]?.string,let object=state.objects[local],!object.deleted {
+            for version in object.heads.sorted() {
+                try append(.object(["type":.string("hermes_history_anchor"),"source":.string("message"),"objectId":.string(local),"versionId":.string(version),"sourceBranchId":.string(branch)]),version)
+            }
+        }
+        guard !choices.isEmpty else { throw APIError.server(409,"hermes_history_anchor_unavailable") }
+        return choices
+    }
+    @discardableResult
+    func resolveCloudConflict(_ review: CloudConflictReview, selectedHead: String, historyChoice:CloudHistoryChoice? = nil) async throws -> String {
+        guard !cloudAgentSyncing, review.epoch == sessionRevision, review.account == session?.accountId else { throw CancellationError() }
+        await synchronizeCloudAgentState()
+        guard cloudAgentSyncError == nil, !cloudAgentSyncing, review.epoch == sessionRevision, review.account == session?.accountId else { throw CancellationError() }
+        let auth = try await validSession()
+        let consent = try await services.hermesConsent(auth.accessToken)
+        guard review.epoch == sessionRevision, review.account == session?.accountId,
+            auth.accountId == review.account, consent.accountId == review.account, consent.cloudEnabled else {
+            throw APIError.server(403,"agent_cloud_consent_required")
+        }
+        guard let state = cloudAgentState else { throw APIError.invalidResponse }
+        let mutation:CloudAgentMutation
+        if state.objects[review.objectId]?.kind == "session" {
+            try sessionResolutionSafe(review.objectId)
+            guard let choice=historyChoice,choice.selectedHead == selectedHead,choice.cursor == state.cursor,
+                try state.anchoredHistory(choice.anchor,sessionId:review.objectId,account:review.account,runs:discoveredCloudRuns) == choice.history
+            else { throw APIError.server(409,"hermes_history_review_required") }
+            mutation=try state.anchoredResolution(objectId:review.objectId,reviewedHeads:review.versions.map(\.versionId),selectedHead:selectedHead,account:review.account,anchor:choice.anchor,runs:discoveredCloudRuns)
+        } else { mutation=try state.resolution(objectId:review.objectId,reviewedHeads:review.versions.map(\.versionId),selectedHead:selectedHead,account:review.account) }
+        let oldState=cloudAgentState,oldRemote=remoteHermes[review.objectId]
+        var next=state;try next.enqueue(mutation);cloudAgentState=next
+        if mutation.kind == "session" { remoteHermes[review.objectId]=nil }
+        guard persist() else { cloudAgentState=oldState;remoteHermes[review.objectId]=oldRemote;throw APIError.server(0,"history_cache_write_failed") }
+        await synchronizeCloudAgentState()
+        guard cloudConflictReviewVisible(review) else { throw CancellationError() }
+        // Return the durable identity, not a success claim: the UI verifies the exact acknowledged head.
+        return mutation.versionId
+    }
+    struct LegacyExportSource: Identifiable, Equatable, Sendable {
+        let id: String
+        let title: String
+        let count: Int
+        let exportableCount: Int
+        let guestCount: Int
+    }
+    struct LegacyExportDiscovery: Equatable, Sendable {
+        let accountID: String
+        let sources: [LegacyExportSource]
+        let approvedSources: [String]
+        let cloudEnabled: Bool
+        let consentRevision: Int
+    }
+    private static let legacyExportScopes: Set<String> = ["legacy-native-history", "legacy-native-memory", "legacy-cloud-history", "legacy-guest"]
+    private static func legacyFamily(_ source: String) -> String? {
+        switch source {
+        case "nativeConversation", "nativeMessage": return "legacy-native-history"
+        case "nativeMemory": return "legacy-native-memory"
+        case "cloudConversation", "cloudRepositoryNode": return "legacy-cloud-history"
+        default: return nil
+        }
+    }
+    private static func validateLegacyLedger(_ ledger: HermesLegacyLedgerSnapshot?, account: String) throws {
+        if let ledger {
+            let scope = SHA256.hash(data: Data(("account:" + account).utf8)).map { String(format: "%02x", $0) }.joined()
+            guard ledger.formatVersion == 1, ledger.scope == scope else { throw APIError.invalidResponse }
+        }
+    }
+    private static func legacyDiscovery(account: String, ledger: HermesLegacyLedgerSnapshot?, consent: CloudHermesConsent) -> LegacyExportDiscovery {
+        let definitions = [("legacy-native-history", "Historique de cet appareil"), ("legacy-native-memory", "Mémoire de cet appareil"),
+            ("legacy-cloud-history", "Ancien historique Cloud"), ("legacy-guest", "Données conservées en mode invité")]
+        var sources: [LegacyExportSource] = []
+        for (id, title) in definitions {
+            let records = (ledger?.conversions ?? []).filter { conversion in
+                guard let provenance = conversion.record.provenance, legacyFamily(provenance.source) != nil else { return false }
+                return id == "legacy-guest" ? provenance.guestOrigin != nil : legacyFamily(provenance.source) == id
+            }
+            if !records.isEmpty {
+                sources.append(.init(id: id, title: title, count: records.count,
+                    exportableCount: records.filter { (try? HermesLegacyEnvelopeCodec.encode($0.record)) != nil }.count,
+                    guestCount: records.filter { $0.record.provenance?.guestOrigin != nil }.count))
+            }
+        }
+        return .init(accountID: account, sources: sources,
+            approvedSources: (consent.exportSources ?? []).filter { legacyExportScopes.contains($0) }.sorted(),
+            cloudEnabled: consent.cloudEnabled, consentRevision: consent.revision)
+    }
+    /// Reads preservation and live consent only. Discovery does not enqueue, authorize, or execute anything.
+    func discoverLegacyExports() async throws -> LegacyExportDiscovery {
+        guard !isRestoring, storageLoaded, session != nil else { throw CancellationError() }
+        let epoch = sessionRevision, restoration = restorationRevision
+        let auth = try await validSession()
+        guard sessionRevision == epoch, restorationRevision == restoration, session?.accountId == auth.accountId else { throw CancellationError() }
+        let source = try storageURL()
+        func current() throws {
+            guard !isRestoring, storageLoaded, sessionRevision == epoch, restorationRevision == restoration,
+                  session?.accountId == auth.accountId, try storageURL() == source else { throw CancellationError() }
+            try Task.checkCancellation()
+        }
+        let ledger = try await services.legacySnapshot(source, auth.accountId); try current()
+        try Self.validateLegacyLedger(ledger, account: auth.accountId)
+        let consent = try await services.hermesConsent(auth.accessToken); try current()
+        guard consent.accountId == auth.accountId, consent.revision >= 0,
+              Set(consent.exportSources ?? []).count == (consent.exportSources ?? []).count else { throw APIError.invalidResponse }
+        return Self.legacyDiscovery(account: auth.accountId, ledger: ledger, consent: consent)
+    }
+    /// Exact replacement of the four preservation grants only; all other authorizations survive.
+    @discardableResult
+    func setLegacyExportConsent(selectedSources: [String]) async throws -> LegacyExportDiscovery {
+        guard !isRestoring, storageLoaded, session != nil else { throw CancellationError() }
+        let selected = Set(selectedSources)
+        guard selected.count == selectedSources.count, selected.isSubset(of: Self.legacyExportScopes) else {
+            throw APIError.server(400, "invalid_legacy_export_sources")
+        }
+        let epoch = sessionRevision, restoration = restorationRevision
+        let auth = try await validSession()
+        guard sessionRevision == epoch, restorationRevision == restoration, session?.accountId == auth.accountId else { throw CancellationError() }
+        let source = try storageURL()
+        func current() throws {
+            guard !isRestoring, storageLoaded, sessionRevision == epoch, restorationRevision == restoration,
+                  session?.accountId == auth.accountId, try storageURL() == source else { throw CancellationError() }
+            try Task.checkCancellation()
+        }
+        let ledger = try await services.legacySnapshot(source, auth.accountId); try current()
+        try Self.validateLegacyLedger(ledger, account: auth.accountId)
+        let consent = try await services.hermesConsent(auth.accessToken); try current()
+        guard consent.accountId == auth.accountId, consent.revision >= 0, consent.revision < 9_007_199_254_740_990,
+              Set(consent.exportSources ?? []).count == (consent.exportSources ?? []).count else { throw APIError.invalidResponse }
+        let available = Self.legacyDiscovery(account: auth.accountId, ledger: ledger, consent: consent)
+        guard selected.isSubset(of: Set(available.sources.map(\.id))) else { throw APIError.server(400, "legacy_export_source_unavailable") }
+        if selected.contains("legacy-guest") {
+            guard available.sources.contains(where: { $0.id != "legacy-guest" && $0.guestCount > 0 && selected.contains($0.id) }) else {
+                throw APIError.server(400, "legacy_guest_family_required")
+            }
+        }
+        let merged = Set(consent.exportSources ?? []).subtracting(Self.legacyExportScopes).union(selected).sorted()
+        let enabled = consent.cloudEnabled || !selected.isEmpty
+        let updated = try await services.hermesUpdateConsent(auth.accountId, consent.revision, enabled, merged, auth.accessToken); try current()
+        guard updated.accountId == auth.accountId, updated.revision == consent.revision + 1, updated.cloudEnabled == enabled,
+              Set(updated.exportSources ?? []) == Set(merged), (updated.exportSources ?? []).count == merged.count else {
+            throw APIError.invalidResponse
+        }
+        Task { @MainActor [weak self] in
+            guard let self, self.sessionRevision == epoch, self.restorationRevision == restoration,
+                  self.session?.accountId == auth.accountId, (try? self.storageURL()) == source else { return }
+            await self.synchronizeCloudAgentState()
+        }
+        return Self.legacyDiscovery(account: auth.accountId, ledger: ledger, consent: updated)
+    }
+    private static func legacySourcesApproved(record: HermesLegacyRecord, consent: CloudHermesConsent) -> Bool {
+        guard consent.cloudEnabled, let provenance = record.provenance else { return false }
+        let family: String
+        switch provenance.source {
+        case "nativeConversation", "nativeMessage": family = "legacy-native-history"
+        case "nativeMemory": family = "legacy-native-memory"
+        case "cloudConversation", "cloudRepositoryNode": family = "legacy-cloud-history"
+        default: return false
+        }
+        let approved = Set(consent.exportSources ?? [])
+        return approved.contains(family) && (provenance.guestOrigin == nil || approved.contains("legacy-guest"))
+    }
+    private(set) var discoveredCloudRuns:[String:CloudHermesRun] = [:]
+    /// State-only journal exchange: never starts, resumes or replays an execution.
+    func synchronizeCloudAgentState() async {
+        guard !isRestoring, storageLoaded, session != nil else { return }
+        let epoch=sessionRevision
+        if cloudAgentSyncing,cloudAgentSyncEpoch==epoch { cloudAgentSyncRequested=true;return }
+        let owner=UUID()
+        cloudAgentSyncing=true;cloudAgentSyncEpoch=epoch;cloudAgentSyncToken=owner;cloudAgentSyncRequested=false
+        defer {
+            if sessionRevision==epoch,cloudAgentSyncEpoch==epoch,cloudAgentSyncToken==owner {
+                cloudAgentSyncing=false;cloudAgentSyncEpoch=nil;cloudAgentSyncToken=nil
+                let requested=cloudAgentSyncRequested;cloudAgentSyncRequested=false
+                if requested { Task { await self.synchronizeCloudAgentState() } }
+            }
+        }
+        do {
+            let auth=try await validSession()
+            guard sessionRevision==epoch,cloudAgentSyncToken==owner,session?.accountId==auth.accountId else { throw CancellationError() }
+            if cloudAgentState == nil {
+                cloudAgentState=CloudAgentState(accountId:auth.accountId,deviceId:UUID().uuidString.lowercased())
+                guard persist() else { throw APIError.server(0,"history_cache_write_failed") }
+            }
+            guard cloudAgentState?.accountId == auth.accountId else { throw APIError.invalidResponse }
+            func current() throws {
+                guard sessionRevision == epoch, cloudAgentSyncToken==owner, session?.accountId == auth.accountId else { throw CancellationError() }
+                try Task.checkCancellation()
+            }
+            let legacySource = try storageURL()
+            var exportJournal = try await services.legacyExportSnapshot(legacySource, auth.accountId); try current()
+            func settleConfirmedExports() throws {
+                guard var state = cloudAgentState else { throw CancellationError() }
+                let previous = state
+                for intent in exportJournal.intents.values where intent.phase == .receiptConfirmed || intent.phase == .blocked {
+                    let related = state.outbox.filter { $0.operationId == intent.mutation.operationId || $0.versionId == intent.mutation.versionId }
+                    guard related.allSatisfy({ $0 == intent.mutation }) else { throw APIError.server(409,"agent_operation_reused") }
+                    state.outbox.removeAll { $0 == intent.mutation }
+                }
+                state.memoryWriteScopes = state.memoryWriteScopes?.filter { id, _ in state.outbox.contains { $0.operationId == id } }
+                if state != previous {
+                    cloudAgentState = state
+                    guard persist() else { cloudAgentState = previous; throw APIError.server(0,"history_cache_write_failed") }
+                }
+            }
+            if !exportJournal.intents.isEmpty, let restored = cloudAgentState {
+                exportJournal = try await services.legacyExportReconcile(legacySource, auth.accountId,
+                    restored.objects.values.flatMap { Array($0.versions.values) }); try current()
+            }
+            try settleConfirmedExports()
+            func pull() async throws {
+                while let state=cloudAgentState {
+                    try current()
+                    let page=try await services.hermesChanges(state.cursor,auth.accessToken)
+                    try current()
+                    // Rebase on current journal so local enqueue during network I/O is retained.
+                    let previous=cloudAgentState!
+                    let previousRemote = remoteHermes
+                    cloudAgentState=try previous.applying(page)
+                    for (id, object) in cloudAgentState!.objects where object.deleted {
+                        remoteHermes[id] = nil
+                        for old in previous.objects[id]?.versions.values ?? Dictionary<String,CloudAgentChange>().values {
+                            if let owner = old.value?.object?["sessionId"]?.string { remoteHermes[owner] = nil }
+                        }
+                    }
+                    guard persist() else { remoteHermes=previousRemote;cloudAgentState=previous;throw APIError.server(0,"history_cache_write_failed") }
+                    if !exportJournal.intents.isEmpty {
+                        exportJournal = try await services.legacyExportReconcile(legacySource, auth.accountId, page.changes); try current()
+                        try settleConfirmedExports()
+                    }
+                    if !page.hasMore { break }
+                }
+            }
+            try await pull()
+            // Applied tombstones and recovered publication changes settle journal entries after a restart.
+            let settled=pendingCloudArtifacts.filter { pending in
+                guard let state=cloudAgentState else { return false }
+                return state.objects[pending.artifact.projectId]?.deleted == true || state.objects[pending.artifact.id]?.deleted == true ||
+                    (state.objects[pending.artifact.id]?.versions[pending.operation.versionId] != nil && !state.outbox.contains(where:{$0.operationId==pending.operation.operationId}))
+            }
+            if !settled.isEmpty {
+                let old=pendingCloudArtifacts
+                let ids=Set(settled.map{$0.operation.operationId})
+                pendingCloudArtifacts.removeAll{ids.contains($0.operation.operationId)}
+                guard persist() else { pendingCloudArtifacts=old;throw APIError.server(0,"history_cache_write_failed") }
+                for pending in settled { try? await services.artifactRemove(auth.accountId,pending.file);try current() }
+            }
+            let consent=try await services.hermesConsent(auth.accessToken);try current()
+            guard consent.accountId == auth.accountId else { throw APIError.invalidResponse }
+            if consent.cloudEnabled {
+                try await reconcileLocalTurns(consent:consent,epoch:epoch)
+                try current()
+                for saved in pendingCloudArtifacts where saved.account==auth.accountId && saved.phase != .uploaded {
+                    try current()
+                    guard let state=cloudAgentState else { throw CancellationError() }
+                    // A tombstone must never be resurrected. Conflicts retain the local copy for explicit review.
+                    if state.objects[saved.artifact.projectId]?.deleted == true || state.objects[saved.artifact.id]?.deleted == true { continue }
+                    guard (try? state.workspaceProject(saved.artifact.projectId).heads)==saved.projectParents else { continue }
+                    if let index=pendingCloudArtifacts.firstIndex(where:{$0.operation.operationId==saved.operation.operationId}) {
+                        pendingCloudArtifacts[index].phase = .uploading
+                        guard persist() else { pendingCloudArtifacts[index]=saved;throw APIError.server(0,"history_cache_write_failed") }
+                    }
+                    var manifest=try await services.artifactBegin(auth.accountId,saved.identity,auth.accessToken);try current()
+                    manifest=try manifest.checked(expected:saved.identity)
+                    if manifest.state != "complete" {
+                        for index in 0..<saved.identity.chunkCount where !manifest.received.contains(index) {
+                            let bytes=try await services.artifactLocalChunk(auth.accountId,saved.file,index);try current()
+                            let reply=try await services.artifactPut(auth.accountId,saved.identity,index,bytes,auth.accessToken);try current()
+                            _ = try reply.checked(expected:saved.identity)
+                        }
+                        manifest=try await services.artifactComplete(auth.accountId,saved.identity,auth.accessToken);try current()
+                    }
+                    guard try manifest.checked(expected:saved.identity).state=="complete" else { throw APIError.invalidResponse }
+                    guard var next=cloudAgentState,let index=pendingCloudArtifacts.firstIndex(where:{$0.operation.operationId==saved.operation.operationId}) else { throw CancellationError() }
+                    if next.objects[saved.artifact.projectId]?.deleted == true || next.objects[saved.artifact.id]?.deleted == true { continue }
+                    let previous=next,old=pendingCloudArtifacts[index]
+                    try next.enqueue(saved.operation)
+                    cloudAgentState=next;pendingCloudArtifacts[index].phase = .uploaded
+                    guard persist() else { cloudAgentState=previous;pendingCloudArtifacts[index]=old;throw APIError.server(0,"history_cache_write_failed") }
+                }
+                let ledger = try await services.legacySnapshot(legacySource, auth.accountId); try current()
+                if let ledger {
+                    for conversion in ledger.conversions {
+                        try current()
+                        let opID = conversion.operationID.uuidString.lowercased()
+                        if let saved = exportJournal.intents[opID], saved.phase == .blocked || saved.phase == .receiptConfirmed { continue }
+                        guard Self.legacySourcesApproved(record: conversion.record, consent: consent) else { continue }
+                        guard let state = cloudAgentState else { throw CancellationError() }
+                        let mapped = try HermesLegacyExportJournal.mappedObjectID(record: conversion.record, snapshot: exportJournal)
+                        if let mapped, let object = state.objects[mapped], object.deleted || object.heads.count > 1 || state.conflicts[mapped] != nil { continue }
+                        let parents = mapped.flatMap { state.objects[$0]?.heads } ?? []
+                        // New intent is durable before enqueue. Existing intent retains its original captured parents.
+                        let prepared: HermesLegacyExportJournal.Intent
+                        do {
+                            prepared = try await services.legacyExportPrepare(legacySource, conversion, auth.accountId,
+                                ledger.deviceID.uuidString.lowercased(), parents, consent); try current()
+                        } catch HermesLegacyEnvelopeCodec.Failure.tooLarge { continue }
+                        exportJournal.intents[opID] = prepared
+                        exportJournal.mappings[prepared.identity] = prepared.mutation.objectId
+                        let fresh = try await services.hermesConsent(auth.accessToken); try current()
+                        guard fresh.accountId == auth.accountId else { throw APIError.invalidResponse }
+                        guard Self.legacySourcesApproved(record: conversion.record, consent: fresh) else { continue }
+                        let queued = try await services.legacyExportQueue(legacySource, auth.accountId, opID, fresh); try current()
+                        exportJournal.intents[opID] = queued
+                        guard var next = cloudAgentState else { throw CancellationError() }
+                        if let object = next.objects[queued.mutation.objectId], object.deleted || object.heads.count > 1 { continue }
+                        let previous = next
+                        try next.enqueue(queued.mutation); cloudAgentState = next
+                        guard persist() else { cloudAgentState = previous; throw APIError.server(0,"history_cache_write_failed") }
+                    }
+                }
+                while cloudAgentState?.outbox.isEmpty == false {
+                    let sendConsent = try await services.hermesConsent(auth.accessToken); try current()
+                    guard sendConsent.accountId == auth.accountId else { throw APIError.invalidResponse }
+                    if !sendConsent.cloudEnabled { break }
+                    guard let state = cloudAgentState else { throw CancellationError() }
+
+                    var batch:[CloudAgentMutation]=[]
+                    let blockedLocalSessions = Set(state.outbox.compactMap { operation -> String? in
+                        if operation.kind == "session", operation.value?.object?["historyAnchor"] != nil, operation.value?.object?["localTurnId"] == nil { return nil }
+                        guard let source = operation.value?.object?["localSource"]?.string else { return nil }
+                        let owner = operation.kind == "session" ? operation.objectId : operation.value?.object?["sessionId"]?.string
+                        let approved = (sendConsent.exportSources ?? []).contains(source) && cloudHermesBindings.values.contains(where: { $0.accountId == auth.accountId && $0.permitsLocalOperation(operation) })
+                        return approved ? nil : owner
+                    })
+                    let allowed = state.outbox.filter { operation in
+                        if operation.value?.object?["type"]?.string == "hermes-legacy-preservation" {
+                            guard let intent = exportJournal.intents[operation.operationId], intent.phase == .queued,
+                                  intent.mutation == operation, !operation.deleted,
+                                  Set(intent.requiredSources).isSubset(of: Set(sendConsent.exportSources ?? [])) else { return false }
+                            return state.objects[operation.objectId]?.deleted != true && state.conflicts[operation.objectId] == nil
+                        }
+                        if let writer = state.memoryWriteScopes?[operation.operationId] {
+                            guard let conversation = UUID(uuidString: writer), let binding = cloudHermesBindings[conversation],
+                                binding.accountId == auth.accountId, binding.cloudAuthorized != false,
+                                binding.contextMemoryWritable == true, (binding.contextMemoryIDs ?? []).contains(operation.objectId),
+                                operation.kind == "memory", operation.value?.object?["type"]?.string == "hermes_core_memory" else { return false }
+                        }
+                        if operation.kind == "session", operation.value?.object?["historyAnchor"] != nil, operation.value?.object?["localTurnId"] == nil { return true }
+                        guard let source = operation.value?.object?["localSource"]?.string else { return true }
+                        guard let owner = operation.kind == "session" ? operation.objectId : operation.value?.object?["sessionId"]?.string else { return false }
+                        return !blockedLocalSessions.contains(owner) && (sendConsent.exportSources ?? []).contains(source)
+                    }
+                    if allowed.isEmpty { break }
+                    for operation in allowed.prefix(100) {
+                        if try JSONEncoder().encode(batch+[operation]).count > 900_000 { break }
+                        batch.append(operation)
+                    }
+                    guard !batch.isEmpty else { throw APIError.server(413,"agent_batch_too_large") }
+                    let reply=try await services.hermesMutations(auth.accountId,batch,auth.accessToken);try current()
+                    _ = try cloudAgentState!.acknowledging(reply,submitted:batch)
+                    let legacyBatch = batch.filter { exportJournal.intents[$0.operationId]?.mutation == $0 }
+                    let legacyIDs = Set(legacyBatch.map(\.operationId))
+                    let legacyReceipts = reply.receipts.filter { legacyIDs.contains($0.operationId) }
+                    if !legacyReceipts.isEmpty {
+                        exportJournal = try await services.legacyExportAcknowledge(legacySource, auth.accountId, legacyBatch,
+                            .init(accountId: reply.accountId, receipts: legacyReceipts)); try current()
+                    }
+                    // Rebase receipt handling on the current state after journal actor suspension.
+                    let previous = cloudAgentState!
+                    cloudAgentState=try previous.acknowledging(reply,submitted:batch)
+                    let acknowledged=Set(reply.receipts.map(\.operationId))
+                    let oldPending=pendingCloudArtifacts
+                    let settled=pendingCloudArtifacts.filter{acknowledged.contains($0.operation.operationId)}
+                    pendingCloudArtifacts.removeAll{acknowledged.contains($0.operation.operationId)}
+                    guard persist() else { cloudAgentState=previous;pendingCloudArtifacts=oldPending;throw APIError.server(0,"history_cache_write_failed") }
+                    for pending in settled { try? await services.artifactRemove(auth.accountId,pending.file);try current() }
+                }
+                try await pull()
+            }
+            let anchors=cloudAgentObjects.filter{$0.kind == "session" && !$0.deleted && !$0.conflicted}.compactMap { object -> (String,HistoryJSON)? in
+                guard let anchor=object.value?.object?["historyAnchor"] else { return nil }; return (object.id,anchor)
+            }
+            let anchorRunIDs=Set(anchors.compactMap{$0.1.object?["runId"]?.string})
+            let liveRunIDs=anchorRunIDs.union(Set(cloudAgentObjects.filter{$0.kind == "task" && !$0.deleted && !$0.conflicted}.compactMap{$0.value?.object?["runId"]?.string}))
+            discoveredCloudRuns=discoveredCloudRuns.filter{liveRunIDs.contains($0.key)}
+            for object in cloudAgentObjects where object.kind == "task" && !object.deleted && !object.conflicted {
+                guard let value=object.value?.object,value["type"]?.string == "hermes_run",let runID=value["runId"]?.string else { continue }
+                let run=try await services.hermesRead(auth.accountId,runID,auth.accessToken,false);try current()
+                guard run.sessionId == value["sessionId"]?.string,run.branchId == value["branchId"]?.string else { throw APIError.invalidResponse }
+                discoveredCloudRuns[runID]=run // Separate from legacy conversations and their sync.
+            }
+            for (id,anchor) in anchors where anchor.object?["source"]?.string == "run" {
+                guard let runId=anchor.object?["runId"]?.string,CloudAgentState.uuid(runId) else { throw APIError.invalidResponse }
+                let run=try await services.hermesRead(auth.accountId,runId,auth.accessToken,false);try current()
+                discoveredCloudRuns[runId]=run
+                _ = try cloudAgentState!.anchoredHistory(anchor,sessionId:id,account:auth.accountId,runs:discoveredCloudRuns)
+            }
+            guard persist() else { throw APIError.server(0,"history_cache_write_failed") }
+            cloudAgentSyncError=nil
+            cloudAgentRetryable = false
+        } catch {
+            if sessionRevision == epoch,cloudAgentSyncToken==owner {
+                cloudAgentSyncError=error.localizedDescription
+                if case APIError.server(let status, _) = error {
+                    cloudAgentRetryable = status == 429 || (500...599).contains(status)
+                } else if let transport = error as? URLError {
+                    cloudAgentRetryable = [.timedOut, .networkConnectionLost, .notConnectedToInternet, .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed].contains(transport.code)
+                } else { cloudAgentRetryable = false }
+                if cloudAgentRetryable { scheduleCloudAgentRetry() }
+            }
+        }
+    }
+    var currentLocalHermesExportApproved: Bool {
+        guard let id=selection,let binding=cloudHermesBindings[id],binding.accountId == session?.accountId else { return false }
+        return Set(CloudHermesBinding.localSources).isSubset(of:Set(binding.localExportSources ?? []))
+    }
+    var currentCloudContextSelection: (memory:[String],skills:[String],files:[String],project:String?,memoryWritable:Bool) {
+        guard let id=selection,let binding=cloudHermesBindings[id],binding.accountId == session?.accountId else { return ([],[],[],nil,false) }
+        return (binding.contextMemoryIDs ?? [],binding.contextSkillIDs ?? [],binding.contextFileIDs ?? [],binding.contextProjectID,binding.contextMemoryWritable == true)
+    }
+    func localHermesSeed(conversation id: UUID, input: [ChatMessage], epoch: UUID) async throws -> (history: [HistoryJSON]?, context: String, files: [CloudHermesContext.WorkspaceFile], skills: HermesSkillCatalog?, memory: HermesSelectedMemory?, project: CloudHermesContext.WorkspaceProject?) {
+        guard let binding = cloudHermesBindings[id], binding.accountId == session?.accountId else { return (nil,"",[],nil,nil,nil) }
+        guard binding.pending == nil, let currentTurn = input.last(where: { $0.role == "user" }) else { throw APIError.server(409,"hermes_pending_run_requires_recovery") }
+        let account = binding.accountId
+        var history = binding.history
+        if let object=cloudAgentState?.objects[binding.sessionId] {
+            guard !object.deleted,object.heads.count == 1,let value=object.versions[object.heads[0]]?.value?.object,
+                value["branchId"]?.string == binding.branchId else { throw APIError.server(409,"hermes_binding_branch_changed") }
+            if value["historyAnchor"] != nil || !(binding.localTurns ?? []).contains(where: { !$0.published }) {
+                let shared = try remoteBase(binding.sessionId).history
+                if !shared.isEmpty || value["historyAnchor"] != nil { history=shared }
+            }
+        }
+        for turn in binding.localTurns ?? [] where !turn.published && turn.turnId != currentTurn.id {
+            let context = HermesRunContext(accountID:account,conversationID:id,turnID:turn.turnId,modelID:turn.modelId,source:turn.source)
+            guard let raw = try await services.hermesLocalCheckpoint(context) else { throw APIError.server(409,"hermes_local_checkpoint_requires_recovery") }
+            guard sessionRevision == epoch, session?.accountId == account, conversations.contains(where: { $0.id == id }) else { throw CancellationError() }
+            let messages = try JSONDecoder().decode([HistoryJSON].self,from:Data(raw.utf8))
+            try RemoteHermesSession.validateHistory(messages)
+            guard let start = messages.lastIndex(where: { $0.object?["role"]?.string == "user" }) else { throw APIError.invalidResponse }
+            history = history.isEmpty ? messages : history + Array(messages[start...])
+        }
+        var context = ""
+        var workspaceFiles: [CloudHermesContext.WorkspaceFile] = []
+        var skillCatalog: HermesSkillCatalog?
+        var selectedMemory: HermesSelectedMemory?
+        var selectedProject: CloudHermesContext.WorkspaceProject?
+        if binding.contextProjectID != nil || !(binding.contextMemoryIDs ?? []).isEmpty || !(binding.contextSkillIDs ?? []).isEmpty || !(binding.contextFileIDs ?? []).isEmpty {
+            guard let state = cloudAgentState else { throw APIError.invalidResponse }
+            let snapshot = try CloudHermesContext.build(state:state,accountID:account,projectID:binding.contextProjectID,
+                memoryObjectIDs:binding.contextMemoryIDs ?? [],skillObjectIDs:binding.contextSkillIDs ?? [],fileObjectIDs:binding.contextFileIDs ?? [])
+            workspaceFiles = snapshot.workspaceFiles
+            skillCatalog = snapshot.skillCatalog
+            selectedMemory = binding.contextMemoryWritable == true ? snapshot.selectedMemory : nil
+            selectedProject = snapshot.workspaceProject
+            context = [snapshot.memory,snapshot.skills,snapshot.files].filter { !$0.isEmpty }.joined(separator:"\n\n")
+        }
+        guard sessionRevision == epoch, session?.accountId == account else { throw CancellationError() }
+        if history.isEmpty { return (nil,context,workspaceFiles,skillCatalog,selectedMemory,selectedProject) }
+        history.append(.object(["role":.string("user"),"content":.string(currentTurn.content)]))
+        try RemoteHermesSession.validateHistory(history)
+        return (history,context,workspaceFiles,skillCatalog,selectedMemory,selectedProject)
+    }
+    /// State-only reconciliation. Checkpoints are read without creating leases or invoking tools/models.
+    private func reconcileLocalTurns(consent: CloudHermesConsent, epoch: UUID) async throws {
+        let account = consent.accountId
+        for (id, captured) in cloudHermesBindings where captured.accountId == account && captured.cloudAuthorized != false {
+            if let object=cloudAgentState?.objects[captured.sessionId],object.heads.count == 1,
+                let branch=object.versions[object.heads[0]]?.value?.object?["branchId"]?.string,branch != captured.branchId {
+                if (captured.localTurns ?? []).contains(where:{!$0.published}) { throw APIError.server(409,"hermes_binding_branch_changed") }
+                continue
+            }
+            for (index, turn) in (captured.localTurns ?? []).enumerated() where !turn.published {
+                guard (captured.localExportSources ?? []).contains(turn.source), (consent.exportSources ?? []).contains(turn.source) else { break }
+                guard captured.pending == nil else { throw APIError.server(409,"hermes_pending_run_requires_recovery") }
+                let context = HermesRunContext(accountID:account,conversationID:id,turnID:turn.turnId,modelID:turn.modelId,source:turn.source)
+                guard let checkpoint = try await services.hermesLocalCheckpoint(context) else { break }
+                guard sessionRevision == epoch, session?.accountId == account,
+                    var binding = cloudHermesBindings[id], binding.accountId == account,
+                    binding.localTurns?.indices.contains(index) == true, binding.pending == nil,
+                    (binding.localExportSources ?? []).contains(turn.source), binding.cloudAuthorized != false,
+                    binding.localTurns?[index].turnId == turn.turnId, binding.localTurns?[index].published == false,
+                    conversations.contains(where: { $0.id == id }) else { throw CancellationError() }
+                let history = try JSONDecoder().decode([HistoryJSON].self,from:Data(checkpoint.utf8))
+                guard var state = cloudAgentState, state.accountId == account else { throw APIError.invalidResponse }
+                let previousState = state, previousBinding = binding
+                if binding.localTurns?[index].parentValue == nil, turn.parents.count == 1 {
+                    // Compatibility: recover only the exact captured version, never a newer arbitrary head.
+                    let exact = state.objects[binding.sessionId]?.versions[turn.parents[0]]?.value
+                        ?? state.outbox.first(where: { $0.objectId == binding.sessionId && $0.versionId == turn.parents[0] })?.value
+                    binding.localTurns?[index].parentValue = exact
+                    if exact == nil && turn.parents == [binding.versionId] && state.objects[binding.sessionId] == nil {
+                        let initialValue: HistoryJSON = .object(["type":.string("hermes_session"),"conversationId":.string(binding.conversationId),"branchId":.string(binding.branchId),"title":.string("Hermes chat")])
+                        binding.localTurns?[index].parentValue = initialValue
+                    }
+                }
+                // The first session version is durable and idempotent; later local parents never rebase automatically.
+                if state.objects[binding.sessionId] == nil && !state.outbox.contains(where: { $0.objectId == binding.sessionId }) {
+                    try state.enqueue(.init(operationId:binding.operationId,objectId:binding.sessionId,versionId:binding.versionId,deviceId:binding.deviceId,kind:"session",parents:[],deleted:false,
+                        value:.object(["type":.string("hermes_session"),"branchId":.string(binding.branchId),"conversationId":.string(binding.conversationId),"title":.string("Hermes chat"),"localSource":.string(turn.source)])))
+                }
+                for operation in try binding.localPublication(index:index,checkpoint:history) { try state.enqueue(operation) }
+                cloudAgentState = state; cloudHermesBindings[id] = binding
+                guard persist() else { cloudAgentState = previousState; cloudHermesBindings[id] = previousBinding; throw APIError.server(0,"history_cache_write_failed") }
+            }
+        }
+    }
+    var remoteHermesModels: [ModelOption] { models.filter { !ModelExecution($0.id).isLocal && !$0.id.hasPrefix("personal/") } }
+    var localHermesContinuationModels: [ModelOption] {
+        models.filter { model in
+            if model.id == LocalModel.id { return services.localAvailability() == nil }
+            return ModelExecution(model.id) == .downloaded && services.downloadedAvailability(model.id) == nil
+        }
+    }
+    /// Explicitly materialize a shared session on this device. No network, inference or consent mutation.
+    @discardableResult func continueHermesOnDevice(sessionId: String, model: String, accountId: String) throws -> UUID {
+        guard !isStreaming, !isRestoring, storageLoaded, session?.accountId == accountId,
+              let state = cloudAgentState, state.accountId == accountId,
+              localHermesContinuationModels.contains(where: { $0.id == model }),
+              !state.outbox.contains(where: { $0.objectId == sessionId || $0.value?.object?["sessionId"]?.string == sessionId }) else { throw APIError.server(409,"hermes_local_continuation_unavailable") }
+        if let remote = remoteHermes[sessionId] {
+            guard remote.accountId == accountId, remote.requests.allSatisfy({ request in
+                !remote.cancellations.contains(request.input.runId) && ["completed","cancelled"].contains(remote.results[request.input.runId]?.state ?? "")
+            }) else { throw APIError.server(409,"hermes_pending_run_requires_recovery") }
+        }
+        let base = try remoteBase(sessionId)
+        let matches = cloudHermesBindings.filter { $0.value.accountId == accountId && $0.value.sessionId == sessionId }
+        guard matches.count <= 1 else { throw APIError.server(409,"hermes_duplicate_local_binding") }
+        if let (id,binding) = matches.first {
+            guard binding.branchId == base.branch, binding.pending == nil,
+                  let index = conversations.firstIndex(where: { $0.id == id }) else { throw APIError.server(409,"hermes_pending_run_requires_recovery") }
+            let previous = conversations[index]
+            conversations[index].model=model;conversations[index].modelAccess=nil
+            guard persist() else { conversations[index]=previous;throw APIError.server(0,"history_cache_write_failed") }
+            selection=id;selectedModel=model;selectedAccess=nil
+            return id
+        }
+        let id=UUID(),uuid={UUID().uuidString.lowercased()}
+        let visible = base.history.compactMap { message -> ChatMessage? in
+            guard let value=message.object,let role=value["role"]?.string,["user","assistant"].contains(role),
+                  let content=value["content"]?.string,!content.isEmpty else { return nil }
+            return ChatMessage(role:role,content:content,completion:role == "assistant" ? .completed : nil)
+        }
+        let title=state.objects[sessionId]?.versions[base.heads[0]]?.value?.object?["title"]?.string ?? "Hermes"
+        var conversation=Conversation(id:id,model:model,messages:visible);conversation.title=title
+        var binding=CloudHermesBinding(accountId:accountId,conversationId:id.uuidString.lowercased(),sessionId:sessionId,branchId:base.branch,
+            operationId:uuid(),versionId:base.heads[0],deviceId:state.deviceId,cloudAuthorized:true,localExportSources:[],importApproved:true)
+        binding.history=base.history
+        conversations.append(conversation);cloudHermesBindings[id]=binding
+        guard persist() else { conversations.removeAll{$0.id==id};cloudHermesBindings[id]=nil;throw APIError.server(0,"history_cache_write_failed") }
+        selection=id;selectedModel=model;selectedAccess=nil
+        return id
+    }
+    private func remoteBase(_ id: String) throws -> (branch: String, history: [HistoryJSON], cursor: Int64, heads: [String]) {
+        guard CloudAgentState.uuid(id), let state = cloudAgentState, state.accountId == session?.accountId,
+            let object = state.objects[id], object.kind == "session", !object.deleted, object.heads.count == 1,
+            let version = object.versions[object.heads[0]], let value = version.value?.object,
+            let branch = value["branchId"]?.string, CloudAgentState.uuid(branch) else { throw APIError.server(409,"hermes_session_conflict_or_missing") }
+        var history: [HistoryJSON] = [], cursor: Int64 = 0
+        if let anchor=value["historyAnchor"] {
+            history=try state.anchoredHistory(anchor,sessionId:id,account:state.accountId,runs:discoveredCloudRuns)
+            // Keep the introducing revision as the immutable ordering boundary across metadata edits.
+            var pending=[version.versionId],visited=Set<String>(),origins:[Int64]=[]
+            while let id=pending.popLast() {
+                guard visited.insert(id).inserted else { continue }
+                guard let ancestor=object.versions[id] else { throw APIError.server(409,"hermes_history_anchor_origin_missing") }
+                if ancestor.value?.object?["historyAnchor"] == anchor,ancestor.value?.object?["branchId"]?.string == branch {
+                    origins.append(ancestor.cursor)
+                    pending.append(contentsOf:ancestor.parents.filter {
+                        object.versions[$0]?.value?.object?["historyAnchor"] == anchor && object.versions[$0]?.value?.object?["branchId"]?.string == branch
+                    })
+                }
+            }
+            guard let origin=origins.min(),origin>0 else { throw APIError.server(409,"hermes_history_anchor_origin_missing") }
+            cursor=origin
+        }
+        if let local = value["localTurnId"]?.string {
+            guard CloudAgentState.uuid(local), let message = state.objects[local], message.kind == "message", !message.deleted,
+                message.heads.count == 1, let raw = message.versions[message.heads[0]]?.value?.object,
+                raw["type"]?.string == "hermes_local_turn", raw["sessionId"]?.string == id, raw["branchId"]?.string == branch,
+                raw["turnId"]?.string == local, let saved = raw["history"]?.array else { throw APIError.server(409,"hermes_local_checkpoint_conflict") }
+            let localCursor=message.versions[message.heads[0]]!.cursor
+            guard value["historyAnchor"] == nil || localCursor > cursor else { throw APIError.server(409,"hermes_history_anchor_local_turn_stale") }
+            history = saved; cursor = localCursor
+        } else if value["historyAnchor"] == nil, let saved = value["messages"]?.array { history = saved }
+        for task in state.objects.values where task.kind == "task" && !task.deleted {
+            for head in task.heads {
+                guard let change = task.versions[head], let raw = change.value?.object,
+                    raw["sessionId"]?.string == id, raw["branchId"]?.string == branch else { continue }
+                guard task.heads.count == 1, let runID = raw["runId"]?.string, CloudAgentState.uuid(runID),
+                    let run = discoveredCloudRuns[runID], run.sessionId == id, run.branchId == branch,
+                    ["completed","cancelled"].contains(run.state) else { throw APIError.server(409,"hermes_remote_run_requires_recovery") }
+                if change.cursor > cursor, let result = run.result, run.state == "completed" { history = result.history; cursor = change.cursor }
+            }
+        }
+        if let local = remoteHermes[id], local.branchId == branch {
+            guard local.accountId == state.accountId else { throw APIError.invalidResponse }
+            for request in local.requests {
+                guard let run = local.results[request.input.runId], run.state == "completed", let result = run.result else { continue }
+                if request.baseCursor >= cursor { history = result.history }
+            }
+        }
+        try RemoteHermesSession.validateHistory(history)
+        return (branch,history,cursor,object.heads)
+    }
+    func remoteHermesWorkspaceProject(_ id: String) -> String {
+        guard let object=cloudAgentState?.objects[id],object.heads.count == 1,!object.deleted,
+            let value=object.versions[object.heads[0]]?.value?.object else { return id }
+        return value["workspaceProjectId"]?.string ?? value["projectId"]?.string ?? id
+    }
+    func remoteHermesTranscript(_ id: String) -> [HistoryJSON] { (try? remoteBase(id).history) ?? [] }
+    func remoteHermesPrompt(sessionId: String, runId: String) -> String { remoteHermes[sessionId]?.requests.first { $0.input.runId == runId }?.input.message ?? "" }
+    func remoteHermesRuns(_ id: String) -> [CloudHermesRun] {
+        guard let local = remoteHermes[id], local.accountId == session?.accountId else { return [] }
+        return local.requests.compactMap { local.results[$0.input.runId] }
+    }
+    func sendRemoteHermes(sessionId id: String, model: String, message: String, workspaceProjectId: String? = nil) async throws {
+        guard !remoteHermesBusy, remoteHermesModels.contains(where: { $0.id == model }), !message.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty,
+            message.count <= 32_000 else { throw APIError.invalidResponse }
+        let epoch = sessionRevision, expectedAccount = session?.accountId
+        await synchronizeCloudAgentState()
+        guard sessionRevision == epoch, session?.accountId == expectedAccount else { throw CancellationError() }
+        guard cloudAgentSyncError == nil, !remoteHermesBusy else { throw APIError.server(409,"hermes_session_sync_required") }
+        remoteHermesBusy = true
+        defer { if sessionRevision == epoch { remoteHermesBusy = false } }
+        let auth = try await validSession()
+        let consent = try await services.hermesConsent(auth.accessToken)
+        let selected = try await services.remoteHermesModel(model,auth.accessToken)
+        guard sessionRevision == epoch, session?.accountId == auth.accountId, consent.accountId == auth.accountId,
+            consent.cloudEnabled, ["cloud","relay"].contains(selected.source) else { throw APIError.server(403,"agent_cloud_consent_required") }
+        var base = try remoteBase(id)
+        let metadata = cloudAgentState?.objects[id]?.versions[base.heads[0]]?.value?.object
+        let billingProjectID = metadata?["projectId"]?.string
+        guard billingProjectID == nil || CloudAgentState.uuid(billingProjectID!) else { throw APIError.invalidResponse }
+        let selectedWorkspace = workspaceProjectId ?? metadata?["workspaceProjectId"]?.string
+        let projectID = selectedWorkspace ?? billingProjectID ?? id
+        if let selectedWorkspace {
+            guard CloudAgentState.uuid(selectedWorkspace), let project=cloudAgentState?.objects[selectedWorkspace],
+                ["project","session"].contains(project.kind), !project.deleted, project.heads.count == 1 else { throw APIError.server(409,"hermes_workspace_project_unavailable") }
+        }
+        if workspaceProjectId != nil && projectID != remoteHermesWorkspaceProject(id) {
+            guard let state=cloudAgentState, let object=state.objects[id],
+                var value=object.versions[base.heads[0]]?.value?.object else { throw APIError.invalidResponse }
+            value["workspaceProjectId"] = .string(projectID)
+            try enqueueCloudAgentMutation(.init(operationId:UUID().uuidString.lowercased(),objectId:id,versionId:UUID().uuidString.lowercased(),deviceId:state.deviceId,
+                kind:"session",parents:base.heads,deleted:false,value:.object(value)))
+            await synchronizeCloudAgentState()
+            guard sessionRevision == epoch, session?.accountId == auth.accountId, cloudAgentSyncError == nil,
+                remoteHermesWorkspaceProject(id) == projectID else { throw APIError.server(409,"hermes_workspace_selection_sync_required") }
+            base = try remoteBase(id)
+        }
+        var local = remoteHermes[id] ?? RemoteHermesSession(accountId:auth.accountId,sessionId:id,branchId:base.branch)
+        guard local.requests.allSatisfy({ ["completed","cancelled"].contains(local.results[$0.input.runId]?.state ?? "") }) else { throw APIError.server(409,"hermes_pending_run_requires_recovery") }
+        let input = CloudHermesRunInput(operationId:UUID().uuidString.lowercased(),runId:UUID().uuidString.lowercased(),sessionId:id,branchId:base.branch,
+            model:selected,message:message,history:base.history,workspaceProjectId:selectedWorkspace,projectId:billingProjectID)
+        let previous = remoteHermes[id]
+        local.requests.append(.init(input:input,baseCursor:cloudAgentState!.cursor,sessionHeads:base.heads)); remoteHermes[id] = local
+        guard persist() else { remoteHermes[id] = previous; throw APIError.server(0,"history_cache_write_failed") }
+        try await reconcileRemote(id,auth:auth,epoch:epoch)
+    }
+    private func reconcileRemote(_ id: String, auth: NativeSession, epoch: UUID) async throws {
+        let restoration = restorationRevision
+        func current() throws {
+            try Task.checkCancellation()
+            guard restorationRevision == restoration, sessionRevision == epoch,
+                  session?.accountId == auth.accountId else { throw CancellationError() }
+        }
+        try current()
+        guard let captured = remoteHermes[id], captured.accountId == auth.accountId else { return }
+        for request in captured.requests {
+            try current()
+            guard sessionRevision == epoch, session?.accountId == auth.accountId, remoteHermes[id] != nil else { throw CancellationError() }
+            guard let object = cloudAgentState?.objects[id], !object.deleted, object.heads.count == 1 else { throw APIError.server(409,"hermes_session_conflict_or_missing") }
+            let input = request.input
+            if let known = remoteHermes[id]?.results[input.runId], ["completed","cancelled"].contains(known.state), remoteHermes[id]?.cancellations.contains(input.runId) != true { continue }
+            var run: CloudHermesRun
+            do { run = try await services.hermesRead(auth.accountId,input.runId,auth.accessToken,false) }
+            catch APIError.server(let status, _) where status == 404 {
+                try current()
+                guard remoteHermes[id]?.results[input.runId] == nil, let state = cloudAgentState,
+                    let object = state.objects[id], !object.deleted, object.heads == request.sessionHeads else { throw APIError.server(409,"hermes_remote_request_conflict") }
+                if remoteHermes[id]?.cancellations.contains(input.runId) == true {
+                    run = CloudHermesRun(runId:input.runId,sessionId:id,branchId:input.branchId,state:"cancelled",generation:0,result:nil)
+                    let previous = remoteHermes[id]
+                    remoteHermes[id]?.results[input.runId] = run; remoteHermes[id]?.cancellations.remove(input.runId)
+                    guard persist() else { remoteHermes[id] = previous; throw APIError.server(0,"history_cache_write_failed") }
+                    continue
+                }
+                let consent = try await services.hermesConsent(auth.accessToken)
+                try current()
+                guard sessionRevision == epoch, consent.accountId == auth.accountId, consent.cloudEnabled else { throw APIError.server(403,"agent_cloud_consent_required") }
+                run = try await services.hermesCreate(auth.accountId,input,auth.accessToken)
+            }
+            try current()
+            guard sessionRevision == epoch, session?.accountId == auth.accountId, var live = remoteHermes[id], live.accountId == auth.accountId,
+                run.runId == input.runId, run.sessionId == id, run.branchId == input.branchId else { throw CancellationError() }
+            if let result = run.result { try RemoteHermesSession.validateHistory(result.history) }
+            if live.cancellations.contains(input.runId) {
+                run = try await services.hermesRead(auth.accountId,input.runId,auth.accessToken,true)
+                try current()
+                guard sessionRevision == epoch, session?.accountId == auth.accountId, remoteHermes[id] != nil,
+                    run.runId == input.runId, run.sessionId == id, run.branchId == input.branchId else { throw CancellationError() }
+                live.cancellations.remove(input.runId)
+            }
+            let previous = remoteHermes[id]; live.results[input.runId] = run; remoteHermes[id] = live
+            guard persist() else { remoteHermes[id] = previous; throw APIError.server(0,"history_cache_write_failed") }
+        }
+    }
+    func recoverRemoteHermes() async {
+        guard !isRestoring, storageLoaded, !remoteHermesBusy, !remoteHermes.isEmpty, session != nil else { return }
+        remoteHermesBusy = true; let epoch = sessionRevision
+        let restoration = restorationRevision, account = session?.accountId
+        let ownsRecovery = { self.sessionRevision == epoch && self.restorationRevision == restoration && self.session?.accountId == account }
+        let current = { ownsRecovery() && !Task.isCancelled }
+        defer { if ownsRecovery() { remoteHermesBusy = false } }
+        do {
+            let auth = try await validSession()
+            guard current() else { return }
+            for id in remoteHermes.keys.sorted() {
+                guard current() else { return }
+                try await reconcileRemote(id,auth:auth,epoch:epoch)
+            }
+            guard current() else { return }
+            remoteHermesError = nil
+        } catch { if current() { remoteHermesError = error.localizedDescription } }
+    }
+    func cancelRemoteHermes(sessionId: String, runId: String) async throws {
+        guard !remoteHermesBusy, var local = remoteHermes[sessionId], local.accountId == session?.accountId,
+            local.requests.contains(where: { $0.input.runId == runId }) else { throw APIError.invalidResponse }
+        let previous = local; local.cancellations.insert(runId); remoteHermes[sessionId] = local
+        guard persist() else { remoteHermes[sessionId] = previous; throw APIError.server(0,"history_cache_write_failed") }
+        await recoverRemoteHermes()
+    }
+    /// Call only for explicitly authorized Hermes content; local documents/memory are never auto-enqueued.
+    func enqueueCloudAgentMutation(_ operation:CloudAgentMutation) throws {
+        guard var state=cloudAgentState,state.accountId == session?.accountId else { throw APIError.invalidResponse }
+        let previous=state;try state.enqueue(operation);cloudAgentState=state
+        guard persist() else { cloudAgentState=previous;throw APIError.server(0,"history_cache_write_failed") }
+    }
+    private var cloudHermesBindings: [UUID: CloudHermesBinding] = [:]
+    private(set) var cloudHermesRecoveryRun: String?
+    private(set) var cloudHermesStatus: [UUID:String] = [:]
+    private var cloudHermesRestoreTask: Task<Void,Never>?
+    private var cloudHermesRecoveryRetryTask: Task<Void,Never>?
+    private var cloudHermesRecoveryRetryOwner: UUID?
+    private var cloudHermesRecoveryRetryable = false
+    private func cancelCloudHermesRecoveryRetry() {
+        cloudHermesRecoveryRetryTask?.cancel(); cloudHermesRecoveryRetryTask = nil
+        cloudHermesRecoveryRetryOwner = nil; cloudHermesRecoveryRetryable = false
+    }
+    private static func temporaryCloudHermesRecoveryFailure(_ error: Error) -> Bool {
+        if case APIError.server(let status, let detail) = error {
+            return status == 429 || (500...599).contains(status)
+                || (status == 409 && detail == "hermes_recovery_pending")
+                || (status == 0 && detail == "history_cache_write_failed")
+        }
+        if let transport = error as? URLError {
+            return [.timedOut, .networkConnectionLost, .notConnectedToInternet, .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed].contains(transport.code)
+        }
+        return false
+    }
+    private func scheduleCloudHermesRecoveryRetry() {
+        guard cloudHermesRecoveryRetryTask == nil, cloudHermesRecoveryRetryable, online,
+            !isRestoring, let account = session?.accountId else { return }
+        let epoch = sessionRevision, owner = UUID(), delay = services.hermesSyncDelay
+        cloudHermesRecoveryRetryOwner = owner
+        cloudHermesRecoveryRetryTask = Task { [weak self] in
+            defer {
+                if self?.cloudHermesRecoveryRetryOwner == owner {
+                    self?.cloudHermesRecoveryRetryTask = nil; self?.cloudHermesRecoveryRetryOwner = nil
+                }
+            }
+            var attempt = 0
+            while !Task.isCancelled {
+                guard self?.online == true, self?.sessionRevision == epoch,
+                    self?.session?.accountId == account, self?.cloudHermesRecoveryRetryOwner == owner,
+                    self?.cloudHermesRecoveryRetryable == true else { return }
+                do { try await delay(attempt) } catch { return }
+                do {
+                    guard let self, !Task.isCancelled, online, sessionRevision == epoch,
+                        session?.accountId == account, cloudHermesRecoveryRetryOwner == owner,
+                        cloudHermesRecoveryRetryable else { return }
+                    // GET-only pending-run observation; never creates or replays an execution.
+                    await resumeCloudHermes()
+                }
+                attempt = min(5, attempt + 1)
+            }
+        }
+    }
+    var currentCloudHermesAuthorized: Bool { guard let id = selection else { return false }; return cloudHermesBindings[id]?.accountId == session?.accountId && cloudHermesBindings[id]?.cloudAuthorized != false && session != nil }
+    var currentCloudHermesStatus: String? { selection.flatMap { cloudHermesStatus[$0] } }
+    var currentCloudHermesPending: Bool { selection.flatMap { cloudHermesBindings[$0]?.pending } != nil }
+    func resumeCloudHermes() async {
+        guard !isRestoring, storageLoaded, !isStreaming, session != nil else { return }
+        if let task = cloudHermesRestoreTask { await task.value; return }
+        let revision = sessionRevision
+        let restoration = restorationRevision, account = session?.accountId
+        cloudHermesRecoveryRetryable = false
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                var auth = try await validSession()
+                guard !Task.isCancelled, restorationRevision == restoration, sessionRevision == revision, session?.accountId == account else { return }
+                let deadline = Date().addingTimeInterval(9 * 60)
+                for (id,saved) in cloudHermesBindings where saved.accountId == auth.accountId && saved.pending != nil {
+                    guard !Task.isCancelled, restorationRevision == restoration, sessionRevision == revision, session?.accountId == auth.accountId, !isStreaming else { return }
+                    guard let pending = saved.pending else { continue }
+                    do {
+                        var result = try await services.hermesRead(auth.accountId,pending.runId,auth.accessToken,false)
+                        guard !Task.isCancelled, restorationRevision == restoration, sessionRevision == revision, session?.accountId == account else { return }
+                        while ["queued","running","waiting_device"].contains(result.state) {
+                            guard !Task.isCancelled, restorationRevision == restoration, sessionRevision == revision, session?.accountId == auth.accountId, !isStreaming else { return }
+                            guard Date() < deadline else { throw APIError.server(409,"hermes_recovery_pending") }
+                            guard cloudHermesBindings[id]?.pending?.runId == pending.runId,
+                                cloudHermesStatus[id] != "cancelled", cloudHermesStatus[id] != "completed" else { break }
+                            cloudHermesStatus[id] = result.state
+                            try await services.hermesPollDelay()
+                            guard !Task.isCancelled, restorationRevision == restoration, sessionRevision == revision, session?.accountId == account else { return }
+                            auth = try await validSession()
+                            guard !Task.isCancelled, restorationRevision == restoration, sessionRevision == revision, auth.accountId == saved.accountId else { return }
+                            result = try await services.hermesRead(auth.accountId,pending.runId,auth.accessToken,false)
+                        }
+                        guard !Task.isCancelled, restorationRevision == restoration, sessionRevision == revision, session?.accountId == auth.accountId, !isStreaming else { return }
+                        guard cloudHermesBindings[id]?.pending?.runId == pending.runId else { continue }
+                        try applyCloudHermesRecovery(result, conversation:id, binding:saved)
+                    } catch {
+                        guard !Task.isCancelled, restorationRevision == restoration, sessionRevision == revision, session?.accountId == auth.accountId else { return }
+                        guard cloudHermesBindings[id]?.pending?.runId == pending.runId else { continue }
+                        cloudHermesRecoveryRetryable = cloudHermesRecoveryRetryable || Self.temporaryCloudHermesRecoveryFailure(error)
+                        cloudHermesStatus[id] = "recovery_unavailable"
+                        self.error = "Impossible de vérifier l’exécution Hermes. Aucun nouveau lancement n’a été créé. " + error.localizedDescription
+                    }
+                }
+            } catch { if !Task.isCancelled, restorationRevision == restoration, sessionRevision == revision, session?.accountId == account {
+                cloudHermesRecoveryRetryable = Self.temporaryCloudHermesRecoveryFailure(error)
+                self.error = error.localizedDescription
+            } }
+        }
+        cloudHermesRestoreTask = task; await task.value
+        if restorationRevision == restoration, sessionRevision == revision, session?.accountId == account {
+            cloudHermesRestoreTask = nil
+            if !Task.isCancelled, cloudHermesRecoveryRetryable { scheduleCloudHermesRecoveryRetry() }
+        }
+    }
+    private func applyCloudHermesRecovery(_ run:CloudHermesRun, conversation id:UUID, binding saved:CloudHermesBinding) throws {
+        guard let pending = saved.pending,
+            let current = cloudHermesBindings[id], current.accountId == saved.accountId,
+            current.pending?.runId == pending.runId,
+            cloudHermesStatus[id] != "cancelled", cloudHermesStatus[id] != "completed",
+            run.runId == pending.runId, let stableReplyID = UUID(uuidString:run.runId), run.sessionId == saved.sessionId,
+            run.branchId == saved.branchId, let index = conversations.firstIndex(where:{$0.id == id}) else { throw APIError.invalidResponse }
+        let previousConversation = conversations[index], previousStatus = cloudHermesStatus[id]
+        let previousRecoveryRun = cloudHermesRecoveryRun
+        var binding = current
+        if run.state == "completed", let completed = run.result {
+            guard let turn = binding.turnId, let userIndex = conversations[index].messages.firstIndex(where:{$0.id == turn}),
+                conversations[index].messages[userIndex].content == pending.message else { throw APIError.server(409,"hermes_history_conflict") }
+            let following = conversations[index].messages.dropFirst(userIndex+1)
+            guard following.count <= 1, following.first?.role != "user" else { throw APIError.server(409,"hermes_history_conflict") }
+            if let assistant = following.first, !assistant.content.isEmpty && assistant.content != completed.response { throw APIError.server(409,"hermes_history_conflict") }
+            if !following.isEmpty { conversations[index].messages[userIndex+1].content = completed.response; conversations[index].messages[userIndex+1].completion = .completed }
+            else { conversations[index].messages.append(ChatMessage(id:stableReplyID,role:"assistant",content:completed.response,completion:.completed)) }
+            binding.history = completed.history; binding.pending = nil; cloudHermesRecoveryRun = nil
+        } else if run.state == "cancelled" { binding.pending = nil; cloudHermesRecoveryRun = nil }
+        else if run.state == "awaiting_resolution" { cloudHermesRecoveryRun = run.runId }
+        cloudHermesBindings[id] = binding
+        cloudHermesStatus[id] = run.state
+        guard persist() else {
+            conversations[index] = previousConversation; cloudHermesBindings[id] = current
+            cloudHermesStatus[id] = previousStatus; cloudHermesRecoveryRun = previousRecoveryRun
+            throw APIError.server(0,"history_cache_write_failed")
+        }
+    }
+    func cancelPendingCloudHermes() async {
+        guard let id = selection, let binding = cloudHermesBindings[id], let pending = binding.pending else { return }
+        let revision = sessionRevision
+        do {
+            let auth = try await validSession()
+            guard binding.accountId == auth.accountId else { return }
+            let run = try await services.hermesRead(auth.accountId,pending.runId,auth.accessToken,true)
+            guard sessionRevision == revision, session?.accountId == auth.accountId, !isStreaming else { return }
+            try applyCloudHermesRecovery(run,conversation:id,binding:binding)
+        } catch { if sessionRevision == revision { self.error = error.localizedDescription } }
+    }
+    private var activeCloudHermes: (accountId:String, runId:String, token:String)?
+    /// Call only after UI has explained server-readable storage and obtained explicit agreement.
+    func authorizeHermesCloud(importExistingConversation: Bool, synchronizeLocalTurns: Bool = false, memoryIDs: [String] = [], skillIDs: [String] = [], fileIDs: [String] = [], projectID: String? = nil, memoryWritable: Bool = false) async throws {
+        guard !isStreaming, let id = selection, let conversation = current else { throw APIError.invalidResponse }
+        if !conversation.messages.isEmpty && !importExistingConversation { throw APIError.server(403,"hermes_history_import_required") }
+        let revision = sessionRevision, session = try await validSession()
+        let consent = try await services.hermesConsent(session.accessToken)
+        guard sessionRevision == revision, consent.accountId == session.accountId else { throw CancellationError() }
+        if synchronizeLocalTurns {
+            let sources = Array(Set((consent.exportSources ?? []) + CloudHermesBinding.localSources)).sorted()
+            let enabled = try await services.hermesAuthorizeSources(session.accountId,consent.revision,sources,session.accessToken)
+            guard sessionRevision == revision, selection == id, enabled.accountId == session.accountId, enabled.cloudEnabled,
+                Set(CloudHermesBinding.localSources).isSubset(of:Set(enabled.exportSources ?? [])) else { throw CancellationError() }
+        } else if !consent.cloudEnabled {
+            let enabled = try await services.hermesEnable(session.accountId,consent.revision,session.accessToken)
+            guard sessionRevision == revision, enabled.accountId == session.accountId, enabled.cloudEnabled else { throw CancellationError() }
+        }
+        guard sessionRevision == revision, selection == id else { throw CancellationError() }
+        let uuid = { UUID().uuidString.lowercased() }
+        var binding = cloudHermesBindings[id] ?? CloudHermesBinding(accountId:session.accountId,conversationId:id.uuidString.lowercased(),sessionId:uuid(),branchId:uuid(),operationId:uuid(),versionId:uuid(),deviceId:uuid(),importApproved:importExistingConversation)
+        guard binding.accountId == session.accountId else { throw APIError.invalidResponse }
+        if projectID != nil || !memoryIDs.isEmpty || !skillIDs.isEmpty || !fileIDs.isEmpty {
+            guard let state = cloudAgentState else { throw APIError.invalidResponse }
+            _ = try CloudHermesContext.build(state:state,accountID:session.accountId,projectID:projectID,memoryObjectIDs:memoryIDs,skillObjectIDs:skillIDs,fileObjectIDs:fileIDs)
+        }
+        let previousBinding = cloudHermesBindings[id]
+        binding.contextMemoryWritable = memoryWritable && !memoryIDs.isEmpty
+        binding.contextMemoryIDs=memoryIDs;binding.contextSkillIDs=skillIDs;binding.contextFileIDs=fileIDs;binding.contextProjectID=projectID
+        binding.cloudAuthorized = true
+        binding.localExportSources = synchronizeLocalTurns ? CloudHermesBinding.localSources : []
+        binding.importApproved = binding.importApproved || importExistingConversation
+        cloudHermesBindings[id] = binding
+        guard persist() else { cloudHermesBindings[id] = previousBinding; throw APIError.server(0,"history_cache_write_failed") }
+    }
+
+    func resolveHermesRecovery(_ recovery: HermesRecovery) async {
+        guard !isStreaming,
+              recovery.context.accountID == session?.accountId,
+              recovery.accountRevision == sessionRevision, selection == recovery.context.conversationID else { hermesRecovery = nil; return }
+        do {
+            let engine = try PiAgentHarness().version
+            try await HermesCheckpointStore.shared.skipIndeterminate(recovery.context, engine: engine)
+            guard recovery.accountRevision == sessionRevision, recovery.context.accountID == session?.accountId else { return }
+            hermesRecovery = nil
+            _ = retry(conversation: recovery.context.conversationID, message: recovery.replyID)
+        } catch { self.error = error.localizedDescription }
+    }
+
+    var authenticationPresented = false
+    private(set) var internetApproval: InternetApprovalRequest?
+    private var internetWaiters: [CheckedContinuation<Bool, Never>] = []
+    private var generationExpiresAt: Date?
+    private var approvalStartedAt: Date?
+    private let networkMonitor = NWPathMonitor()
+    private var monitoringNetwork = false
+    private var online = false
+    private var syncTask: Task<Void, Never>?
+    private var cloudAgentRetryTask: Task<Void, Never>?
+    private var cloudAgentRetryOwner: UUID?
+    private var cloudAgentRetryable = false
+    var session: NativeSession? {
+        didSet {
+            if session?.accountId != oldValue?.accountId {
+                cancelCloudHermesRecoveryRetry()
+                cloudAgentRetryTask?.cancel(); cloudAgentRetryTask = nil; cloudAgentRetryOwner = nil; cloudAgentRetryable = false
+            }
+            if session?.accountId != oldValue?.accountId { hermesRecovery = nil; cloudHermesRecoveryRun = nil; cloudHermesBindings = [:]; cloudAgentState=nil; pendingCloudArtifacts=[]; cloudAgentSyncing=false; discoveredCloudRuns=[:]; remoteHermes=[:]; remoteHermesBusy=false; remoteHermesError=nil; cloudHermesRestoreTask?.cancel(); cloudHermesRestoreTask = nil; cloudHermesStatus = [:]; activeCloudHermes = nil; selectedAccess = nil; requestedAccessModel = nil; accessNotice = nil }
+        }
+    }
+    init(services suppliedServices: SessionServices? = nil) {
+        var services = suppliedServices ?? SessionServices()
+        if suppliedServices == nil {
+            services.streamAccess = { try await ChatAPI.shared.stream(model: $0, access: $1, messages: $2, token: $3, onDelta: $4) }
+        }
+        self.services = services
+        session = services.load()
+    }
+    private(set) var isRestoring = true
+    private var restorationRevision = UUID()
+    var conversations: [Conversation] = []
+    var selection: UUID? {
+        didSet {
+            guard selection != oldValue else { return }
+            hermesRecovery = nil
+            stop()
+            voice.silence()
+            error = nil
+            if let current {
+                // Do not silently substitute a different model for an existing chat.
+                selectedModel = current.model
+                if !current.model.isEmpty && !models.contains(where: { $0.id == current.model }) {
+                    models.append(ModelOption(id: current.model))
+                }
+                selectedAccess = current.modelAccess
+            }
+        }
+    }
+    var models: [ModelOption] = []
+    private(set) var isLoadingModels = false
+    private(set) var modelsError: String?
+    private var modelLoadRevision = UUID()
+    var selectedModel = "" { didSet { if selectedModel != oldValue { selectedAccess = nil } } }
+    /// Account the last-used preference belongs to. Guests keep their own slot so
+    /// a signed-out session can never inherit another account's model.
+    private var modelPreferenceScope: String { session?.accountId ?? Self.guestModelScope }
+    static let guestModelScope = "guest"
+    /// Records a model the user actually settled on. Restoration fallbacks and
+    /// conversation switching go through `selectedModel` directly and never land here.
+    private func rememberSelectedModel() {
+        guard !selectedModel.isEmpty else { return }
+        services.rememberLastUsedModel(selectedModel, modelPreferenceScope)
+    }
+    var selectedAccess: SelectedModelAccess?
+    var requestedAccessModel: ModelOption?
+    var accessNotice: String?
+    func chooseModel(_ model: ModelOption, force: Bool = false) async {
+        if ModelExecution(model.id).isLocal {
+            guard !isStreaming else { return }
+            if ModelExecution(model.id) == .downloaded, let reason = services.downloadedAvailability(model.id) { error = reason; return }
+            selectedModel = model.id; selectedAccess = nil
+            if !models.contains(where: { $0.id == model.id }) { models.append(model) }
+            rememberSelectedModel()
+            return
+        }
+        let account = session?.accountId
+        do {
+            let token = try await validSession().accessToken
+            let reply = try await ChatAPI.shared.modelAccess(model: model.id, token: token)
+            guard session?.accountId == account, !isStreaming else { return }
+            let existing = current?.model == model.id ? current?.modelAccess : nil
+            let preferred = existing?.id ?? reply.preferred
+            if !force, let choice = reply.data.first(where: { $0.id == preferred && $0.state == "ready" }) {
+                applyAccess(choice.selection)
+            } else {
+                accessNotice = preferred == nil ? nil : "Choisissez le mode d’accès à utiliser."
+                requestedAccessModel = reply.model.option
+            }
+        } catch { self.error = error.localizedDescription }
+    }
+    func applyAccess(_ access: SelectedModelAccess) {
+        guard !isStreaming else { return }
+        selectedModel = access.modelId; selectedAccess = access
+        rememberSelectedModel()
+        if let id = selection, let index = conversations.firstIndex(where: { $0.id == id }) {
+            conversations[index].model = access.modelId; conversations[index].modelAccess = access
+            conversations[index].updatedAt = Date(); _ = persist()
+        }
+        requestedAccessModel = nil
+    }
+    private func streamUsingAccess(_ model: String, access: SelectedModelAccess?, messages: [ChatMessage], token: String,
+                                   delta: @Sendable (String) async -> Void) async throws {
+        if let stream = services.streamAccess { try await stream(model, access, messages, token, delta) }
+        else { try await services.stream(model, messages, token, delta) }
+    }
+    var error: String?
+    var isStreaming = false
+    /// Explicitly publishes nested message mutations to SwiftUI while a reply streams.
+    private(set) var streamingTextRevision = 0
+    private(set) var completedReply: UUID?
+    let voice = VoiceController()
+    enum ShortcutRequest { case newConversation, dictation, draft(String), voiceConversation, assistantVoiceConversation }
+    enum NativeDestination: String, Equatable { case history, documents, memory, privacy, synchronization }
+    struct NativeShortcut: Equatable {
+        var id = UUID()
+        var destination: NativeDestination?
+        var conversationID: UUID?
+        var accountID: String?
+        var localDraft: String?
+        var memoryText: String?
+        var documentName: String?
+        var documentText: String?
+    }
+    var nativeShortcut: NativeShortcut?
+    var wantsNewConversation = false
+    var wantsVoice = false
+    var wantsImmediateVoiceCapture = false
+    var wantsVoiceConversation = false
+    var pendingDraft: String?
+    private struct PendingHistorySave: Codable {
+        var snapshot: AccountHistorySnapshot
+        var memory: [AgentMemory]?
+        var local: [Conversation]
+        var conversationIDs: [String: UUID]
+        var messageIDs: [String: UUID]
+    }
+    private var importedGuestSnapshots: [UUID: Conversation] = [:]
+    private var storageLoaded = false
+    var nativeDataReady: Bool { !isRestoring && storageLoaded }
+    private var pendingHistorySave: PendingHistorySave?
+    private struct HistoryCache: Codable {
+        var cloudHermesBindings: [UUID: CloudHermesBinding]?
+        var cloudAgentState: CloudAgentState?
+        var pendingCloudArtifacts: [PendingCloudArtifact]?
+        var remoteHermes: [String:RemoteHermesSession]?
+        var discoveredCloudRuns: [String:CloudHermesRun]?
+        var memory: [AgentMemory]?
+        var memoryBaseline: [AgentMemory]?
+        var memorySyncEnabled: Bool?
+        var calendarEnabled: Bool?
+        var remindersEnabled: Bool?
+        var documents: [LocalDocument]?
+        var importedGuestSnapshots: [UUID: Conversation]?
+        var automaticSync: Bool?
+        var conversations: [Conversation]
+        var snapshot: AccountHistorySnapshot?
+        var pending: PendingHistorySave?
+        var baseline: [Conversation]
+        var conversationIDs: [String: UUID]
+        var messageIDs: [String: UUID]
+    }
+    private var historySnapshot: AccountHistorySnapshot?
+    private var historyBaseline: [Conversation] = []
+    private var historyConversationIDs: [String: UUID] = [:]
+    private var historyMessageIDs: [String: UUID] = [:]
+    private(set) var isSynchronizing = false
+    var historyStatus: String?
+    private(set) var hasHistoryConflict = false
+    var passwordRecovery: PasswordRecoveryRequest?
+    private var activeReply: (conversation: UUID, message: UUID)?
+    private var generation: Task<Void, Never>?
+    private var generationDeadline: Task<Void, Never>?
+    private var refreshTask: Task<NativeSession, Error>?
+    private var refreshRevision = UUID()
+    private var sessionRevision = UUID()
+    private var generationRevision = UUID()
+    var historyConversations: [Conversation] { conversations.filter { !$0.messages.isEmpty } }
+    var current: Conversation? { conversations.first { $0.id == selection } }
+
+    private var initialRestoration: Task<Void, Never>?
+    /// App launch and entity resolution share one restoration without remote model
+    /// discovery. Existing opt-in automatic history sync keeps its normal policy.
+    func restoreForNativeEntry() async {
+        if let task = initialRestoration { await task.value; return }
+        guard isRestoring else { return }
+        let task = Task { await self.restore(loadRemoteModels: false) }
+        initialRestoration = task
+        await task.value
+    }
+
+    func restore(loadRemoteModels: Bool = true) async {
+        let restoration = UUID()
+        let capturedAccount = session?.accountId
+        let capturedSession = sessionRevision
+        restorationRevision = restoration
+        // Invalidate suspended owners before clearing their journals on the same account.
+        cloudAgentSyncToken = nil; cloudAgentSyncEpoch = nil
+        cloudAgentSyncing = false; cloudAgentSyncRequested = false
+        cloudAgentRetryTask?.cancel(); cloudAgentRetryTask = nil; cloudAgentRetryOwner = nil; cloudAgentRetryable = false
+        cloudHermesRestoreTask?.cancel(); cloudHermesRestoreTask = nil
+        cancelCloudHermesRecoveryRetry()
+        isRestoring = true
+        let ownsRestoration = { self.restorationRevision == restoration && self.sessionRevision == capturedSession && self.session?.accountId == capturedAccount }
+        defer {
+            if ownsRestoration() {
+                isRestoring = false
+                if storageLoaded && !Task.isCancelled {
+                    scheduleAutomaticSync()
+                    Task {
+                        guard ownsRestoration(), self.storageLoaded, !Task.isCancelled else { return }
+                        await self.synchronizeCloudAgentState()
+                        guard ownsRestoration(), self.storageLoaded, !Task.isCancelled else { return }
+                        await self.resumeCloudHermes()
+                        guard ownsRestoration(), self.storageLoaded, !Task.isCancelled else { return }
+                        await self.recoverRemoteHermes()
+                    }
+                }
+            }
+        }
+        startNetworkMonitoring()
+        models = [LocalModel.option] + services.downloadedModels()
+        selectedModel = restoredModel(for: modelPreferenceScope, in: models) ?? LocalModel.id
+        storageLoaded = false
+        memoryReviews.values.forEach { $0.cancel() }; memoryReviews = [:]
+        titleTasks.values.forEach { $0.cancel() }; titleTasks = [:]
+        memoryRecords = []; memoryBaseline = []; memoryIndex = nil; memoryDraft = nil; memorySyncEnabled = false; memoryError = nil
+        calendarEnabled = false; remindersEnabled = false; cloudHermesBindings = [:]; cloudAgentState=nil; pendingCloudArtifacts=[]; discoveredCloudRuns=[:]; remoteHermes=[:]; remoteHermesBusy=false; remoteHermesError=nil; cloudHermesRecoveryRun = nil
+        do {
+            let capturedURL = try storageURL()
+            try Task.checkCancellation()
+            let data: Data?
+            do { data = try services.readLocalHistory(capturedURL) }
+            catch CocoaError.fileReadNoSuchFile { data = nil }
+            if let data {
+                try await services.preserveLegacyHistory(data, capturedURL, capturedAccount)
+                try Task.checkCancellation()
+                guard ownsRestoration() else { return }
+                if let cache = try? JSONDecoder().decode(HistoryCache.self, from: data) {
+                    cloudAgentState = cache.cloudAgentState?.accountId == session?.accountId ? cache.cloudAgentState : nil
+                    discoveredCloudRuns = cloudAgentState == nil ? [:] : (cache.discoveredCloudRuns ?? [:])
+                    pendingCloudArtifacts = (cache.pendingCloudArtifacts ?? []).filter { $0.account == session?.accountId }
+                    remoteHermes = (cache.remoteHermes ?? [:]).filter { $0.value.accountId == session?.accountId }
+                    cloudHermesBindings = (cache.cloudHermesBindings ?? [:]).filter { $0.value.accountId == session?.accountId }
+                    memoryRecords = cache.memory ?? []; memoryBaseline = cache.memoryBaseline ?? []; memorySyncEnabled = cache.memorySyncEnabled ?? false
+                    calendarEnabled = cache.calendarEnabled ?? false
+                    remindersEnabled = cache.remindersEnabled ?? false
+                    localDocuments = cache.documents ?? []
+                    automaticSync = cache.automaticSync ?? false
+                    importedGuestSnapshots = cache.importedGuestSnapshots ?? [:]
+                    conversations = cache.conversations
+                    pendingHistorySave = cache.pending
+                    historySnapshot = cache.snapshot; historyBaseline = cache.baseline
+                    historyConversationIDs = cache.conversationIDs; historyMessageIDs = cache.messageIDs
+                } else { conversations = try JSONDecoder().decode([Conversation].self, from: data) }
+                // A persisted in-flight response cannot still be running after launch.
+                for i in conversations.indices {
+                    for j in conversations[i].messages.indices where conversations[i].messages[j].completion == .streaming {
+                        conversations[i].messages[j].completion = .stopped
+                    }
+                }
+            }
+            storageLoaded = true
+            do {
+                memoryIndex = try services.memoryIndex(capturedURL.deletingPathExtension().appendingPathExtension("memory.sqlite"))
+                try memoryIndex?.rebuild(memoryItems)
+            } catch { memoryError = MemoryError.storage.localizedDescription }
+            if loadRemoteModels && session != nil {
+                Task {
+                    guard ownsRestoration(), self.storageLoaded, !Task.isCancelled else { return }
+                    await self.reloadModels()
+                }
+            }
+        } catch {
+            guard ownsRestoration(), !Task.isCancelled, !(error is CancellationError) else { return }
+            self.error = error.localizedDescription
+        }
+    }
+    /// Explicit network recovery without re-reading or replacing local history.
+    func refreshDownloadedModels() {
+        let downloaded = services.downloadedModels()
+        models.removeAll { option in ModelExecution(option.id) == .downloaded && !downloaded.contains(where: { $0.id == option.id }) }
+        for model in downloaded where !models.contains(where: { $0.id == model.id }) { models.append(model) }
+    }
+    /// The remembered model is a preference, not an entitlement: reuse it only
+    /// when it is present in the given catalog, otherwise fall back to the local model.
+    private func restoredModel(for scope: String, in available: [ModelOption]) -> String? {
+        guard let remembered = services.lastUsedModel(scope),
+              available.contains(where: { $0.id == remembered }) else { return nil }
+        return remembered
+    }
+    func reloadModels() async {
+        guard session != nil, !isLoadingModels, !isStreaming else { return }
+        let accountRevision = sessionRevision
+        let loadRevision = UUID()
+        modelLoadRevision = loadRevision
+        isLoadingModels = true
+        modelsError = nil
+        defer { if modelLoadRevision == loadRevision { isLoadingModels = false } }
+        do {
+            let credentials = try await validSession()
+            let remoteModels = try await services.models(credentials.accessToken)
+            guard sessionRevision == accountRevision, modelLoadRevision == loadRevision else { return }
+            // Sending can begin while this request is in flight; never switch its model.
+            guard !isStreaming else { return }
+            var available = [LocalModel.option] + services.downloadedModels() + remoteModels.filter { !ModelExecution($0.id).isLocal }
+            for favorite in ModelFavoriteStore.load().sorted() where !available.contains(where: { $0.id == favorite }) {
+                available.append(models.first { $0.id == favorite } ?? ModelOption(id: favorite))
+            }
+            if let current, !current.model.isEmpty, !available.contains(where: { $0.id == current.model }) {
+                available.append(models.first { $0.id == current.model } ?? ModelOption(id: current.model))
+            }
+            models = available
+            if !selectedModel.isEmpty {
+                if !available.contains(where: { $0.id == selectedModel }) { selectedModel = "" }
+            } else if let current {
+                selectedModel = available.contains(where: { $0.id == current.model }) ? current.model : ""
+            } else if let remembered = restoredModel(for: modelPreferenceScope, in: available) {
+                // No conversation selected: start from the last model this account used.
+                selectedModel = remembered
+            } else { selectedModel = available.first?.id ?? "" }
+            if let current, current.model == selectedModel { selectedAccess = current.modelAccess }
+
+        } catch {
+            if sessionRevision == accountRevision, modelLoadRevision == loadRevision {
+                modelsError = "Impossible de charger les modèles. Vérifiez votre connexion puis réessayez."
+            }
+        }
+    }
+    private func resetModelLoading() {
+        modelLoadRevision = UUID()
+        isLoadingModels = false
+        modelsError = nil
+    }
+    func validSession() async throws -> NativeSession {
+        guard let previous = session else { throw APIError.authenticationRequired }
+        if previous.expiresAt > Date().addingTimeInterval(60) { return previous }
+        let revision = sessionRevision
+        if let refreshTask {
+            let renewed = try await refreshTask.value
+            guard sessionRevision == revision else { throw CancellationError() }
+            return renewed
+        }
+        let flight = UUID()
+        refreshRevision = flight
+        // One owner persists the rotated token; concurrent callers only await it.
+        let task = Task { @MainActor in
+            defer { if refreshRevision == flight { refreshTask = nil } }
+            let renewed: NativeSession
+            do {
+                renewed = try await services.refresh(previous)
+            } catch APIError.server(400, "invalid_grant") {
+                guard sessionRevision == revision else { throw CancellationError() }
+                await closeRejectedSession(
+                    message: "Votre session a expiré. Reconnectez-vous pour retrouver les modèles Cloud."
+                )
+                throw APIError.authenticationRequired
+            }
+            if sessionRevision == revision {
+                do {
+                    try services.save(renewed)
+                    session = renewed
+                } catch {
+                    // The previous refresh token may already be consumed. Never
+                    // keep it as an apparently usable local session after failure.
+                    stop()
+                    voice.silence()
+                    sessionRevision = UUID()
+                    resetModelLoading()
+                    let failedRevision = sessionRevision
+                    isRestoring = true
+                    services.clear()
+                    session = nil
+                    conversations = []; selection = nil
+                    resetHistorySync()
+                    models = []; selectedModel = ""
+                    localDocuments = []; automaticSync = false; cloudHermesBindings = [:]; cloudAgentState=nil; pendingCloudArtifacts=[]; discoveredCloudRuns=[:]; remoteHermes=[:]; remoteHermesBusy=false; remoteHermesError=nil; cloudHermesRecoveryRun = nil
+                    await restore(loadRemoteModels: false)
+                    nativeShortcut = nil
+        wantsNewConversation = false; wantsVoice = false
+                    wantsVoiceConversation = false; wantsImmediateVoiceCapture = false; pendingDraft = nil
+                    self.error = "Impossible de sauvegarder la session dans le Trousseau. Reconnectez-vous."
+                    do { try await services.revoke(renewed.refreshToken) }
+                    catch {
+                        if sessionRevision == failedRevision {
+                            self.error = "Session locale fermée. La révocation distante n’a pas pu être confirmée. Reconnectez-vous."
+                        }
+                    }
+                    throw APIError.authenticationRequired
+                }
+            } else {
+                // An account switch can orphan a rotation even without logout.
+                // Revoke only the old account's token, never touch the new session.
+                try? await services.revoke(renewed.refreshToken)
+            }
+            // Logout may need this rotated token for revocation even after the UI
+            // session was cleared. Never restore UI state across account revisions.
+            return renewed
+        }
+        refreshTask = task
+        let renewed = try await task.value
+        guard sessionRevision == revision else { throw CancellationError() }
+        return renewed
+    }
+
+    /// A rejected refresh token cannot become usable again. Clear only the
+    /// authentication state, then restore the guest workspace from local disk.
+    private func closeRejectedSession(message: String) async {
+        stop()
+        voice.silence()
+        sessionRevision = UUID()
+        resetModelLoading()
+        isRestoring = true
+        services.clear()
+        session = nil
+        conversations = []; selection = nil
+        resetHistorySync()
+        models = [LocalModel.option]; selectedModel = LocalModel.id
+        localDocuments = []; automaticSync = false; cloudHermesBindings = [:]; cloudAgentState=nil; pendingCloudArtifacts=[]; discoveredCloudRuns=[:]; remoteHermes=[:]; remoteHermesBusy=false; remoteHermesError=nil; cloudHermesRecoveryRun = nil
+        await restore(loadRemoteModels: false)
+        nativeShortcut = nil
+        wantsNewConversation = false; wantsVoice = false
+        wantsVoiceConversation = false; wantsImmediateVoiceCapture = false; pendingDraft = nil
+        error = message
+        authenticationPresented = true
+    }
+    func accept(_ session: NativeSession) async throws {
+        nativeShortcut = nil
+        do { try services.save(session) }
+        catch {
+            // All sign-in paths issue a real server session before persistence.
+            // A failed Keychain write must not leave that session orphaned.
+            let persistenceError = error
+            try? await services.revoke(session.refreshToken)
+            throw persistenceError
+        }
+        stop()
+        refreshRevision = UUID()
+        refreshTask = nil
+        sessionRevision = UUID()
+        resetModelLoading()
+        isRestoring = true
+        resetHistorySync()
+        self.session = session
+        error = nil; models = []; selectedModel = ""
+        conversations = []; localDocuments = []; automaticSync = false; cloudHermesBindings = [:]; cloudAgentState=nil; pendingCloudArtifacts=[]; discoveredCloudRuns=[:]; remoteHermes=[:]; remoteHermesBusy=false; remoteHermesError=nil; cloudHermesRecoveryRun = nil; selection = nil
+        await restore()
+    }
+    /// Keep only the latest foreground request while authentication restores.
+    /// Preparing an intent never edits history or starts microphone/network work.
+    func prepareShortcut(_ request: ShortcutRequest) {
+        wantsNewConversation = false; wantsVoice = false
+        wantsVoiceConversation = false; wantsImmediateVoiceCapture = false; pendingDraft = nil
+        switch request {
+        case .newConversation: wantsNewConversation = true
+        case .dictation: wantsVoice = true
+        case .draft(let text): pendingDraft = String(text.prefix(32_000))
+        case .voiceConversation: wantsVoiceConversation = true
+        case .assistantVoiceConversation:
+            wantsVoiceConversation = true
+            wantsImmediateVoiceCapture = true
+        }
+    }
+    /// Foreground-only handoff. Account identity and selected IDs are revalidated
+    /// after restoration, never trusted from cached Shortcuts entity labels.
+    func queueNativeShortcut(_ request: NativeShortcut) {
+        prepareShortcut(.draft(""))
+        pendingDraft = nil
+        nativeShortcut = request
+    }
+    func applyNativeShortcut() throws -> NativeShortcut? {
+        guard !isRestoring, storageLoaded else { return nil }
+        guard let request = nativeShortcut else { return nil }
+        nativeShortcut = nil
+        guard request.accountID == session?.accountId else { throw NativeShortcutError.missing }
+        guard !isStreaming, !isSynchronizing else { throw NativeShortcutError.busy }
+        if let id = request.conversationID {
+            guard conversations.contains(where: { $0.id == id }) else { throw NativeShortcutError.missing }
+            selection = id
+        }
+        if let draft = request.localDraft {
+            if let reason = localUnavailableReason { throw LocalAgentError.unavailable(reason) }
+            selectedModel = LocalModel.id
+            newConversation()
+            pendingDraft = String(draft.prefix(32_000))
+        }
+        if let text = request.memoryText {
+            let text = String(text.prefix(600)).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { throw NativeShortcutError.empty }
+            memoryDraft = MemoryDraft(text: text, evidence: MemoryEvidence(origin: .userEntry,
+                quote: text, date: Date(), sourceRole: "user"))
+        }
+        if let name = request.documentName, let text = request.documentText {
+            guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw NativeShortcutError.empty }
+            try importDocument(name: name, text: text)
+        }
+        return request
+    }
+    func shortcutConversation(_ id: UUID, accountID: String?) throws -> Conversation {
+        guard !isRestoring, storageLoaded else { throw NativeShortcutError.notReady }
+        guard accountID == session?.accountId,
+              let conversation = conversations.first(where: { $0.id == id }) else { throw NativeShortcutError.missing }
+        return conversation
+    }
+    func askLocalFromShortcut(_ prompt: String) async throws -> String {
+        try Task.checkCancellation()
+        guard !isRestoring, storageLoaded else { throw NativeShortcutError.notReady }
+        guard !isStreaming, !isSynchronizing else { throw NativeShortcutError.busy }
+        guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              prompt.count <= 32_000 else { throw LocalAgentError.invalidInput }
+        if let reason = localUnavailableReason { throw LocalAgentError.unavailable(reason) }
+        prepareShortcut(.draft(""))
+        pendingDraft = nil
+        selectedModel = LocalModel.id
+        newConversation()
+        let account = sessionRevision
+        guard let conversation = selection, send(prompt) else { throw NativeShortcutError.busy }
+        let reply = current?.messages.last?.id
+        do {
+            let deadline = Date().addingTimeInterval(125)
+            while isStreaming {
+                try Task.checkCancellation()
+                guard sessionRevision == account, selection == conversation else { throw CancellationError() }
+                guard Date() < deadline else { throw LocalAgentError.budget }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            guard sessionRevision == account, selection == conversation,
+                  let result = current?.messages.last, result.id == reply,
+                  result.role == "assistant", result.completion == .completed,
+                  !result.content.isEmpty else { throw NativeShortcutError.noReply }
+            return result.content
+        } catch {
+            // Never stop a different run started while this intent was suspended.
+            if sessionRevision == account, selection == conversation,
+               current?.messages.last?.id == reply { stop() }
+            throw error
+        }
+    }
+
+    func newConversation() {
+        guard !isRestoring, storageLoaded else { return }
+        if current?.messages.isEmpty == true { return }
+        stop()
+        // A new conversation opens on the model the user last used, not on
+        // whatever the previously selected conversation happened to use.
+        if let remembered = restoredModel(for: modelPreferenceScope, in: models) { selectedModel = remembered }
+        if let unused = conversations.first(where: { $0.messages.isEmpty }) {
+            selection = unused.id
+            return
+        }
+        let conversation = Conversation(model: selectedModel, modelAccess: selectedAccess)
+        conversations.insert(conversation, at: 0); selection = conversation.id
+        persist()
+    }
+    @discardableResult func send(_ text: String) -> Bool {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !isRestoring, !isStreaming, !isSynchronizing || ModelExecution(selectedModel).isLocal else { return false }
+        guard session != nil || ModelExecution(selectedModel).isLocal else { error = APIError.authenticationRequired.localizedDescription; return false }
+        guard storageLoaded else { error = "L’historique local n’a pas pu être ouvert. Il est conservé sans modification. Relancez l’app après avoir déverrouillé l’appareil."; return false }
+        if selectedModel == LocalModel.id, let reason = localUnavailableReason { error = reason; return false }
+        if ModelExecution(selectedModel) == .downloaded, let reason = services.downloadedAvailability(selectedModel) { error = reason; return false }
+        guard !selectedModel.isEmpty else { error = APIError.noModel.localizedDescription; return false }
+        if !ModelExecution(selectedModel).isLocal && selectedAccess?.modelId != selectedModel && services.streamAccess != nil {
+            requestedAccessModel = models.first { $0.id == selectedModel } ?? ModelOption(id: selectedModel)
+            return false
+        }
+        if current == nil { newConversation() }
+        guard let id = selection, let index = conversations.firstIndex(where: { $0.id == id }) else { return false }
+        memoryReviews[id]?.cancel(); memoryReviews[id] = nil
+        conversations[index].model = selectedModel
+        conversations[index].modelAccess = selectedAccess
+        conversations[index].messages.append(ChatMessage(role: "user", content: text))
+        if conversations[index].messages.count == 1 { conversations[index].title = ConversationTitle.fallback(for: text) }
+        if MemoryCommand.isForget(text) { memoryPresented = true; return persist() }
+        // Runs in the background against the same model; the reply is not delayed.
+        if conversations[index].messages.count == 1 { scheduleTitle(conversation: id) }
+        return startReply(conversation: id, index: index)
+    }
+    @discardableResult func appendVoiceTurn(conversationID: UUID, accountID: String, model: String, role: String, text: String, turnID: String) -> Bool {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard session?.accountId == accountID, ["user", "assistant"].contains(role), !text.isEmpty, storageLoaded,
+              let index = conversations.firstIndex(where: { $0.id == conversationID }) else { return false }
+        // Stable across retries and history sync, without retaining provider credentials.
+        let bytes = Array(SHA256.hash(data: Data((conversationID.uuidString + ":" + turnID).utf8)).prefix(16))
+        let id = UUID(uuid: (bytes[0],bytes[1],bytes[2],bytes[3],bytes[4],bytes[5],bytes[6],bytes[7],bytes[8],bytes[9],bytes[10],bytes[11],bytes[12],bytes[13],bytes[14],bytes[15]))
+        if conversations[index].messages.contains(where: { $0.id == id }) { return true }
+        let previous = conversations[index]
+        conversations[index].model = model
+        conversations[index].messages.append(ChatMessage(id: id, role: role, content: text, completion: role == "assistant" ? .completed : nil))
+        if conversations[index].messages.count == 1 { conversations[index].title = ConversationTitle.fallback(for: text) }
+        conversations[index].updatedAt = Date()
+        guard persist() else { conversations[index] = previous; return false }
+        if conversations[index].messages.count == 1 { scheduleTitle(conversation: conversationID) }
+        scheduleAutomaticSync()
+        return true
+    }
+    /// Retry only the current tail, never truncate later turns or duplicate the prompt.
+    @discardableResult func retry(conversation id: UUID, message: UUID) -> Bool {
+        guard !isStreaming, !isSynchronizing || ModelExecution(current?.model ?? "").isLocal, selection == id,
+              let index = conversations.firstIndex(where: { $0.id == id }),
+              let last = conversations[index].messages.last, last.id == message, last.canRetry,
+              conversations[index].messages.dropLast().last?.role == "user",
+              models.contains(where: { $0.id == conversations[index].model }) else { return false }
+        selectedModel = conversations[index].model
+        selectedAccess = conversations[index].modelAccess
+        voice.silence()
+        conversations[index].messages.removeLast()
+        return startReply(conversation: id, index: index)
+    }
+    private func startReply(conversation id: UUID, index: Int) -> Bool {
+        let input = conversations[index].messages
+        let reply = ChatMessage(role: "assistant", content: "", completion: .streaming)
+        conversations[index].messages.append(reply)
+        activeReply = (id, reply.id)
+        completedReply = nil
+        localEvents = []
+        isStreaming = true; error = nil
+        guard persist() else { isStreaming = false; setReplyCompletion(.failed); activeReply = nil; return false }
+        let revision = generationRevision
+        let accountRevision = sessionRevision
+        let model = selectedModel
+        if ModelExecution(model).isLocal {
+            if let account = session?.accountId, let turn = input.last(where: { $0.role == "user" }) {
+                let uuid = { UUID().uuidString.lowercased() }
+                var binding = cloudHermesBindings[id] ?? CloudHermesBinding(accountId:account,conversationId:id.uuidString.lowercased(),sessionId:uuid(),branchId:uuid(),operationId:uuid(),versionId:uuid(),deviceId:uuid(),cloudAuthorized:false,importApproved:false)
+                let queuedParent = cloudAgentState?.outbox.last(where: { $0.objectId == binding.sessionId })?.versionId
+                let parents = queuedParent.map { [$0] } ?? cloudAgentState?.objects[binding.sessionId]?.heads ?? [binding.versionId]
+                let snapshot = cloudAgentState?.outbox.last(where: { $0.objectId == binding.sessionId })?.value
+                    ?? parents.first.flatMap { cloudAgentState?.objects[binding.sessionId]?.versions[$0]?.value }
+                binding.recordLocalIntent(turnId:turn.id,modelId:model,source:model == LocalModel.id ? "apple-foundation-local" : "downloaded-local",parents:parents,parentValue:snapshot)
+                let previous = cloudHermesBindings[id]; cloudHermesBindings[id] = binding
+                guard persist() else { cloudHermesBindings[id] = previous; isStreaming = false; setReplyCompletion(.failed); activeReply = nil; return false }
+            }
+            generationExpiresAt = Date().addingTimeInterval(120)
+            armGenerationDeadline(generation: revision, account: accountRevision)
+        }
+        generation = Task {
+            defer {
+                if generationRevision == revision && sessionRevision == accountRevision {
+                    cancelInternetApproval()
+                    generationExpiresAt = nil
+                    generationDeadline?.cancel(); generationDeadline = nil
+                    isStreaming = false; generation = nil; activeReply = nil; persist(); scheduleAutomaticSync()
+                    if ModelExecution(model).isLocal { Task { await self.synchronizeCloudAgentState() } }
+                }
+            }
+            do {
+                await AutomationCoordinator.shared.yieldToUser()
+                if ModelExecution(model).isLocal {
+                    let deviceData = LocalDeviceSnapshot()
+                    try Task.checkCancellation()
+                    guard generationRevision == revision && sessionRevision == accountRevision else { return }
+                    let checkpointContext = input.last(where: { $0.role == "user" }).map {
+                        HermesRunContext(accountID: session?.accountId, conversationID: id, turnID: $0.id, modelID: model, source: model == LocalModel.id ? "apple-foundation-local" : "downloaded-local")
+                    }
+                    let initial = try await localHermesSeed(conversation:id,input:input,epoch:accountRevision)
+                    guard generationRevision == revision && sessionRevision == accountRevision else { throw CancellationError() }
+                    let workspace = LocalAgentWorkspace(conversations: conversations, documents: localDocuments,
+                        hermesContext: checkpointContext, initialHermesHistory:initial.history, selectedCloudContext:initial.context, selectedWorkspaceFiles:initial.files, selectedSkills:initial.skills,
+                        selectedMemory:initial.memory, selectedProject:initial.project,
+                        saveMemory: { proposal in
+                            try await self.saveLocalHermesMemory(proposal,conversation:id,generation:revision,account:accountRevision)
+                        }, createWorkspaceFile: { project, path, content in
+                            try await self.createLocalHermesWorkspaceFile(project,path:path,content:content,conversation:id,generation:revision,account:accountRevision)
+                        },
+                        saveWorkspaceFile: { file, content in
+                            try await self.saveLocalHermesWorkspaceFile(file,content:content,conversation:id,generation:revision,account:accountRevision)
+                        }, deviceData: deviceData,
+                        event: { event in
+                            await self.recordLocalEvent(event, generation: revision, account: accountRevision)
+                        }, saveDocument: { document in
+                            try await self.saveLocalDocument(document, generation: revision, account: accountRevision)
+                        }, readDevice: { action, query in
+                            try await self.readDeviceData(action: action, query: query, generation: revision, account: accountRevision)
+                        }, render: { blocks in
+                            await self.appendNativeContent(blocks, conversation: id, message: reply.id,
+                                generation: revision, account: accountRevision)
+                        }, allowedDeviceActions: LocalDeviceScope.actions(for: input), authorizeInternet: { url in
+                            try await self.requestInternet(url: url, conversation: id, generation: revision, account: accountRevision)
+                        }, webFetch: services.webFetch, automation: { arguments in
+                            try await self.manageAutomation(arguments, model: model, account: accountRevision)
+                        }, memory: { action, query, text in
+                            try await self.memoryTool(action: action, query: query, text: text, conversation: id,
+                                source: input.last, generation: revision, account: accountRevision)
+                        })
+                    let delta: @Sendable (String) async -> Void = { delta in
+                        await self.append(delta, conversation: id, message: reply.id, generation: revision, account: accountRevision)
+                        await Task.yield()
+                    }
+                    if ModelExecution(model) == .downloaded {
+                        try await services.downloadedRespond(model, input, workspace, delta)
+                    } else { try await services.localRespond(input, workspace, delta) }
+                } else {
+                    let session = try await validSession()
+                    try Task.checkCancellation()
+                    guard generationRevision == revision && sessionRevision == accountRevision else { return }
+                    await synchronizeCloudAgentState()
+                    guard cloudAgentSyncError == nil else { throw APIError.server(409,"hermes_local_reconciliation_required") }
+                    guard var binding = cloudHermesBindings[id], binding.accountId == session.accountId, binding.cloudAuthorized != false,
+                        let turn = input.last(where: { $0.role == "user" }) else { throw APIError.server(403,"agent_cloud_consent_required") }
+                    guard (binding.localTurns ?? []).allSatisfy(\.published),
+                        !(cloudAgentState?.outbox.contains(where: { $0.objectId == binding.sessionId || $0.value?.object?["sessionId"]?.string == binding.sessionId }) ?? false) else {
+                        throw APIError.server(403,"hermes_local_export_consent_or_reconciliation_required")
+                    }
+                    if !(binding.localTurns ?? []).isEmpty {
+                        let liveConsent = try await services.hermesConsent(session.accessToken)
+                        guard sessionRevision == accountRevision, liveConsent.accountId == session.accountId,
+                            liveConsent.cloudEnabled, (binding.localTurns ?? []).allSatisfy({ (liveConsent.exportSources ?? []).contains($0.source) && (binding.localExportSources ?? []).contains($0.source) }) else {
+                            throw APIError.server(403,"hermes_local_export_consent_required")
+                        }
+                    }
+                    if let object=cloudAgentState?.objects[binding.sessionId] {
+                        guard !object.deleted,object.heads.count == 1,let value=object.versions[object.heads[0]]?.value?.object,
+                            value["branchId"]?.string == binding.branchId else { throw APIError.server(409,"hermes_binding_branch_changed") }
+                        if value["historyAnchor"] != nil { binding.history=try remoteBase(binding.sessionId).history }
+                    }
+                    let prior = input.dropLast()
+                    if binding.history.isEmpty && !prior.isEmpty && !binding.importApproved { throw APIError.server(403,"hermes_history_import_required") }
+                    if binding.pending != nil && binding.turnId != turn.id { throw APIError.server(409,"hermes_pending_run_requires_recovery") }
+                    if binding.pending == nil && binding.turnId == turn.id { throw APIError.server(409,"hermes_completed_turn_requires_explicit_branch") }
+                    if binding.pending == nil {
+                        let history: [HistoryJSON] = binding.history.isEmpty ? prior.map { .object(["role":.string($0.role),"content":.string($0.content)]) } : binding.history
+                        binding.pending = CloudHermesRunInput(operationId:UUID().uuidString.lowercased(),runId:UUID().uuidString.lowercased(),sessionId:binding.sessionId,branchId:binding.branchId,
+                            model:try CloudHermesModel.selected(model,access:conversations.first(where:{$0.id == id})?.modelAccess),message:turn.content,history:OpenUIPresentation.history(history))
+                        binding.turnId = turn.id; cloudHermesBindings[id] = binding
+                        guard persist() else { throw APIError.server(0,"history_cache_write_failed") }
+                    }
+                    let request = binding.pending!
+                    cloudHermesStatus[id] = "queued"
+                    activeCloudHermes = (session.accountId,request.runId,session.accessToken)
+                    defer { if activeCloudHermes?.runId == request.runId { activeCloudHermes = nil } }
+                    await synchronizeCloudAgentState()
+                    guard cloudAgentSyncError == nil, cloudAgentState?.accountId == session.accountId else { throw APIError.server(409,"hermes_session_sync_required") }
+                    if cloudAgentState?.objects[binding.sessionId] == nil {
+                        try enqueueCloudAgentMutation(.init(operationId:binding.operationId,objectId:binding.sessionId,versionId:binding.versionId,deviceId:binding.deviceId,
+                            kind:"session",parents:[],deleted:false,value:.object(["type":.string("hermes_chat"),"conversationId":.string(binding.conversationId),"branchId":.string(binding.branchId),"title":.string("Hermes chat")])))
+                        await synchronizeCloudAgentState()
+                    }
+                    guard cloudAgentSyncError == nil, let synced=cloudAgentState?.objects[binding.sessionId], !synced.deleted, synced.heads.count == 1 else {
+                        throw APIError.server(409,"hermes_session_sync_required")
+                    }
+                    try Task.checkCancellation()
+                    guard generationRevision == revision && sessionRevision == accountRevision else { throw CancellationError() }
+                    var result: CloudHermesRun
+                    do { result = try await services.hermesRead(session.accountId,request.runId,session.accessToken,false) }
+                    catch APIError.server(let status, _) where status == 404 {
+                        result = try await services.hermesCreate(session.accountId,request,session.accessToken)
+                    }
+                    if Task.isCancelled || generationRevision != revision || sessionRevision != accountRevision {
+                        let cancel = services.hermesRead
+                        Task { _ = try? await cancel(session.accountId,request.runId,session.accessToken,true) }
+                        throw CancellationError()
+                    }
+                    cloudHermesStatus[id] = result.state
+                    while ["queued","running","waiting_device"].contains(result.state) {
+                        try Task.checkCancellation()
+                        guard generationRevision == revision && sessionRevision == accountRevision else { throw CancellationError() }
+                        try await services.hermesPollDelay()
+                        result = try await services.hermesRead(session.accountId,request.runId,session.accessToken,false)
+                    }
+                    try Task.checkCancellation()
+                    guard generationRevision == revision && sessionRevision == accountRevision,
+                        result.sessionId == binding.sessionId, result.branchId == binding.branchId else { throw CancellationError() }
+                    cloudHermesStatus[id] = result.state
+                    if result.state == "awaiting_resolution" { cloudHermesRecoveryRun = request.runId; throw APIError.server(409,"hermes_awaiting_resolution") }
+                    guard result.state == "completed", let completed = result.result else { throw APIError.server(409,"hermes_run_cancelled") }
+                    binding.history = completed.history; binding.pending = nil; cloudHermesBindings[id] = binding
+                    guard persist() else { throw APIError.server(0,"history_cache_write_failed") }
+                    append(completed.response,conversation:id,message:reply.id,generation:revision,account:accountRevision)
+                }
+                try Task.checkCancellation()
+                guard generationRevision == revision && sessionRevision == accountRevision else { return }
+                // Only a successfully terminated stream authorizes automatic playback.
+                setReplyCompletion(.completed)
+                completedReply = reply.id
+                scheduleMemoryReview(conversation: id)
+            } catch is CancellationError {
+                if generationRevision == revision && sessionRevision == accountRevision { setReplyCompletion(.stopped) }
+            } catch {
+                if generationRevision == revision && sessionRevision == accountRevision {
+                    setReplyCompletion(.failed)
+                    if !ModelExecution(model).isLocal, case APIError.server(let status, let code) = error, !code.hasPrefix("hermes_"), code != "agent_cloud_consent_required", [400, 401, 402, 403, 409, 429, 503].contains(status) {
+                        accessNotice = "Cet accès est indisponible. Réessayez ou choisissez un autre mode."
+                        requestedAccessModel = models.first { $0.id == model } ?? ModelOption(id: model)
+                    }
+                    if let checkpointError = error as? HermesCheckpointError {
+                        self.error = checkpointError.localizedDescription
+                        if case .indeterminate = checkpointError, let turn = input.last(where: { $0.role == "user" }) {
+                            hermesRecovery = HermesRecovery(context: .init(accountID: session?.accountId, conversationID: id, turnID: turn.id, modelID: model, source: model == LocalModel.id ? "apple-foundation-local" : "downloaded-local"), replyID: reply.id,
+                                accountRevision: accountRevision, detail: checkpointError.localizedDescription)
+                        }
+                    } else { self.error = ModelExecution(model).isLocal
+                        ? (error as? LocalAgentError)?.localizedDescription ?? "L’agent local n’a pas pu terminer cette demande. Réessayez avec une demande plus précise ; les étapes déjà enregistrées sont conservées."
+                        : error.localizedDescription
+                    }
+                }
+            }
+        }
+        return true
+    }
+    private func append(_ delta: String, conversation: UUID, message: UUID, generation: UUID, account: UUID) {
+        guard generationRevision == generation, sessionRevision == account else { return }
+        guard let i = conversations.firstIndex(where: { $0.id == conversation }),
+              let j = conversations[i].messages.firstIndex(where: { $0.id == message }) else { return }
+        conversations[i].messages[j].content += delta
+        conversations[i].updatedAt = Date()
+        streamingTextRevision &+= 1
+    }
+    private func setReplyCompletion(_ completion: ChatMessage.Completion) {
+        guard let activeReply,
+              let i = conversations.firstIndex(where: { $0.id == activeReply.conversation }),
+              let j = conversations[i].messages.firstIndex(where: { $0.id == activeReply.message }) else { return }
+        conversations[i].messages[j].completion = completion
+        conversations[i].updatedAt = Date()
+    }
+    func stop() {
+        if let active = activeCloudHermes {
+            activeCloudHermes = nil
+            let cancel = services.hermesRead
+            Task { _ = try? await cancel(active.accountId,active.runId,active.token,true) }
+        }
+        if isStreaming { setReplyCompletion(.stopped) }
+        activeReply = nil
+        completedReply = nil
+        generationRevision = UUID()
+        cancelInternetApproval()
+        generationExpiresAt = nil
+        generationDeadline?.cancel(); generationDeadline = nil
+        generation?.cancel(); generation = nil
+        isStreaming = false
+        persist()
+    }
+    func delete(_ id: UUID) {
+        memoryReviews[id]?.cancel(); memoryReviews[id] = nil
+        titleTasks[id]?.cancel(); titleTasks[id] = nil
+        if selection == id { stop(); selection = nil }
+        let sourceID = conversations.first(where: { $0.id == id })?.memorySourceID ?? id
+        let oldConversations = conversations; let oldMemory = memoryRecords
+        let oldBaseline = memoryBaseline; let oldSnapshot = historySnapshot; let oldPending = pendingHistorySave
+        for memoryID in Set(memoryRecords.filter { $0.evidence?.conversationID == sourceID || $0.evidence?.conversationID == id }.map(\.id)) { forgetMemoryRecords(memoryID) }
+        conversations.removeAll { $0.id == id }
+        guard persist() else {
+            conversations = oldConversations; memoryRecords = oldMemory; memoryBaseline = oldBaseline
+            historySnapshot = oldSnapshot; pendingHistorySave = oldPending; return
+        }
+        let checkpointAccount = session?.accountId
+        Task {
+            do { try await HermesCheckpointStore.shared.deleteConversation(accountID: checkpointAccount, conversationID: id) }
+            catch { if session?.accountId == checkpointAccount { self.error = "La conversation a été supprimée, mais son point de reprise local n’a pas pu être effacé : " + error.localizedDescription } }
+        }
+        refreshMemoryIndex(); scheduleAutomaticSync()
+    }
+    func logout() async {
+        await RemoteInstances.shared.logout()
+        nativeShortcut = nil
+        voice.silence()
+        let previous = session
+        let inFlightRefresh = refreshTask
+        stop()
+        isRestoring = true
+        refreshRevision = UUID()
+        refreshTask = nil
+        sessionRevision = UUID()
+        resetModelLoading()
+        let revision = sessionRevision
+        resetHistorySync()
+        await HermesCheckpointStore.shared.invalidateAccount(previous?.accountId)
+        services.clear(); session = nil; conversations = []; selection = nil
+        models = []; selectedModel = ""; wantsNewConversation = false; wantsVoice = false; wantsVoiceConversation = false; wantsImmediateVoiceCapture = false; pendingDraft = nil; error = nil
+        localDocuments = []; automaticSync = false; cloudHermesBindings = [:]; cloudAgentState=nil; pendingCloudArtifacts=[]; discoveredCloudRuns=[:]; remoteHermes=[:]; remoteHermesBusy=false; remoteHermesError=nil; cloudHermesRecoveryRun = nil
+        await restore()
+        if let previous {
+            do {
+                // Do not cancel a possibly committed server rotation. Await it and
+                // revoke its result; otherwise revoke the last known family token.
+                let rotated = try? await inFlightRefresh?.value
+                try await services.revoke(rotated?.refreshToken ?? previous.refreshToken)
+            }
+            catch {
+                if sessionRevision == revision {
+                    self.error = "Session locale effacée. La révocation distante a échoué : \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+    private func resetHistorySync() {
+        cloudAgentSyncing=false;cloudAgentSyncEpoch=nil;cloudAgentSyncToken=nil;cloudAgentSyncRequested=false
+        syncTask?.cancel(); syncTask = nil
+        isSynchronizing = false
+        importedGuestSnapshots = [:]
+        pendingHistorySave = nil
+        historySnapshot = nil; historyBaseline = []; historyConversationIDs = [:]; historyMessageIDs = [:]
+        historyStatus = nil; hasHistoryConflict = false
+    }
+    /// Account-scoped synchronization; automatic invocation requires persisted opt-in.
+    /// Never resolve concurrent edits by silently choosing one device's snapshot.
+    func synchronizeHistory(keepingBothVersions: Bool = false, automatic: Bool = false) async {
+        guard !isSynchronizing, !isStreaming, !isRestoring, storageLoaded, session != nil, !automatic || automaticSync else { return }
+        isSynchronizing = true
+        let accountRevision = sessionRevision
+        defer { if sessionRevision == accountRevision { isSynchronizing = false } }
+        let local = conversations
+        let localMemory = memoryRecords
+        let syncMemory = memorySyncEnabled
+        do {
+            let session = try await validSession()
+            var remote = try await services.readHistory(session.accessToken)
+            if syncMemory {
+                guard remote.memory != nil else { throw APIError.server(503, "memory_sync_not_supported") }
+                guard remote.memory!.count <= 1000, remote.memory!.allSatisfy(\.valid) else { throw APIError.invalidResponse }
+            } else { remote.memory = nil }
+            guard sessionRevision == accountRevision, !isStreaming, conversations == local else { return }
+            try Task.checkCancellation()
+            guard (!automatic || automaticSync), memorySyncEnabled == syncMemory else { return }
+            guard remote.accountId == session.accountId else { throw APIError.invalidResponse }
+            // Validate the downloaded projection before any mutating request.
+            var validationIDs: [String: UUID] = [:]
+            var validatedKeys = Set<String>()
+            for index in remote.conversations.indices {
+                guard let key = remote.conversations[index].object?["id"]?.string,
+                      validatedKeys.insert(key).inserted else { throw APIError.invalidResponse }
+                _ = try remote.projectedConversation(at: index, id: UUID(), messageIDs: &validationIDs)
+            }
+            // Reconcile a lost POST response using the exact persisted payload,
+            // never just a colliding conversation ID or an assumed success.
+            if let pending = pendingHistorySave,
+               remote.revision == pending.snapshot.revision + 1,
+               remote.accountId == pending.snapshot.accountId,
+               remote.conversations == pending.snapshot.conversations,
+               remote.folders == pending.snapshot.folders,
+               remote.memory == pending.snapshot.memory {
+                historySnapshot = remote; historyBaseline = pending.local
+                if syncMemory { memoryBaseline = pending.memory ?? [] }
+                historyConversationIDs = pending.conversationIDs; historyMessageIDs = pending.messageIDs
+                pendingHistorySave = nil
+                guard persist() else { throw APIError.server(0, "history_cache_write_failed") }
+            }
+            let uncertainSave = pendingHistorySave.map { remote.revision > $0.snapshot.revision } ?? false
+            let conflict = uncertainSave || (historySnapshot.map { $0.revision != remote.revision && local != historyBaseline } ?? false)
+            if conflict && !keepingBothVersions {
+                hasHistoryConflict = true
+                historyStatus = "Des modifications existent sur cet appareil et sur un autre. Rien n’a été écrasé. La résolution du conflit est nécessaire."
+                return
+            }
+            var merged = remote
+            if syncMemory { merged.memory = MemoryPolicy.merge(localMemory.filter { $0.state != .proposed }, remote.memory ?? []) }
+            var conversationIDs = historyConversationIDs
+            var messageIDs = historyMessageIDs
+            if historySnapshot == nil || local != historyBaseline || (syncMemory && merged.memory != remote.memory) {
+                let localIDs = Set(local.map(\.id))
+                let deleted = conflict ? Set<UUID>() : Set(historyBaseline.map(\.id)).subtracting(localIDs)
+                merged.conversations.removeAll { item in
+                    guard let key = item.object?["id"]?.string, let id = conversationIDs[key] else { return false }
+                    return deleted.contains(id)
+                }
+                for original in local {
+                    var conversation = original
+                    if conflict {
+                        // Preserve the server version, including remotely deleted chats.
+                        // Only dirty local chats become explicitly labelled copies.
+                        guard historyBaseline.first(where: { $0.id == original.id }) != original else { continue }
+                        conversation.id = UUID()
+                        conversation.title = String((original.title + " — copie locale").prefix(120))
+                    }
+                    let key = conversationIDs.first { $0.value == conversation.id }?.key ?? conversation.id.uuidString
+                    // On first import, retain any independently existing server chat.
+                    if historySnapshot == nil, merged.conversations.contains(where: { $0.object?["id"]?.string == key }) {
+                        throw APIError.server(409, "history_import_collision")
+                    }
+                    conversationIDs[key] = conversation.id
+                    try merged.store(conversation, serverID: key, messageIDs: &messageIDs)
+                }
+                pendingHistorySave = PendingHistorySave(snapshot: merged, memory: syncMemory ? merged.memory : nil, local: local,
+                    conversationIDs: conversationIDs, messageIDs: messageIDs)
+                // Persist recovery evidence before making the consequential request.
+                guard persist() else { throw APIError.server(0, "history_cache_write_failed") }
+                try Task.checkCancellation()
+                guard !automatic || automaticSync else { return }
+                merged = try await services.saveHistory(merged, session.accessToken)
+                if !syncMemory { merged.memory = nil }
+                if syncMemory {
+                    guard let records = merged.memory, records.count <= 1000, records.allSatisfy(\.valid) else { throw APIError.invalidResponse }
+                }
+                // A confirmed save is a new baseline even if the user edited locally
+                // while it was in flight. Never apply it to a different account.
+                guard sessionRevision == accountRevision else { return }
+            }
+            var projected: [Conversation] = []
+            var remoteIDs = Set<String>()
+            for index in merged.conversations.indices {
+                guard let key = merged.conversations[index].object?["id"]?.string, remoteIDs.insert(key).inserted else { throw APIError.invalidResponse }
+                let id = conversationIDs[key] ?? UUID()
+                conversationIDs[key] = id
+                var conversation = try merged.projectedConversation(at: index, id: id, messageIDs: &messageIDs)
+                // Internet consent belongs to this device and conversation, never to a server payload.
+                if let deviceConversation = conversations.first(where: { $0.id == id }) {
+                    conversation.internetPermission = deviceConversation.internetPermission
+                    let deviceMessages = Dictionary(uniqueKeysWithValues: deviceConversation.messages.map { ($0.id, $0.nativeContent) })
+                    for messageIndex in conversation.messages.indices {
+                        conversation.messages[messageIndex].nativeContent = deviceMessages[conversation.messages[messageIndex].id] ?? nil
+                    }
+                }
+                projected.append(conversation)
+            }
+            if syncMemory && memorySyncEnabled {
+                memoryRecords = MemoryPolicy.merge(memoryRecords, merged.memory ?? [])
+                memoryBaseline = merged.memory ?? []
+                refreshMemoryIndex()
+            }
+            hasHistoryConflict = false; pendingHistorySave = nil
+            historySnapshot = merged; historyConversationIDs = conversationIDs; historyMessageIDs = messageIDs
+            historyBaseline = projected.sorted { $0.updatedAt > $1.updatedAt }
+            // Reapply only edits made since the request began, including deletion.
+            // Imported remote conversations were not in `local` and remain intact.
+            let captured = Dictionary(uniqueKeysWithValues: local.map { ($0.id, $0) })
+            let current = Dictionary(uniqueKeysWithValues: conversations.map { ($0.id, $0) })
+            let removed = Set(captured.keys).subtracting(current.keys)
+            projected.removeAll { removed.contains($0.id) }
+            for conversation in conversations where captured[conversation.id] != conversation {
+                projected.removeAll { $0.id == conversation.id }
+                projected.append(conversation)
+            }
+            conversations = projected.sorted { $0.updatedAt > $1.updatedAt }
+            if let selection, !conversations.contains(where: { $0.id == selection }) { self.selection = nil }
+            guard persist() else {
+                historyStatus = "Copie distante reçue, mais l’enregistrement sur cet appareil a échoué. Réessayez la synchronisation."
+                return
+            }
+            historyStatus = conversations == historyBaseline
+                ? "Historique synchronisé avec votre compte."
+                : "Copie distante enregistrée ; de nouvelles modifications locales restent à synchroniser."
+        } catch {
+            if sessionRevision == accountRevision { historyStatus = "Synchronisation non terminée. Vos conversations locales sont conservées. " + error.localizedDescription }
+        }
+    }
+    private func armGenerationDeadline(generation: UUID, account: UUID) {
+        generationDeadline?.cancel()
+        let remaining = max(0, generationExpiresAt?.timeIntervalSinceNow ?? 0)
+        generationDeadline = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(remaining)) } catch { return }
+            guard let self, self.generationRevision == generation, self.sessionRevision == account else { return }
+            self.stop(); self.error = LocalAgentError.budget.localizedDescription
+        }
+    }
+    private var deviceReads: [UUID: (count: Int, started: Date)] = [:]
+    private func readDeviceData(action: String, query: String, generation: UUID, account: UUID) async throws -> LocalToolResult {
+        try Task.checkCancellation()
+        guard generationRevision == generation, sessionRevision == account else { throw CancellationError() }
+        if deviceReads[generation] == nil {
+            deviceReads[generation] = (0, Date())
+            generationDeadline?.cancel(); generationDeadline = nil
+        }
+        deviceReads[generation]!.count += 1
+        defer {
+            deviceReads[generation]!.count -= 1
+            if deviceReads[generation]!.count == 0 {
+                if generationRevision == generation, sessionRevision == account,
+                   let started = deviceReads[generation]?.started, let expiry = generationExpiresAt {
+                    generationExpiresAt = expiry.addingTimeInterval(Date().timeIntervalSince(started))
+                    armGenerationDeadline(generation: generation, account: account)
+                }
+                deviceReads[generation] = nil
+            }
+        }
+        let result = try await LocalDeviceData.read(action: action, query: query)
+        try Task.checkCancellation()
+        guard generationRevision == generation, sessionRevision == account else { throw CancellationError() }
+        return result
+    }
+    private func appendNativeContent(_ blocks: [NativeContentBlock], conversation: UUID, message: UUID,
+                                     generation: UUID, account: UUID) {
+        guard generationRevision == generation, sessionRevision == account,
+              let i = conversations.firstIndex(where: { $0.id == conversation }),
+              let j = conversations[i].messages.firstIndex(where: { $0.id == message }) else { return }
+        var existing = conversations[i].messages[j].nativeContent?.blocks ?? []
+        existing.append(contentsOf: blocks.filter { block in !existing.contains(where: { $0.id == block.id }) })
+        conversations[i].messages[j].nativeContent = NativeContentPayload(blocks: existing)
+        persist()
+    }
+    private func requestInternet(url: URL, conversation: UUID, generation: UUID, account: UUID) async throws -> Bool {
+        try Task.checkCancellation()
+        guard generationRevision == generation, sessionRevision == account,
+              let index = conversations.firstIndex(where: { $0.id == conversation }) else { throw CancellationError() }
+        if let decision = conversations[index].internetPermission { return decision == .allowed }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled, generationRevision == generation, sessionRevision == account else {
+                    continuation.resume(returning: false); return
+                }
+                internetWaiters.append(continuation)
+                if internetApproval == nil {
+                    generationDeadline?.cancel(); generationDeadline = nil
+                    approvalStartedAt = Date()
+                    internetApproval = InternetApprovalRequest(conversation: conversation, url: url)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                guard self?.generationRevision == generation, self?.sessionRevision == account else { return }
+                self?.cancelInternetApproval()
+            }
+        }
+    }
+    func resolveInternetApproval(allow: Bool) {
+        guard let request = internetApproval,
+              let index = conversations.firstIndex(where: { $0.id == request.conversation }) else { return }
+        conversations[index].internetPermission = allow ? .allowed : .denied
+        let saved = persist()
+        if !saved { conversations[index].internetPermission = nil }
+        if let started = approvalStartedAt, let expiry = generationExpiresAt {
+            generationExpiresAt = expiry.addingTimeInterval(Date().timeIntervalSince(started))
+            armGenerationDeadline(generation: generationRevision, account: sessionRevision)
+        }
+        internetApproval = nil; approvalStartedAt = nil
+        let waiters = internetWaiters; internetWaiters = []
+        for waiter in waiters { waiter.resume(returning: allow && saved) }
+    }
+    private func cancelInternetApproval() {
+        internetApproval = nil; approvalStartedAt = nil
+        let waiters = internetWaiters; internetWaiters = []
+        for waiter in waiters { waiter.resume(returning: false) }
+    }
+    private func storageURL() throws -> URL {
+        if let session { return try historyURL(session.accountId) }
+        return try guestHistoryURL()
+    }
+    private func guestHistoryURL() throws -> URL {
+        let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        return directory.appendingPathComponent("history-guest.json")
+    }
+    private func recordLocalEvent(_ event: LocalAgentEvent, generation: UUID, account: UUID) {
+        guard generationRevision == generation, sessionRevision == account else { return }
+        if let index = localEvents.firstIndex(where: { $0.id == event.id }) { localEvents[index] = event }
+        else { localEvents.append(event) }
+        if let activeReply, let i = conversations.firstIndex(where: { $0.id == activeReply.conversation }),
+           let j = conversations[i].messages.firstIndex(where: { $0.id == activeReply.message }) {
+            conversations[i].messages[j].localEvents = localEvents
+            persist()
+        }
+    }
+    private func manageAutomation(_ arguments: String, model: String, account: UUID) async throws -> String {
+        guard sessionRevision == account else { throw CancellationError() }
+        return try await AutomationTools.execute(arguments, model: model, scope: session?.accountId ?? "guest")
+    }
+    func saveLocalHermesMemory(_ proposal: HermesSelectedMemory.Proposal, conversation: UUID, generation: UUID, account: UUID) throws {
+        try Task.checkCancellation()
+        let original = proposal.original
+        guard generationRevision == generation, sessionRevision == account, session?.accountId == original.accountID,
+            let binding = cloudHermesBindings[conversation], binding.accountId == original.accountID, binding.cloudAuthorized != false,
+            binding.contextMemoryWritable == true, (binding.contextMemoryIDs ?? []).contains(original.objectID),
+            var state = cloudAgentState, state.accountId == original.accountID,
+            let object = state.objects[original.objectID], object.kind == "memory", !object.deleted,
+            object.heads == original.parents, object.heads.count == 1, state.conflicts[original.objectID] == nil,
+            let head = object.versions[object.heads[0]], !head.deleted, !head.erased,
+            var value = head.value?.object, value["type"]?.string == original.type, value["target"]?.string == original.target,
+            value["content"] == (original.content.map(HistoryJSON.string) ?? .null),
+            !state.outbox.contains(where: { $0.objectId == original.objectID }) else { throw APIError.server(409,"hermes_memory_changed_or_not_authorized") }
+        guard proposal.changed else { return }
+        value["content"] = .string(proposal.content)
+        let operation = CloudAgentMutation(operationId:UUID().uuidString.lowercased(),objectId:original.objectID,
+            versionId:UUID().uuidString.lowercased(),deviceId:state.deviceId,kind:"memory",parents:original.parents,deleted:false,value:.object(value))
+        let previous = state
+        try state.enqueue(operation)
+        var scopes = state.memoryWriteScopes ?? [:]; scopes[operation.operationId] = conversation.uuidString.lowercased(); state.memoryWriteScopes = scopes
+        cloudAgentState = state
+        guard persist() else { cloudAgentState = previous; throw APIError.server(0,"history_cache_write_failed") }
+        Task { await self.synchronizeCloudAgentState() }
+    }
+    func createLocalHermesWorkspaceFile(_ project: CloudHermesContext.WorkspaceProject, path: String, content: String,
+                                      conversation: UUID, generation: UUID, account: UUID) throws -> CloudHermesContext.WorkspaceFile {
+        try Task.checkCancellation()
+        guard generationRevision == generation, sessionRevision == account, session?.accountId == project.accountId,
+            var binding = cloudHermesBindings[conversation], binding.accountId == project.accountId,
+            binding.contextProjectID == project.projectId, var state = cloudAgentState, state.accountId == project.accountId else { throw CancellationError() }
+        let id = CloudAgentState.workspaceFileID(projectId:project.projectId,path:path)
+        guard state.objects[id] == nil, !state.outbox.contains(where: { $0.objectId == id }),
+            !pendingCloudArtifacts.contains(where: { $0.operation.objectId == id }) else { throw APIError.server(409,"workspace_path_exists") }
+        let operation = try state.workspaceMutation(projectId:project.projectId,objectId:id,path:path,content:content,
+            parents:[],projectParents:project.parents,delete:false)
+        let previousState = state, previousBinding = binding
+        try state.enqueue(operation)
+        binding.contextFileIDs = Array(Set((binding.contextFileIDs ?? []) + [id])).sorted()
+        guard (binding.contextFileIDs ?? []).count <= 200 else { throw APIError.server(413,"workspace_file_limit") }
+        cloudAgentState = state; cloudHermesBindings[conversation] = binding
+        guard persist() else {
+            cloudAgentState = previousState; cloudHermesBindings[conversation] = previousBinding
+            throw APIError.server(0,"history_cache_write_failed")
+        }
+        Task { await self.synchronizeCloudAgentState() }
+        return .init(accountId:project.accountId,projectId:project.projectId,objectId:id,path:path,content:content,parents:[],projectParents:project.parents,pending:true)
+    }
+    func saveLocalHermesWorkspaceFile(_ file: CloudHermesContext.WorkspaceFile, content: String, conversation: UUID, generation: UUID, account: UUID) throws {
+        try Task.checkCancellation()
+        guard generationRevision == generation, sessionRevision == account, session?.accountId == file.accountId,
+              let binding = cloudHermesBindings[conversation], binding.accountId == file.accountId,
+              binding.contextProjectID == file.projectId, (binding.contextFileIDs ?? []).contains(file.objectId),
+              !file.pending, let state = cloudAgentState, state.accountId == file.accountId,
+              let object = state.objects[file.objectId], !object.deleted, object.heads.count == 1,
+              object.versions[object.heads[0]]?.value?.object?["type"]?.string == "hermes_workspace_file",
+              !pendingCloudArtifacts.contains(where: { $0.operation.objectId == file.objectId }) else { throw CancellationError() }
+        let operation = try state.workspaceMutation(projectId:file.projectId,objectId:file.objectId,path:file.path,content:content,
+            parents:file.parents,projectParents:file.projectParents,delete:false)
+        try enqueueCloudAgentMutation(operation)
+        Task { await self.synchronizeCloudAgentState() }
+    }
+    private func saveLocalDocument(_ document: LocalDocument, generation: UUID, account: UUID) throws {
+        guard generationRevision == generation, sessionRevision == account else { throw CancellationError() }
+        let previous = localDocuments
+        if let index = localDocuments.firstIndex(where: { $0.id == document.id }) { localDocuments[index] = document }
+        else { localDocuments.append(document) }
+        guard persist() else { localDocuments = previous; throw LocalAgentError.unavailable("Enregistrement du document impossible.") }
+    }
+    func importDocument(name: String, text: String) throws {
+        guard !isRestoring, !isStreaming, text.utf8.count <= 100_000 else { throw LocalAgentError.invalidInput }
+        let document = LocalDocument(name: String(name.prefix(120)), text: text)
+        localDocuments.append(document)
+        guard persist() else { localDocuments.removeAll { $0.id == document.id }; throw LocalAgentError.unavailable("Enregistrement du document impossible.") }
+    }
+    /// Explicit copy into the signed-in account. Guest originals remain available after logout.
+    func importGuestHistory() {
+        guard session != nil, !isRestoring, !isStreaming, !isSynchronizing else { return }
+        do {
+            let cache = try JSONDecoder().decode(HistoryCache.self, from: services.readLocalHistory(guestHistoryURL()))
+            let previous = conversations
+            let imported = importedGuestSnapshots
+            for original in cache.conversations where importedGuestSnapshots[original.id] != original {
+                var copy = original
+                copy.id = UUID()
+                copy.internetPermission = nil
+                conversations.append(copy)
+                importedGuestSnapshots[original.id] = original
+            }
+            guard persist() else { conversations = previous; importedGuestSnapshots = imported; return }
+            historyStatus = "Conversations invitées copiées dans ce compte. Les originaux restent sur cet appareil."
+            scheduleAutomaticSync()
+        } catch { historyStatus = "Aucun historique invité lisible à importer." }
+    }
+    func setCalendarEnabled(_ enabled: Bool) async {
+        let revision = sessionRevision
+        do {
+            let allowed = enabled ? try await LocalDeviceData.authorizeCalendar() : false
+            guard sessionRevision == revision else { return }
+            calendarEnabled = allowed; persist()
+            if enabled && !allowed { error = "Autorisez l’accès au calendrier dans les réglages iOS." }
+        } catch { if sessionRevision == revision { self.error = error.localizedDescription } }
+    }
+    func setRemindersEnabled(_ enabled: Bool) async {
+        let revision = sessionRevision
+        do {
+            let allowed = enabled ? try await LocalDeviceData.authorizeReminders() : false
+            guard sessionRevision == revision else { return }
+            remindersEnabled = allowed; persist()
+            if enabled && !allowed { error = "Autorisez l’accès aux rappels dans les réglages iOS." }
+        } catch { if sessionRevision == revision { self.error = error.localizedDescription } }
+    }
+    func disableAutomaticSync() {
+        automaticSync = false; syncTask?.cancel(); syncTask = nil; persist()
+    }
+    func enableAutomaticSync() {
+        guard session != nil else { authenticationPresented = true; return }
+        automaticSync = true
+        if persist() { scheduleAutomaticSync() }
+    }
+    func foreground() {
+        Task { await self.synchronizeCloudAgentState(); await self.resumeCloudHermes(); await self.recoverRemoteHermes() }
+        scheduleAutomaticSync()
+    }
+    private func startNetworkMonitoring() {
+        guard services.monitorConnectivity, !monitoringNetwork else { return }
+        monitoringNetwork = true
+        networkMonitor.pathUpdateHandler = { [weak self] path in
+            let reachable = path.status == .satisfied
+            Task { @MainActor [weak self] in
+                self?.connectivityChanged(reachable)
+            }
+        }
+        networkMonitor.start(queue: DispatchQueue(label: "cloud.multivibe.chat.connectivity"))
+    }
+    func connectivityChanged(_ reachable: Bool) {
+        if reachable { Task { await self.synchronizeCloudAgentState(); await self.resumeCloudHermes(); await self.recoverRemoteHermes() } }
+        online = reachable
+        if reachable { scheduleAutomaticSync() }
+        else { cancelCloudHermesRecoveryRetry(); cloudHermesRestoreTask?.cancel(); syncTask?.cancel(); syncTask = nil; cloudAgentRetryTask?.cancel(); cloudAgentRetryTask = nil; cloudAgentRetryOwner = nil }
+    }
+    private func scheduleCloudAgentRetry() {
+        guard cloudAgentRetryTask == nil, online, !isRestoring, let account = session?.accountId else { return }
+        let epoch = sessionRevision
+        let owner = UUID()
+        let delay = services.hermesSyncDelay
+        cloudAgentRetryOwner = owner
+        cloudAgentRetryTask = Task { [weak self] in
+            defer {
+                if self?.cloudAgentRetryOwner == owner {
+                    self?.cloudAgentRetryTask = nil; self?.cloudAgentRetryOwner = nil
+                }
+            }
+            var attempt = 0
+            while !Task.isCancelled {
+                guard self?.online == true, self?.sessionRevision == epoch,
+                    self?.session?.accountId == account, self?.cloudAgentRetryable == true else { return }
+                do { try await delay(attempt) } catch { return }
+                do {
+                    guard let self, !Task.isCancelled, online, sessionRevision == epoch,
+                        session?.accountId == account, cloudAgentRetryable else { return }
+                    // Hold the manager only during a state exchange, never during backoff.
+                    // State-only exchange: never resume inference or execute a tool here.
+                    await synchronizeCloudAgentState()
+                    if !cloudAgentRetryable { return }
+                }
+                attempt = min(5, attempt + 1)
+            }
+        }
+    }
+    private func scheduleAutomaticSync() {
+        guard automaticSync, online, session != nil, !isRestoring, !isStreaming, !hasHistoryConflict else { return }
+        syncTask?.cancel()
+        let revision = sessionRevision
+        syncTask = Task { [weak self] in
+            guard let self else { return }
+            for attempt in 0..<5 {
+                do { try await services.syncDelay(attempt) } catch { return }
+                guard !Task.isCancelled, online, automaticSync, sessionRevision == revision, !hasHistoryConflict else { return }
+                await synchronizeHistory(automatic: true)
+                if historySnapshot != nil, pendingHistorySave == nil, conversations == historyBaseline, !memorySyncEnabled || memoryRecords.filter({ $0.state != .proposed }) == memoryBaseline { return }
+            }
+        }
+    }
+    /// Titles a conversation from its first user request, in the background.
+    ///
+    /// The request runs against the same model and access as the conversation and
+    /// never blocks or cancels the visible reply. It is attempted once per first
+    /// user message; any failure simply keeps the local truncation fallback.
+    private func scheduleTitle(conversation id: UUID) {
+        guard let snapshot = conversations.first(where: { $0.id == id }),
+              let firstUser = snapshot.messages.first(where: { $0.role == "user" }),
+              !snapshot.messages.isEmpty,
+              snapshot.messages.first?.role == "user",
+              snapshot.titleGeneratedFor != firstUser.id else { return }
+        // Never spend a request on an empty or unusable prompt.
+        let request = String(firstUser.content.prefix(ConversationTitle.maximumInputCharacters))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !request.isEmpty else { return }
+        // Claim the marker before starting so a second turn cannot enqueue a duplicate.
+        titleTasks[id]?.cancel()
+        let account = sessionRevision
+        titleTasks[id] = Task {
+            do {
+                let output = try await titleSummary(model: snapshot.model, access: snapshot.modelAccess, request: request)
+                try Task.checkCancellation()
+                guard sessionRevision == account else { return }
+                guard let title = ConversationTitle.normalize(output) else { throw TitleError.unusable }
+                applyGeneratedTitle(title, conversation: id, firstUser: firstUser.id)
+            } catch is CancellationError {
+                // A newer first message or an account change superseded this request.
+            } catch {
+                // Keep the truncation fallback; still record the attempt so an
+                // offline or unavailable model is not retried on every turn.
+                guard sessionRevision == account else { return }
+                markTitleAttempted(conversation: id, firstUser: firstUser.id)
+            }
+        }
+    }
+    private enum TitleError: Error { case unusable }
+    private func titleSummary(model: String, access: SelectedModelAccess?, request: String) async throws -> String {
+        let prompt = ConversationTitle.instructions + "\n\nDemande de l'utilisateur :\n" + request
+        if ModelExecution(model).isLocal { return try await services.summarizeTitle(model, prompt) }
+        guard let access, access.modelId == model else { throw APIError.server(409, "model_access_unavailable") }
+        let credentials = try await validSession()
+        try Task.checkCancellation()
+        let buffer = MemoryReviewOutput()
+        try await streamUsingAccess(model, access: access, messages: [ChatMessage(role: "user", content: prompt)],
+                                    token: credentials.accessToken) { await buffer.append($0) }
+        return await buffer.value()
+    }
+    /// Applies a generated title only if the conversation still holds the same first
+    /// request and no title was settled in the meantime.
+    private func applyGeneratedTitle(_ title: String, conversation id: UUID, firstUser: UUID) {
+        guard let index = conversations.firstIndex(where: { $0.id == id }),
+              conversations[index].titleGeneratedFor != firstUser,
+              conversations[index].messages.first?.id == firstUser,
+              let firstUserMessage = conversations[index].messages.first(where: { $0.id == firstUser }),
+              conversations[index].title == ConversationTitle.fallback(for: firstUserMessage.content),
+              let normalized = ConversationTitle.normalize(title) else { return }
+        let previous = conversations[index].title
+        conversations[index].title = normalized
+        // The marker records the attempt even if persistence fails, so a message is
+        // never re-summarized in a loop.
+        conversations[index].titleGeneratedFor = firstUser
+        guard persist() else {
+            conversations[index].title = previous
+            return
+        }
+        scheduleAutomaticSync()
+    }
+    private func markTitleAttempted(conversation id: UUID, firstUser: UUID) {
+        guard let index = conversations.firstIndex(where: { $0.id == id }),
+              conversations[index].titleGeneratedFor != firstUser else { return }
+        conversations[index].titleGeneratedFor = firstUser
+        persist()
+    }
+    private func scheduleMemoryReview(conversation id: UUID) {
+        guard let snapshot = conversations.first(where: { $0.id == id }),
+              let tail = snapshot.messages.last, tail.role == "assistant", tail.completion == .completed,
+              snapshot.memoryReviewedThrough != tail.id else { return }
+        memoryReviews[id]?.cancel()
+        let account = sessionRevision
+        let baseline = memoryRecords
+        let start = snapshot.memoryReviewedThrough.flatMap { marker in snapshot.messages.firstIndex { $0.id == marker } }.map { $0 + 1 } ?? 0
+        let messages = Array(snapshot.messages.dropFirst(start))
+        let existing = MemoryPolicy.items(baseline).filter { $0.memory.scope == (snapshot.memoryScope ?? "") }.map(\.memory)
+        memoryReviews[id] = Task {
+            do {
+                try await services.memoryReviewDelay()
+                try Task.checkCancellation()
+                guard sessionRevision == account else { return }
+                let encoder = JSONEncoder()
+                let payload = "Existing memories:\n" + String(decoding: try encoder.encode(existing), as: UTF8.self)
+                    + "\nConversation messages:\n" + String(decoding: try encoder.encode(messages), as: UTF8.self)
+                // Do not silently mark a truncated conversation as reviewed.
+                guard payload.utf8.count <= 48_000 else { throw MemoryError.invalid }
+                let output: String
+                if snapshot.model == LocalModel.id {
+                    output = try await services.reviewLocalMemory(payload)
+                } else if ModelExecution(snapshot.model) == .downloaded {
+                    let buffer = MemoryReviewOutput()
+                    try await services.downloadedRespond(snapshot.model, [ChatMessage(role: "system", content: AutomaticMemory.instructions),
+                        ChatMessage(role: "user", content: payload)], nil) { await buffer.append($0) }
+                    output = await buffer.value()
+                } else {
+                    let credentials = try await validSession()
+                    try Task.checkCancellation()
+                    guard sessionRevision == account else { return }
+                    let buffer = MemoryReviewOutput()
+                    try await streamUsingAccess(snapshot.model, access: snapshot.modelAccess, messages: [ChatMessage(role: "system", content: AutomaticMemory.instructions),
+                        ChatMessage(role: "user", content: payload)], token: credentials.accessToken) { await buffer.append($0) }
+                    output = await buffer.value()
+                }
+                try Task.checkCancellation()
+                guard sessionRevision == account, !isRestoring,
+                      let index = conversations.firstIndex(where: { $0.id == id }),
+                      conversations[index].messages == snapshot.messages,
+                      conversations[index].memoryScope == snapshot.memoryScope else { return }
+                let changes = try AutomaticMemory.changes(output)
+                // A manual forget or correction during inference always wins, even for proposed additions.
+                guard memoryRecords == baseline else {
+                    conversations[index].memoryReviewedThrough = tail.id
+                    if !persist() { conversations[index].memoryReviewedThrough = snapshot.memoryReviewedThrough }
+                    return
+                }
+                let updated = AutomaticMemory.apply(changes, messages: messages, conversation: snapshot,
+                    baseline: baseline, current: memoryRecords)
+                let old = memoryRecords
+                memoryRecords = updated
+                conversations[index].memoryReviewedThrough = tail.id
+                guard persist() else {
+                    memoryRecords = old
+                    conversations[index].memoryReviewedThrough = snapshot.memoryReviewedThrough
+                    return
+                }
+                refreshMemoryIndex(); scheduleAutomaticSync()
+            } catch is CancellationError {
+                // A newer user turn or account change superseded this review.
+            } catch {
+                if sessionRevision == account { memoryError = "La mise à jour automatique de la mémoire n’a pas abouti. Elle sera réessayée après le prochain échange." }
+            }
+        }
+    }
+
+    func draftMemory(from message: ChatMessage) {
+        guard !isRestoring, !isStreaming, !isSynchronizing else { return }
+        memoryDraft = MemoryDraft(text: String(message.content.prefix(600)),
+            evidence: MemoryEvidence(origin: message.role == "user" ? .userMessage : .userConfirmation,
+                quote: String(message.content.prefix(4000)), date: Date(),
+                conversationID: current?.memorySourceID ?? selection, messageID: message.id, sourceRole: message.role),
+            scope: current?.memoryScope ?? "")
+    }
+    func editMemory(_ item: MemoryItem) {
+        guard let evidence = item.memory.evidence else { return }
+        memoryDraft = MemoryDraft(id: item.memory.id, text: item.memory.text, evidence: evidence,
+            topic: item.memory.topic, kind: item.memory.kind, scope: item.memory.scope, expiresAt: item.memory.expiresAt,
+            replaces: item.memory.id)
+    }
+    @discardableResult func saveMemory(_ draft: MemoryDraft) -> Bool {
+        guard !isRestoring, !isStreaming, !isSynchronizing else { return false }
+        let old = memoryRecords
+        let oldBaseline = memoryBaseline; let oldSnapshot = historySnapshot; let oldPending = pendingHistorySave
+        let related = memoryItems.filter { $0.memory.topicKey == MemoryPolicy.normalized(draft.scope) + "|" + MemoryPolicy.normalized(draft.topic) }
+        if related.contains(where: { $0.memory.id != draft.replaces && $0.memory.text != draft.text }) && !draft.resolveConflicts {
+            memoryError = "Un souvenir différent existe pour ce sujet. Choisissez explicitement de le remplacer."; return false
+        }
+        let existing = draft.replaces.flatMap { id in memoryRecords.first { $0.id == id && $0.state != .deleted } }
+        if let id = draft.replaces, memoryRecords.contains(where: { $0.id == id && $0.state == .deleted }) {
+            memoryError = "Ce souvenir a été oublié. Créez-en un nouveau si nécessaire."; return false
+        }
+        var evidence = draft.evidence
+        evidence.origin = draft.replaces == nil && evidence.sourceRole == "user" && draft.text == evidence.quote
+            ? (evidence.origin == .userEntry ? .userEntry : .userMessage) : .userConfirmation
+        if evidence.origin == .userConfirmation {
+            evidence.priorQuote = evidence.quote
+            evidence.quote = draft.text
+            evidence.date = Date()
+        }
+        var memory = AgentMemory(id: existing?.id ?? UUID(), topic: draft.topic.trimmingCharacters(in: .whitespacesAndNewlines),
+            text: draft.text.trimmingCharacters(in: .whitespacesAndNewlines), kind: draft.kind,
+            scope: draft.scope.trimmingCharacters(in: .whitespacesAndNewlines), state: .confirmed, evidence: evidence,
+            expiresAt: draft.kind == .temporary ? draft.expiresAt : nil)
+        memory.ancestors = memoryRecords.filter { $0.id == memory.id }.map(\.version)
+        guard memory.valid, memoryRecords.count < 1000 else { memoryError = MemoryError.invalid.localizedDescription; return false }
+        if draft.resolveConflicts {
+            for item in related where item.memory.id != memory.id { forgetMemoryRecords(item.memory.id) }
+        }
+        memoryRecords.append(memory)
+        if !persist() { memoryRecords = old; memoryBaseline = oldBaseline; historySnapshot = oldSnapshot; pendingHistorySave = oldPending; return false }
+        refreshMemoryIndex(); memoryDraft = nil; scheduleAutomaticSync()
+        return true
+    }
+    @discardableResult func forgetMemory(_ id: UUID) -> Bool {
+        guard !isRestoring, !isStreaming, !isSynchronizing else { return false }
+        let old = memoryRecords
+        let oldBaseline = memoryBaseline; let oldSnapshot = historySnapshot; let oldPending = pendingHistorySave
+        forgetMemoryRecords(id)
+        guard persist() else { memoryRecords = old; memoryBaseline = oldBaseline; historySnapshot = oldSnapshot; pendingHistorySave = oldPending; return false }
+        refreshMemoryIndex(); scheduleAutomaticSync(); return true
+    }
+    private func forgetMemoryRecords(_ id: UUID) {
+        guard let record = memoryRecords.first(where: { $0.id == id }) else { return }
+        let tombstone = record.tombstone()
+        memoryRecords.removeAll { $0.id == id }; memoryRecords.append(tombstone)
+        // Remove forgotten content from cached remote/recovery payloads too.
+        memoryBaseline.removeAll { $0.id == id }
+        historySnapshot?.memory?.removeAll { $0.id == id }
+        pendingHistorySave?.memory?.removeAll { $0.id == id }
+        pendingHistorySave?.snapshot.memory?.removeAll { $0.id == id }
+    }
+    func setMemorySync(_ enabled: Bool) {
+        guard session != nil, !isSynchronizing, !isStreaming, !isRestoring else { return }
+        let previous = memorySyncEnabled
+        memorySyncEnabled = enabled
+        if !enabled { historySnapshot?.memory = nil; memoryBaseline = []; pendingHistorySave?.memory = nil; pendingHistorySave?.snapshot.memory = nil }
+        if !persist() { memorySyncEnabled = previous; return }
+        if enabled { Task { await self.synchronizeHistory() } }
+    }
+    func setMemoryScope(_ scope: String) {
+        guard !isStreaming, !isSynchronizing, let id = selection,
+              let index = conversations.firstIndex(where: { $0.id == id }) else { return }
+        conversations[index].memoryScope = String(scope.prefix(80)); persist()
+    }
+    private func refreshMemoryIndex() {
+        do { guard let memoryIndex else { throw MemoryError.storage }; try memoryIndex.rebuild(memoryItems); memoryError = nil }
+        catch { memoryError = MemoryError.storage.localizedDescription; memoryIndex = nil }
+    }
+    func source(for reference: MemoryReference) -> AgentMemory? {
+        guard !memoryRecords.contains(where: { $0.id == reference.memoryID && $0.state == .deleted }) else { return nil }
+        return memoryRecords.first { $0.id == reference.memoryID && $0.version == reference.id && $0.state == .confirmed }
+    }
+    private func recordMemoryReference(_ record: AgentMemory) {
+        guard let activeReply, let i = conversations.firstIndex(where: { $0.id == activeReply.conversation }),
+              let j = conversations[i].messages.firstIndex(where: { $0.id == activeReply.message }) else { return }
+        let reference = MemoryReference(id: record.version, memoryID: record.id)
+        var references = conversations[i].messages[j].memoryReferences ?? []
+        if !references.contains(reference), references.count < 36 { references.append(reference) }
+        conversations[i].messages[j].memoryReferences = references
+    }
+    private func memoryTool(action: String, query: String, text: String, conversation: UUID,
+                            source: ChatMessage?, generation: UUID, account: UUID) throws -> String {
+        guard generationRevision == generation, sessionRevision == account else { throw CancellationError() }
+        let scope = conversations.first { $0.id == conversation }?.memoryScope ?? ""
+        switch action {
+        case "context_memory", "search_memory":
+            guard let memoryIndex else { return action == "context_memory" ? "" : MemoryError.storage.localizedDescription }
+            let matches = try memoryIndex.search(query, scope: scope)
+            let conflicts = memoryItems.contains { $0.conflicting && ($0.memory.scope.isEmpty || MemoryPolicy.normalized($0.memory.scope) == MemoryPolicy.normalized(scope)) }
+            let candidates = action == "context_memory" ? Array(matches.prefix(1)) : matches
+            var rendered = ""
+            for item in candidates {
+                let source = MemoryPolicy.render(item)
+                if rendered.count + source.count > 3600 { break }
+                recordMemoryReference(item.memory)
+                rendered += (rendered.isEmpty ? "" : "\n\n") + source
+            }
+            if action == "context_memory", rendered.isEmpty, !conflicts { return "" }
+            return (conflicts ? "Des souvenirs contradictoires sont exclus. Demandez de les résoudre dans Mémoire.\n" : "")
+                + (rendered.isEmpty ? "Aucun souvenir validé, non expiré et pertinent. Ne rien déduire de cette absence." : rendered)
+        case "read_memory":
+            guard let id = UUID(uuidString: query), let item = memoryItems.first(where: { $0.id == id }),
+                  item.usable(now: Date()), item.memory.scope.isEmpty || MemoryPolicy.normalized(item.memory.scope) == MemoryPolicy.normalized(scope) else {
+                return "Souvenir absent, expiré ou contradictoire. Revérifiez auprès de l’utilisateur ou de l’outil approprié."
+            }
+            recordMemoryReference(item.memory)
+            return MemoryPolicy.render(item)
+        case "propose_memory":
+            return "La mémoire est gérée automatiquement après la réponse. Aucune validation manuelle n’est nécessaire."
+        default: return "Outil mémoire inconnu."
+        }
+    }
+
+    private func historyURL(_ account: String) throws -> URL {
+        // Hash account identifiers rather than accepting path components from a server.
+        let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        return directory.appendingPathComponent("history-" + SHA256.hash(data: Data(account.utf8)).map { String(format: "%02x", $0) }.joined() + ".json")
+    }
+    @discardableResult private func persist() -> Bool {
+        guard !isRestoring, storageLoaded else { return false }
+        do {
+            let url = try storageURL()
+            try services.writeHistory(JSONEncoder().encode(HistoryCache(cloudHermesBindings: cloudHermesBindings, cloudAgentState:cloudAgentState, pendingCloudArtifacts:pendingCloudArtifacts, remoteHermes:remoteHermes, discoveredCloudRuns:discoveredCloudRuns, memory: memoryRecords, memoryBaseline: memoryBaseline, memorySyncEnabled: memorySyncEnabled, calendarEnabled: calendarEnabled, remindersEnabled: remindersEnabled, documents: localDocuments, importedGuestSnapshots: importedGuestSnapshots, automaticSync: automaticSync, conversations: conversations,
+                snapshot: historySnapshot, pending: pendingHistorySave, baseline: historyBaseline,
+                conversationIDs: historyConversationIDs, messageIDs: historyMessageIDs)), url)
+            return true
+        } catch {
+            self.error = "Impossible d’enregistrer les conversations sur cet appareil."
+            return false
+        }
+    }
+}

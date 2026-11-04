@@ -1,0 +1,502 @@
+package main
+
+import (
+	"archive/tar"
+	"archive/zip"
+	"compress/gzip"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+)
+
+func verifyDownloadedArchive(state updaterState) error {
+	if !newerUpdate(state) {
+		return errors.New("the update must be newer than the installed version")
+	}
+	if state.DownloadedPath == "" || state.Target == nil || state.DownloadedSHA256 != state.Target.SHA256 {
+		return errors.New("no verified downloaded update is available")
+	}
+	info, err := os.Lstat(state.DownloadedPath)
+	if err != nil || !updaterPrivateFile(state.DownloadedPath, info) || info.Size() != state.Target.Size {
+		return errors.New("the downloaded update archive is unavailable")
+	}
+	file, err := os.Open(state.DownloadedPath)
+	if err != nil {
+		return errors.New("the downloaded update archive cannot be opened")
+	}
+	defer file.Close()
+	digest := sha256.New()
+	if _, err := io.Copy(digest, file); err != nil || hex.EncodeToString(digest.Sum(nil)) != state.Target.SHA256 {
+		return errors.New("the downloaded update archive changed after verification")
+	}
+	return nil
+}
+
+func cleanArchivePath(root, name string) (string, error) {
+	if name == "" || strings.ContainsRune(name, '\x00') || filepath.IsAbs(name) || filepath.Clean(name) != name || name == "." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
+		return "", errors.New("the update archive contains an unsafe path")
+	}
+	destination := filepath.Join(root, filepath.FromSlash(name))
+	relative, err := filepath.Rel(root, destination)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", errors.New("the update archive escapes its staging directory")
+	}
+	return destination, nil
+}
+
+func extractLinuxArchive(archive, destination string) (string, error) {
+	file, err := os.Open(archive)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	compressed, err := gzip.NewReader(file)
+	if err != nil {
+		return "", errors.New("the Linux update is not a gzip archive")
+	}
+	defer compressed.Close()
+	reader := tar.NewReader(compressed)
+	var rootName string
+	var total int64
+	entries := 0
+	for {
+		header, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return "", errors.New("the Linux update archive is invalid")
+		}
+		entries++
+		if entries > 200000 || header.Size < 0 || header.Size > maximumArtifactBytes {
+			return "", errors.New("the Linux update archive exceeds its safety bounds")
+		}
+		entryName := header.Name
+		if header.Typeflag == tar.TypeDir {
+			entryName = strings.TrimSuffix(entryName, "/")
+		}
+		parts := strings.Split(filepath.ToSlash(entryName), "/")
+		if len(parts) == 0 || parts[0] == "" {
+			return "", errors.New("the Linux update archive root is invalid")
+		}
+		if rootName == "" {
+			rootName = parts[0]
+		}
+		if parts[0] != rootName {
+			return "", errors.New("the Linux update archive has multiple roots")
+		}
+		target, err := cleanArchivePath(destination, entryName)
+		if err != nil {
+			return "", err
+		}
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return "", err
+			}
+		case tar.TypeReg, tar.TypeRegA:
+			total += header.Size
+			if total > maximumArtifactBytes {
+				return "", errors.New("the Linux update archive expands beyond its safety bound")
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return "", err
+			}
+			mode := os.FileMode(header.Mode) & 0o777
+			if mode&0o002 != 0 {
+				return "", errors.New("the Linux update archive contains a world-writable file")
+			}
+			output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+			if err != nil {
+				return "", err
+			}
+			written, copyErr := io.CopyN(output, reader, header.Size)
+			closeErr := output.Close()
+			if copyErr != nil || closeErr != nil || written != header.Size {
+				return "", errors.New("the Linux update archive could not be extracted completely")
+			}
+		default:
+			return "", errors.New("the Linux update archive contains links or unsupported entries")
+		}
+	}
+	if rootName == "" {
+		return "", errors.New("the Linux update archive is empty")
+	}
+	root := filepath.Join(destination, rootName)
+	installer := filepath.Join(root, "install.sh")
+	info, err := os.Lstat(installer)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o111 == 0 {
+		return "", errors.New("the Linux update installer is unavailable")
+	}
+	return root, nil
+}
+
+type hostCredentials struct {
+	SchemaVersion string `json:"schema_version"`
+	AdminToken    string `json:"admin_token"`
+	ProxyAPIKey   string `json:"proxy_api_key"`
+}
+
+func resolveHostControlPlanePort(goos, controlPlanePort, hostPort string) (string, error) {
+	port := strings.TrimSpace(controlPlanePort)
+	if port == "" && goos == "darwin" {
+		// macOS runs the Node control plane separately from the Rust edge.
+		port = "1456"
+	}
+	if port == "" {
+		port = strings.TrimSpace(hostPort)
+	}
+	if port == "" {
+		port = "1455"
+	}
+	parsed, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || parsed == 0 || strconv.FormatUint(parsed, 10) != port {
+		return "", errors.New("the Host control-plane port is invalid")
+	}
+	return port, nil
+}
+
+func hostControlPlanePort() (string, error) {
+	return resolveHostControlPlanePort(
+		runtime.GOOS,
+		os.Getenv("MULTIVIBE_CONTROL_PLANE_PORT"),
+		os.Getenv("MULTIVIBE_HOST_PORT"),
+	)
+}
+
+func (update *updater) hostRequest(ctx context.Context, method, route string) (*http.Response, error) {
+	if update.container {
+		return dockerHostRequest(ctx, method, route)
+	}
+
+	credentialPath := filepath.Join(update.store.directory, "host-credentials.json")
+	info, err := os.Lstat(credentialPath)
+	if err != nil || !updaterPrivateFile(credentialPath, info) || info.Size() > 16*1024 {
+		return nil, errors.New("the local Host credentials are unavailable")
+	}
+	data, err := os.ReadFile(credentialPath)
+	if err != nil {
+		return nil, errors.New("the local Host credentials cannot be read")
+	}
+	var credentials hostCredentials
+	if decodeStrictJSON(data, &credentials) != nil || credentials.SchemaVersion != "multivibe-host-credentials-v1" || len(credentials.AdminToken) < 32 {
+		return nil, errors.New("the local Host credentials are invalid")
+	}
+	port, err := hostControlPlanePort()
+	if err != nil {
+		return nil, err
+	}
+	request, err := http.NewRequestWithContext(ctx, method, "http://127.0.0.1:"+port+route, nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("x-admin-token", credentials.AdminToken)
+	request.Header.Set("accept", "application/json")
+	return (&http.Client{Timeout: 5 * time.Second}).Do(request)
+}
+
+func (update *updater) drain(ctx context.Context) error {
+	if update.unattended && !overnightWindow(update.now()) {
+		return errors.New("automatic installation deferred until the next night")
+	}
+	if err := update.requireQuiet(ctx); err != nil {
+		return err
+	}
+
+	var response *http.Response
+	var err error
+	startupDeadline := time.Now().Add(30 * time.Second)
+	for {
+		response, err = update.hostRequest(ctx, http.MethodPost, "/admin/host-update/drain")
+		if err == nil && response.StatusCode == http.StatusOK {
+			break
+		}
+		if err == nil {
+			status := response.StatusCode
+			_ = response.Body.Close()
+			if status < http.StatusInternalServerError || status >= 600 {
+				return fmt.Errorf("the Host refused update drain mode with HTTP %d", status)
+			}
+			err = fmt.Errorf("the Host returned HTTP %d while entering update drain mode", status)
+		}
+		if !time.Now().Before(startupDeadline) {
+			return fmt.Errorf("the running Host could not enter update drain mode: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("the Host refused update drain mode with HTTP %d", response.StatusCode)
+	}
+	deadline := update.now().Add(5 * time.Minute)
+	for update.now().Before(deadline) {
+		response, err := update.hostRequest(ctx, http.MethodGet, "/admin/host-update/readiness")
+		if err == nil {
+			var result struct {
+				Ready bool `json:"ready"`
+			}
+			decodeErr := json.NewDecoder(io.LimitReader(response.Body, 64*1024)).Decode(&result)
+			_ = response.Body.Close()
+			if response.StatusCode == http.StatusOK && decodeErr == nil && result.Ready {
+				// Recheck after admission is closed to cover requests arriving
+				// between the preflight check and entering drain mode.
+				return update.requireQuiet(ctx)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return errors.New("the Host did not become idle before the update deadline")
+}
+
+func (update *updater) resumeDrain() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	response, err := update.hostRequest(ctx, http.MethodPost, "/admin/host-update/resume")
+	if err == nil {
+		_ = response.Body.Close()
+	}
+}
+
+func commandWithLog(ctx context.Context, logPath, program string, arguments ...string) error {
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return errors.New("the update log cannot be opened")
+	}
+	defer logFile.Close()
+	if err := secureUpdaterPrivateFile(logPath); err != nil {
+		return errors.New("the update log cannot be protected")
+	}
+	command := exec.CommandContext(ctx, program, arguments...)
+	command.Stdin = nil
+	command.Stdout = logFile
+	command.Stderr = logFile
+	command.Env = os.Environ()
+	return command.Run()
+}
+
+func (update *updater) applyNative(ctx context.Context, state *updaterState) error {
+	if err := verifyDownloadedArchive(*state); err != nil {
+		return setFailure(update.store, state, "artifact_recheck_failed", err)
+	}
+	state.Status = "installing"
+	state.LastError = ""
+	state.LastErrorCode = ""
+	if err := update.store.save(*state); err != nil {
+		return err
+	}
+	installed := false
+	defer func() {
+		if !installed {
+			update.resumeDrain()
+		}
+	}()
+	if err := update.drain(ctx); err != nil {
+		return setFailure(update.store, state, "host_not_idle", err)
+	}
+	var installErr error
+	if runtime.GOOS == "linux" {
+		staging, err := os.MkdirTemp(update.store.cache, ".extract-*")
+		if err != nil {
+			return setFailure(update.store, state, "extract_stage_failed", err)
+		}
+		defer os.RemoveAll(staging)
+		root, err := extractLinuxArchive(state.DownloadedPath, staging)
+		if err != nil {
+			return setFailure(update.store, state, "archive_extract_failed", err)
+		}
+		installErr = commandWithLog(ctx, update.store.log, filepath.Join(root, "install.sh"), "--automatic-update")
+	} else if runtime.GOOS == "darwin" {
+		mountRoot, err := os.MkdirTemp(update.store.cache, ".mount-*")
+		if err != nil {
+			return setFailure(update.store, state, "mount_stage_failed", err)
+		}
+		defer os.RemoveAll(mountRoot)
+		mountPoint := filepath.Join(mountRoot, "volume")
+		if err := os.Mkdir(mountPoint, 0o700); err != nil {
+			return setFailure(update.store, state, "mount_stage_failed", err)
+		}
+		if err := commandWithLog(ctx, update.store.log, "/usr/bin/hdiutil", "attach", "-quiet", "-readonly", "-nobrowse", "-mountpoint", mountPoint, state.DownloadedPath); err != nil {
+			return setFailure(update.store, state, "dmg_mount_failed", errors.New("the signed macOS disk image could not be mounted"))
+		}
+		defer func() {
+			_ = commandWithLog(context.Background(), update.store.log, "/usr/bin/hdiutil", "detach", "-quiet", mountPoint)
+		}()
+		application := filepath.Join(mountPoint, "MultiVibe Host.app")
+		installer := filepath.Join(application, "Contents", "Resources", "update", "install.sh")
+		installErr = commandWithLog(ctx, update.store.log, installer, "--automatic-update", "--source-application", application, "--destination-application", installedMacApplication())
+	} else if runtime.GOOS == "windows" {
+		staging, err := os.MkdirTemp(update.store.cache, ".extract-*")
+		if err != nil {
+			return setFailure(update.store, state, "extract_stage_failed", err)
+		}
+		defer os.RemoveAll(staging)
+		if err := secureUpdaterPrivateDirectory(staging); err != nil {
+			return setFailure(update.store, state, "extract_stage_failed", err)
+		}
+		root, err := extractWindowsArchive(state.DownloadedPath, staging)
+		if err != nil {
+			return setFailure(update.store, state, "archive_extract_failed", err)
+		}
+		powershell, err := nativePowerShellPath()
+		if err != nil {
+			return setFailure(update.store, state, "installer_unavailable", err)
+		}
+		installArguments := []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(root, "install.ps1"), "-AutomaticUpdate", "-SourceDirectory", root, "-UpdaterProcessId", strconv.Itoa(os.Getpid())}
+		installErr = commandWithLog(ctx, update.store.log, powershell, installArguments...)
+	} else {
+		installErr = errors.New("native updates are unsupported on this operating system")
+	}
+	if installErr != nil {
+		return setFailure(update.store, state, "installation_failed", errors.New("the update installer failed; consult the update log for rollback status"))
+	}
+	installed = true
+	state.CurrentVersion = state.AvailableVersion
+	state.Status = "current"
+	state.LastInstalledAt = update.now().UTC().Format(time.RFC3339Nano)
+	state.AvailableVersion = ""
+	state.AvailableCritical = false
+	state.RolloutEligible = false
+	state.Target = nil
+	state.DownloadedPath = ""
+	state.DownloadedSHA256 = ""
+	state.DownloadRequested = false
+	state.InstallRequested = false
+	if err := update.store.save(*state); err != nil {
+		return err
+	}
+	if runtime.GOOS == "darwin" {
+		_ = exec.Command("/usr/bin/open", installedMacApplication()).Start()
+	}
+	return nil
+}
+
+func extractWindowsArchive(archive, destination string) (string, error) {
+	info, err := os.Stat(archive)
+	if err != nil || !updaterPrivateFile(archive, info) || info.Size() < 1 || info.Size() > maximumArtifactBytes {
+		return "", errors.New("the Windows update archive is invalid")
+	}
+	file, err := os.Open(archive)
+	if err != nil {
+		return "", errors.New("the Windows update archive cannot be opened")
+	}
+	defer file.Close()
+	reader, err := zip.NewReader(file, info.Size())
+	if err != nil || len(reader.File) == 0 || len(reader.File) > 200000 {
+		return "", errors.New("the Windows update archive is invalid")
+	}
+	seen := make(map[string]struct{}, len(reader.File))
+	var rootName string
+	var total int64
+	for _, entry := range reader.File {
+		if strings.Contains(entry.Name, "\\") {
+			return "", errors.New("the Windows update archive contains an unsafe path")
+		}
+		name := entry.Name
+		trimmed := strings.TrimSuffix(name, "/")
+		parts := strings.Split(trimmed, "/")
+		if len(parts) < 1 || parts[0] == "" || !safeWindowsArchivePath(name) {
+			return "", errors.New("the Windows update archive contains an unsafe path")
+		}
+		if rootName == "" {
+			rootName = parts[0]
+		}
+		if parts[0] != rootName {
+			return "", errors.New("the Windows update archive has multiple roots")
+		}
+		canonical := strings.ToLower(trimmed)
+		if _, exists := seen[canonical]; exists {
+			return "", errors.New("the Windows update archive contains duplicate paths")
+		}
+		seen[canonical] = struct{}{}
+		if entry.UncompressedSize64 > uint64(maximumArtifactBytes) || uint64(total) > uint64(maximumArtifactBytes)-entry.UncompressedSize64 {
+			return "", errors.New("the Windows update archive expands beyond its safety bound")
+		}
+		total += int64(entry.UncompressedSize64)
+		target := filepath.Join(destination, filepath.FromSlash(trimmed))
+		if !archivePathWithin(destination, target) {
+			return "", errors.New("the Windows update archive escapes its staging directory")
+		}
+		if strings.HasSuffix(name, "/") || entry.FileInfo().IsDir() {
+			if err := os.MkdirAll(target, 0o700); err != nil || secureUpdaterPrivateDirectory(target) != nil {
+				return "", errors.New("the Windows update archive directory cannot be secured")
+			}
+			continue
+		}
+		parent := filepath.Dir(target)
+		if err := os.MkdirAll(parent, 0o700); err != nil || secureUpdaterPrivateDirectory(parent) != nil {
+			return "", errors.New("the Windows update archive parent cannot be secured")
+		}
+		entryInfo := entry.FileInfo()
+		if !entryInfo.Mode().IsRegular() || entryInfo.Mode()&os.ModeSymlink != 0 {
+			return "", errors.New("the Windows update archive contains an unsupported entry")
+		}
+		output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			return "", errors.New("the Windows update archive file cannot be staged")
+		}
+		input, openErr := entry.Open()
+		if openErr != nil {
+			_ = output.Close()
+			_ = os.Remove(target)
+			return "", errors.New("the Windows update archive entry cannot be opened")
+		}
+		written, copyErr := io.Copy(output, io.LimitReader(input, int64(entry.UncompressedSize64)+1))
+		inputCloseErr := input.Close()
+		closeErr := output.Close()
+		if copyErr != nil || inputCloseErr != nil || closeErr != nil || written != int64(entry.UncompressedSize64) || secureUpdaterPrivateFile(target) != nil {
+			_ = os.Remove(target)
+			return "", errors.New("the Windows update archive could not be extracted completely")
+		}
+	}
+	if rootName == "" {
+		return "", errors.New("the Windows update archive is empty")
+	}
+	installer := filepath.Join(destination, rootName, "install.ps1")
+	installerInfo, err := os.Lstat(installer)
+	if err != nil || !updaterPrivateFile(installer, installerInfo) {
+		return "", errors.New("the Windows update installer is unavailable")
+	}
+	return filepath.Join(destination, rootName), nil
+}
+
+func safeWindowsArchivePath(name string) bool {
+	if name == "" || strings.ContainsRune(name, '\x00') || strings.Contains(name, "\\") || strings.HasPrefix(name, "/") || strings.HasPrefix(name, "//") {
+		return false
+	}
+	trimmed := strings.TrimSuffix(name, "/")
+	if trimmed == "" || strings.HasSuffix(trimmed, "/") {
+		return false
+	}
+	parts := strings.Split(trimmed, "/")
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." || strings.Contains(part, ":") {
+			return false
+		}
+	}
+	return true
+}
+
+func archivePathWithin(root, candidate string) bool {
+	relative, err := filepath.Rel(root, candidate)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
+}

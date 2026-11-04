@@ -1,0 +1,28 @@
+<Container version="2">
+  <Name>multivibe-host</Name>
+  <Repository>ghcr.io/thibautrey/multivibe-host:latest</Repository>
+  <Registry>https://github.com/thibautrey/multivibe/pkgs/container/multivibe-host</Registry>
+  <Network>bridge</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <ExtraParams>--init --read-only --tmpfs=/tmp:rw,nosuid,nodev,noexec,mode=1777,size=512m --security-opt=no-new-privileges:true --cap-drop=ALL --cap-add=CHOWN --cap-add=FOWNER --cap-add=SETGID --cap-add=SETUID</ExtraParams>
+
+  <Icon>https://raw.githubusercontent.com/thibautrey/multivibe/main/assets/brand/favicon/favicon-256x256.png</Icon>
+  <WebUI>http://[IP]:[PORT:1455]</WebUI>
+  <Overview>MultiVibe Host connects AI provider accounts through an API proxy and local dashboard. Application data and credentials persist in appdata.</Overview>
+  <Support>https://github.com/thibautrey/multivibe/issues</Support>
+  <Project>https://github.com/thibautrey/multivibe</Project>
+  <TemplateURL>https://raw.githubusercontent.com/thibautrey/multivibe/main/packaging/unraid/multivibe-host.xml</TemplateURL>
+  <ReadMe>https://raw.githubusercontent.com/thibautrey/multivibe/main/README.md</ReadMe>
+  <Category>Tools:System</Category>
+  <ExtraSearchTerms>AI LLM API proxy provider</ExtraSearchTerms>
+  <Requires>Unraid on x86_64. Set the Public URL to the exact LAN or HTTPS reverse-proxy origin used by browsers.</Requires>
+  <Changes>Initial beta container template.</Changes>
+  <Date>2026-09-07</Date>
+  <Beta>true</Beta>
+  <License>Apache-2.0</License>
+
+  <Config Name="Web UI" Target="1455" Default="1455" Mode="tcp" Description="Host port for the protected MultiVibe dashboard and API." Type="Port" Display="always" Required="true" Mask="false">1455</Config>
+  <Config Name="Application data" Target="/data" Default="/mnt/user/appdata/multivibe-host" Mode="rw" Description="Persistent private credentials, device identity, policy, database and logs." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/multivibe-host</Config>
+  <Config Name="Public URL" Target="MULTIVIBE_HOST_PUBLIC_URL" Default="" Mode="" Description="Required: enter your actual origin, for example http://192.168.1.10:1455. Match the Web UI host port; do not use [IP] or [PORT] placeholders. No path or trailing slash. Use the reverse-proxy HTTPS origin when applicable." Type="Variable" Display="always" Required="true" Mask="false"></Config>
+</Container>

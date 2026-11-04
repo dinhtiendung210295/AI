@@ -1,0 +1,567 @@
+import { createHash } from "node:crypto";
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { gunzipSync } from "node:zlib";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+import { argumentsFrom, archiveBundle, command, commandInvocation, download, stapleMacArtifact, submitMacNotarization } from "./package-provider-host.mjs";
+
+const packager = fileURLToPath(new URL("./package-provider-host.mjs", import.meta.url));
+const verifier = fileURLToPath(new URL("./verify-provider-host.mjs", import.meta.url));
+
+async function runNode(arguments_) {
+  return await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, arguments_, {
+      stdio: ["ignore", "pipe", "pipe"],
+      shell: false,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("exit", (code, signal) => resolve({ code, signal, stdout, stderr }));
+  });
+}
+
+function tarEntries(archive) {
+  const contents = gunzipSync(archive);
+  const entries = [];
+  let offset = 0;
+  while (offset + 512 <= contents.length) {
+    const header = contents.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) break;
+    const stringField = (start, length) => {
+      const field = header.subarray(start, start + length);
+      const end = field.indexOf(0);
+      return field.subarray(0, end < 0 ? field.length : end).toString("ascii");
+    };
+    const sizeText = stringField(124, 12).trim();
+    const size = sizeText === "" ? 0 : Number.parseInt(sizeText, 8);
+    const name = stringField(0, 100);
+    const prefix = stringField(345, 155);
+    entries.push({
+      name: prefix ? `${prefix}/${name}` : name,
+      type: header[156] === 0 ? "0" : String.fromCharCode(header[156]),
+    });
+    offset += 512 + Math.ceil(size / 512) * 512;
+  }
+  return entries;
+}
+
+test("Linux packaging uses ustar paths instead of duplicate GNU long-name metadata", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "multivibe-host-archive-test-"));
+  try {
+    const baseName = "multivibe-host_0.2.0-runtime-community.1_linux_amd64";
+    const root = path.join(directory, baseName);
+    const relativeParts = [
+      "app",
+      "node_modules",
+      "@opentelemetry",
+      "instrumentation-http",
+      "node_modules",
+      "@opentelemetry",
+      "semantic-conventions",
+      "build",
+      "esnext",
+      "resource",
+      "SemanticResourceAttributes.js.map",
+    ];
+    const relative = path.posix.join(...relativeParts);
+    await mkdir(path.dirname(path.join(root, ...relativeParts)), { recursive: true });
+    await writeFile(path.join(root, ...relativeParts), "source map\n");
+
+    const archive = await archiveBundle(
+      { root, baseName },
+      { output: path.join(directory, "out") },
+      { archive: "tar.gz" },
+    );
+    const entries = tarEntries(await readFile(archive));
+    assert.ok(entries.some((entry) => entry.name === `${baseName}/${relative}`));
+    assert.ok(entries.every((entry) => !["L", "x", "g"].includes(entry.type)));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("the packaging CLI remains active when invoked through a symlink", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "multivibe-host-packager-link-test-"));
+  try {
+    const link = path.join(directory, "package-provider-host.mjs");
+    await symlink(packager, link);
+    const result = await runNode([link, "--invalid-test-option"]);
+    assert.equal(result.code, 1);
+    assert.equal(result.signal, null);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /provider-host package failed: unknown argument: --invalid-test-option/u);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Linux archives use the native GTK menu binary and bundled icon", async () => {
+  const source = await readFile(packager, "utf8");
+  assert.match(source, /path\.join\(repositoryRoot, "host", "menu"\)/u);
+  assert.match(source, /multivibe-host-menu/u);
+  assert.match(source, /favicon-32x32\.png/u);
+  assert.match(source, /CGO_ENABLED: selectedTarget\.goos === "linux" \? "1" : "0"/u);
+});
+
+test("Windows packaging emits a ZIP with the native installer pair", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "multivibe-host-windows-archive-test-"));
+  try {
+    const baseName = "multivibe-host_0.2.0_windows_amd64";
+    const root = path.join(directory, baseName);
+    await mkdir(root, { recursive: true });
+    await writeFile(path.join(root, "install.ps1"), "Write-Output install\n");
+    await writeFile(path.join(root, "uninstall.ps1"), "Write-Output uninstall\n");
+    const archive = await archiveBundle(
+      { root, baseName },
+      { output: path.join(directory, "out") },
+      { archive: "zip" },
+    );
+    assert.match(archive, /multivibe-host_0\.2\.0_windows_amd64\.zip$/u);
+    const bytes = await readFile(archive);
+    assert.ok(bytes.includes(Buffer.from(`${baseName}/install.ps1`)));
+    assert.ok(bytes.includes(Buffer.from(`${baseName}/uninstall.ps1`)));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Windows packaging uses the ZIP64-capable .NET archive writer", async () => {
+  const [source, verifierSource] = await Promise.all([
+    readFile(packager, "utf8"),
+    readFile(verifier, "utf8"),
+  ]);
+  assert.match(source, /ZipArchiveMode.*Create/u);
+  assert.match(source, /CreateEntry/u);
+  assert.match(source, /-EncodedCommand/u);
+  assert.match(verifierSource, /-EncodedCommand/u);
+  assert.doesNotMatch(source, /Compress-Archive/u);
+});
+
+test("Windows packaging launches npm-cli.js through Node without enabling a shell", async () => {
+  const source = await readFile(packager, "utf8");
+  const invocation = commandInvocation("npm", ["run", "build"], {
+    platform: "win32",
+    execPath: "C:\\Program Files\\nodejs\\node.exe",
+    npmExecPath: "C:\\npm\\bin\\npm-cli.js",
+  });
+  assert.deepEqual(invocation, {
+    program: "C:\\Program Files\\nodejs\\node.exe",
+    args: ["C:\\npm\\bin\\npm-cli.js", "run", "build"],
+  });
+  assert.match(source, /shell: false/u);
+});
+
+test("command invocation leaves non-Windows and non-npm commands unchanged", () => {
+  assert.deepEqual(commandInvocation("npm", ["test"], { platform: "linux" }), {
+    program: "npm",
+    args: ["test"],
+  });
+  assert.deepEqual(commandInvocation("git", ["status"], { platform: "win32" }), {
+    program: "git",
+    args: ["status"],
+  });
+});
+
+test("Windows npm invocation rejects an invalid npm executable path", () => {
+  assert.throws(
+    () => commandInvocation("npm", ["test"], {
+      platform: "win32",
+      execPath: "C:\\Program Files\\nodejs\\node.exe",
+      npmExecPath: "npm.cmd",
+    }),
+    /npm_execpath must be an absolute path to npm-cli\.js on Windows/u,
+  );
+  assert.throws(
+    () => commandInvocation("npm", ["test"], {
+      platform: "win32",
+      execPath: "C:\\Program Files\\nodejs\\node.exe",
+      npmExecPath: "C:\\npm\\bin\\npx-cli.js",
+    }),
+    /npm_execpath must be an absolute path to npm-cli\.js on Windows/u,
+  );
+});
+
+test("packaging runs web and API builds in separate npm processes", async () => {
+  const source = await readFile(packager, "utf8");
+  assert.match(source, /await command\("npm", \["run", "build:web"\]\);\s+await command\("npm", \["run", "build:api"\]\);/u);
+  assert.doesNotMatch(source, /await command\("npm", \["run", "build"\]\);/u);
+});
+
+const notaryID = "266f98c8-abb9-4420-9527-b1522ca23444";
+const notaryAccepted = JSON.stringify({ id: notaryID, status: "Accepted" });
+const notaryCrash = (stdout = "") => Object.assign(new Error("xcrun failed with SIGBUS"), { signal: "SIGBUS", stdout });
+
+test("notarization separates upload and wait and preserves the submission ID", async () => {
+  const calls = [];
+  const id = await submitMacNotarization("Host.dmg", "release", async (program, args) => {
+    calls.push({ program, args });
+    return args[1] === "submit" ? `Submission ID received\n  id: ${notaryID}\n` : notaryAccepted;
+  });
+  assert.equal(id, notaryID);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0], { program: "xcrun", args: ["notarytool", "submit", "Host.dmg",
+    "--keychain-profile", "release", "--no-wait", "--no-progress", "--no-s3-acceleration"] });
+  assert.deepEqual(calls[1].args, ["notarytool", "wait", notaryID, "--keychain-profile", "release",
+    "--timeout", "15m", "--output-format", "json"]);
+});
+
+test("SIGBUS after submission and during wait resumes without another upload", async () => {
+  const actions = [];
+  await submitMacNotarization("Host.dmg", "release", async (_program, args) => {
+    actions.push(args[1]);
+    if (args[1] === "submit") throw notaryCrash(`  id: ${notaryID}\n`);
+    assert.equal(args[2], notaryID);
+    if (actions.length === 2) throw notaryCrash();
+    return notaryAccepted;
+  });
+  assert.deepEqual(actions, ["submit", "wait", "wait"]);
+});
+
+test("notarization stops after three crashed waits", async () => {
+  let waits = 0;
+  await assert.rejects(submitMacNotarization("Host.zip", "release", async (_program, args) => {
+    if (args[1] === "submit") return `id: ${notaryID}`;
+    waits += 1;
+    throw notaryCrash();
+  }), /could not be verified: xcrun failed with SIGBUS/);
+  assert.equal(waits, 3);
+});
+
+test("notarization fails closed for rejection, timeout, malformed results and mismatched IDs", async (t) => {
+  for (const result of [
+    JSON.stringify({ id: notaryID, status: "Invalid" }),
+    JSON.stringify({ id: notaryID, status: "In Progress" }),
+    JSON.stringify({ id: "another-submission", status: "Accepted" }),
+    "not JSON",
+    new Error("wait timed out"),
+  ]) {
+    await t.test(String(result), async () => {
+      let calls = 0;
+      await assert.rejects(submitMacNotarization("Host.dmg", "release", async () => {
+        if (++calls === 1) return `id: ${notaryID}`;
+        if (result instanceof Error) throw result;
+        return result;
+      }));
+      assert.equal(calls, 2);
+    });
+  }
+});
+
+test("a transient upload abort before any submission is retried", async () => {
+  // Reproduced from the arm64 release job: notarytool aborted the S3 upload with
+  // a reset connection and no submission ID, which is safe to retry.
+  const abortedUpload = Object.assign(new Error("xcrun failed with exit 1"), {
+    code: 1,
+    stderr: 'Error: abortedUpload(resumeRequest: SotoS3.S3.ResumeMultipartUploadRequest(uploadRequest: ...), '
+      + 'uploadId: "cgtNaFys", completedParts: [...]), error: The operation couldnaEURO(tm)t be completed. '
+      + '(Network.NWError error 54 - Connection reset by peer))',
+  });
+  let submits = 0;
+  const id = await submitMacNotarization("Host.dmg", "release", async (_program, args) => {
+    if (args[1] === "submit") {
+      submits += 1;
+      if (submits < 3) throw abortedUpload;
+      return `  id: ${notaryID}\n`;
+    }
+    return notaryAccepted;
+  });
+  assert.equal(id, notaryID);
+  assert.equal(submits, 3);
+});
+
+test("persistent upload aborts stop after the bounded attempts", async () => {
+  const abortedUpload = Object.assign(new Error("xcrun failed with exit 1"), {
+    stderr: "Network.NWError error 54 - Connection reset by peer",
+  });
+  let submits = 0;
+  await assert.rejects(submitMacNotarization("Host.dmg", "release", async (_program, args) => {
+    if (args[1] === "submit") {
+      submits += 1;
+      throw abortedUpload;
+    }
+    throw new Error("wait must not run without a submission ID");
+  }), /aborted 3 times without a submission ID/u);
+  assert.equal(submits, 3);
+});
+
+test("a transient abort after an accepted submission ID is not resubmitted", async () => {
+  // When the client already reported a submission ID, the upload must not be
+  // retried; the existing submission is resumed instead.
+  const abortedUpload = Object.assign(new Error("xcrun failed with exit 1"), {
+    stderr: "Network.NWError error 54 - Connection reset by peer",
+    stdout: `Submission ID received\n  id: ${notaryID}\n`,
+  });
+  let submits = 0;
+  let waits = 0;
+  const id = await submitMacNotarization("Host.dmg", "release", async (_program, args) => {
+    if (args[1] === "submit") {
+      submits += 1;
+      if (submits > 1) throw new Error("an identified submission must never be uploaded twice");
+      throw abortedUpload;
+    }
+    assert.equal(args[2], notaryID);
+    waits += 1;
+    return notaryAccepted;
+  });
+  assert.equal(id, notaryID);
+  assert.equal(submits, 1);
+  assert.equal(waits, 1);
+});
+
+test("submission without an ID or with an ordinary failure is not retried", async () => {
+  // An empty success, a credential/usage failure, and a reset connection that
+  // still names a submission are never re-uploaded.
+  const identifiedReset = Object.assign(new Error("xcrun failed with exit 1"), {
+    stderr: "Network.NWError error 54 - Connection reset by peer",
+    stdout: `  id: ${notaryID}\n`,
+  });
+  for (const result of ["", new Error("authentication failed"), identifiedReset]) {
+    let submits = 0;
+    await assert.rejects(submitMacNotarization("Host.dmg", "release", async (_program, args) => {
+      assert.equal(args[1], "submit");
+      submits += 1;
+      if (result instanceof Error) throw result;
+      return result;
+    }));
+    assert.equal(submits, 1);
+  }
+});
+
+test("a lone client crash without an ID stops instead of resubmitting forever", async () => {
+  let submits = 0;
+  await assert.rejects(submitMacNotarization("Host.dmg", "release", async () => {
+    submits += 1;
+    throw notaryCrash();
+  }), /aborted 3 times without a submission ID/u);
+  assert.equal(submits, 3);
+});
+
+const dependencyURL = "https://nodejs.org/test-archive";
+const dependencyPayload = Buffer.from("verified dependency");
+const dependencyDigest = createHash("sha256").update(dependencyPayload).digest("hex");
+function dependencyResponse(body = dependencyPayload, url = dependencyURL) {
+  const response = new Response(body);
+  Object.defineProperty(response, "url", { value: url });
+  return response;
+}
+
+test("download retries a transport timeout before headers", async () => {
+  const work = await mkdtemp(path.join(tmpdir(), "multivibe-download-"));
+  const destination = path.join(work, "dependency");
+  let attempts = 0;
+  try {
+    await download(dependencyURL, destination, dependencyDigest, 1024, {
+      wait: async () => {}, fetchDependency: async () => {
+        if (++attempts === 1) throw new DOMException("timed out", "TimeoutError");
+        return dependencyResponse();
+      },
+    });
+    assert.equal(attempts, 2);
+    assert.deepEqual(await readFile(destination), dependencyPayload);
+  } finally { await rm(work, { recursive: true, force: true }); }
+});
+
+test("download removes partial data before retrying a disconnected body", async () => {
+  const work = await mkdtemp(path.join(tmpdir(), "multivibe-download-"));
+  const destination = path.join(work, "dependency");
+  let attempts = 0;
+  try {
+    await download(dependencyURL, destination, dependencyDigest, 1024, {
+      wait: async () => {}, fetchDependency: async () => {
+        if (++attempts !== 1) return dependencyResponse();
+        let reads = 0;
+        return dependencyResponse(new ReadableStream({ pull(controller) {
+          if (++reads === 1) controller.enqueue(Buffer.from("partial"));
+          else controller.error(Object.assign(new Error("reset"), { code: "ECONNRESET" }));
+        } }));
+      },
+    });
+    assert.equal(attempts, 2);
+    assert.deepEqual(await readFile(destination), dependencyPayload);
+  } finally { await rm(work, { recursive: true, force: true }); }
+});
+
+test("download retries a timeout that aborts body streaming", async () => {
+  const work = await mkdtemp(path.join(tmpdir(), "multivibe-download-"));
+  const destination = path.join(work, "dependency");
+  let attempts = 0;
+  try {
+    await download(dependencyURL, destination, dependencyDigest, 1024, {
+      wait: async () => {}, fetchDependency: async () => {
+        if (++attempts !== 1) return dependencyResponse();
+        let reads = 0;
+        return dependencyResponse(new ReadableStream({ pull(controller) {
+          if (++reads === 1) controller.enqueue(Buffer.from("partial"));
+          else controller.error(new DOMException("The operation was aborted", "AbortError"));
+        } }));
+      },
+    });
+    assert.equal(attempts, 2);
+    assert.deepEqual(await readFile(destination), dependencyPayload);
+  } finally { await rm(work, { recursive: true, force: true }); }
+});
+
+test("download stops after three transport failures", async () => {
+  let attempts = 0;
+  await assert.rejects(download(dependencyURL, "unused", dependencyDigest, 1024, {
+    wait: async () => {}, fetchDependency: async () => {
+      attempts++;
+      throw new DOMException("timed out", "TimeoutError");
+    },
+  }), /attempt 3\/3/);
+  assert.equal(attempts, 3);
+});
+
+test("download retains integrity, origin, size and existing-file checks", async (t) => {
+  for (const scenario of ["digest", "origin", "size", "existing"]) {
+    await t.test(scenario, async () => {
+      const work = await mkdtemp(path.join(tmpdir(), "multivibe-download-"));
+      const destination = path.join(work, "dependency");
+      let attempts = 0;
+      try {
+        if (scenario === "existing") await writeFile(destination, "user data");
+        await assert.rejects(download(dependencyURL, destination,
+          scenario === "digest" ? "0".repeat(64) : dependencyDigest,
+          scenario === "size" ? 1 : 1024, {
+            wait: async () => {}, fetchDependency: async () => {
+              attempts++;
+              return dependencyResponse(dependencyPayload, scenario === "origin" ? "https://example.com/" : dependencyURL);
+            },
+          }));
+        assert.equal(attempts, 1);
+        if (scenario === "existing") assert.equal(await readFile(destination, "utf8"), "user data");
+        else await assert.rejects(readFile(destination), { code: "ENOENT" });
+      } finally { await rm(work, { recursive: true, force: true }); }
+    });
+  }
+});
+
+test("notarization resumes the same submission after an offline network error", async () => {
+  const actions = [];
+  await submitMacNotarization("Host.zip", "release", async (_program, args) => {
+    actions.push(args[1]);
+    if (args[1] === "submit") return `id: ${notaryID}`;
+    assert.equal(args[2], notaryID);
+    if (actions.length === 2) throw Object.assign(new Error("xcrun failed with exit 1"), {
+      stderr: 'NSURLErrorDomain Code=-1009 "The Internet connection appears to be offline."',
+    });
+    return notaryAccepted;
+  });
+  assert.deepEqual(actions, ["submit", "wait", "wait"]);
+});
+
+test("notarization stops after three offline waits", async () => {
+  let waits = 0;
+  await assert.rejects(submitMacNotarization("Host.zip", "release", async (_program, args) => {
+    if (args[1] === "submit") return `id: ${notaryID}`;
+    waits++;
+    throw Object.assign(new Error("xcrun failed with exit 1"), { stderr: "NSURLErrorDomain Code=-1009" });
+  }), /could not be verified/);
+  assert.equal(waits, 3);
+});
+
+
+test("stapling retries Apple ticket service failures then validates the ticket", async () => {
+  const actions = [];
+  const delays = [];
+  await stapleMacArtifact("Host.dmg", async (_program, args) => {
+    actions.push(args);
+    if (actions.length < 3) throw Object.assign(new Error("ticket lookup unavailable"), { code: 68 });
+  }, async (delay) => delays.push(delay));
+  assert.deepEqual(actions.map((args) => args[1]), ["staple", "staple", "staple", "validate"]);
+  assert.ok(actions.every((args) => args[2] === "Host.dmg"));
+  assert.deepEqual(delays, [5000, 10000]);
+});
+
+test("stapling stops on exhausted retries, permanent failures and invalid tickets", async () => {
+  for (const [code, expectedCalls] of [[68, 3], [65, 1]]) {
+    let calls = 0;
+    const failure = Object.assign(new Error("stapler failed"), { code });
+    await assert.rejects(stapleMacArtifact("Host.app", async () => {
+      calls += 1;
+      throw failure;
+    }, async () => {}), (error) => error === failure);
+    assert.equal(calls, expectedCalls);
+  }
+  const actions = [];
+  await assert.rejects(stapleMacArtifact("Host.app", async (_program, args) => {
+    actions.push(args[1]);
+    if (args[1] === "validate") throw new Error("invalid ticket");
+  }, async () => {}), /invalid ticket/);
+  assert.deepEqual(actions, ["staple", "validate"]);
+});
+
+test("packaging no longer needs inference runtimes or a demand trust anchor", async () => {
+  assert.equal(argumentsFrom(["--version", "0.3.0"]).version, "0.3.0");
+  const dependencies = JSON.parse(await readFile(new URL("../../packaging/provider-host-dependencies.json", import.meta.url), "utf8"));
+  assert.deepEqual(Object.keys(dependencies).sort(), ["node", "schemaVersion"]);
+  const source = await readFile(packager, "utf8");
+  assert.doesNotMatch(source, /ollama|multivibe-provider-agent|multivibe-runtime-benchmark|provider-demand-trust/iu);
+});
+
+
+test("ticket validation retries network failures without repeating stapling", async () => {
+  const actions = [];
+  const delays = [];
+  await stapleMacArtifact("Host.app", async (_program, args) => {
+    actions.push(args[1]);
+    if (args[1] === "validate" && actions.length < 4) {
+      throw Object.assign(new Error("Apple connection lost"), { code: 68 });
+    }
+  }, async (delay) => delays.push(delay));
+  assert.deepEqual(actions, ["staple", "validate", "validate", "validate"]);
+  assert.deepEqual(delays, [5000, 10000]);
+});
+
+test("ticket validation fails after three network failures", async () => {
+  const actions = [];
+  await assert.rejects(stapleMacArtifact("Host.dmg", async (_program, args) => {
+    actions.push(args[1]);
+    if (args[1] === "validate") throw Object.assign(new Error("Apple unavailable"), { code: 68 });
+  }, async () => {}), /Apple unavailable/);
+  assert.deepEqual(actions, ["staple", "validate", "validate", "validate"]);
+});
+
+
+test("notarization explicitly opens the signing keychain for upload and wait", async () => {
+  const calls = [];
+  const keychain = "/tmp/release signing.keychain-db";
+  await submitMacNotarization("Host.dmg", "release", async (_program, args) => {
+    calls.push(args);
+    return args[1] === "submit" ? `id: ${notaryID}` : notaryAccepted;
+  }, 3, async () => {}, keychain);
+  assert.equal(calls.length, 2);
+  for (const args of calls) {
+    assert.equal(args[args.indexOf("--keychain") + 1], keychain);
+    assert.equal(args[args.indexOf("--keychain-profile") + 1], "release");
+  }
+});
+
+
+test("notarization retries real subprocess stderr upload failures", async () => {
+  let submits = 0;
+  const id = await submitMacNotarization("Host.dmg", "release", async (_program, args) => {
+    if (args[1] !== "submit") return notaryAccepted;
+    submits += 1;
+    if (submits === 1) {
+      return await command(process.execPath, ["-e",
+        'process.stderr.write("Error: abortedUpload(error: HTTPClientError.deadlineExceeded)\\n"); process.exit(1);'], { capture: true });
+    }
+    return `id: ${notaryID}`;
+  }, 3, async () => {});
+  assert.equal(id, notaryID);
+  assert.equal(submits, 2);
+});
+
+test("captured commands bound stderr output", async () => {
+  await assert.rejects(command(process.execPath, ["-e", 'process.stderr.write("x".repeat(32));'],
+    { capture: true, captureLimit: 16 }), /produced excessive output/);
+});

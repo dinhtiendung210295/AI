@@ -1,0 +1,157 @@
+import { OAuthConfig } from "./oauth.js";
+import { mergeTokenIntoAccount, refreshAccessToken } from "./oauth.js";
+import {
+  isUsageRefreshNeeded,
+  normalizeProvider,
+  rememberError,
+} from "./quota.js";
+import type { Account } from "./types.js";
+import { refreshXaiAccessToken } from "./xai.js";
+import { refreshOpenCodeAccessToken } from "./opencode.js";
+import { refreshCopilotAccessToken } from "./github-copilot.js";
+
+const copilotRefreshes = new Map<string, Promise<Account>>();
+const xaiRefreshes = new Map<string, Promise<Account>>();
+const openCodeRefreshes = new Map<string, Promise<Account>>();
+
+export function isAccountReauthenticationError(
+  account: Account,
+  status: number,
+): boolean {
+  const provider = normalizeProvider(account);
+  return status === 401 &&
+    (provider === "openai" || provider === "opencode" || provider === "xai" || provider === "github-copilot");
+}
+
+export function isTokenRefreshNeeded(
+  account: Account,
+  now = Date.now(),
+): account is Account & { expiresAt: number; refreshToken: string } {
+  const provider = normalizeProvider(account);
+  return (
+    (provider === "openai" || provider === "opencode" || provider === "xai" || provider === "github-copilot") &&
+    typeof account.expiresAt === "number" &&
+    account.expiresAt > 0 &&
+    now >= account.expiresAt - 5 * 60_000 &&
+    Boolean(account.refreshToken)
+  );
+}
+
+export function accountNeedsRequestPreparation(
+  account: Account,
+  now = Date.now(),
+): boolean {
+  if (!account.enabled) return false;
+  return (
+    isTokenRefreshNeeded(account, now) ||
+    isUsageRefreshNeeded(account) ||
+    (normalizeProvider(account) === "openai" &&
+      Boolean(account.state?.scheduledWeeklyReset))
+  );
+}
+
+export async function ensureValidToken(
+  account: Account,
+  oauthConfig: OAuthConfig,
+): Promise<Account> {
+  if (!isTokenRefreshNeeded(account)) return account;
+
+  if (normalizeProvider(account) === "github-copilot") {
+    const key = `${account.id}:${account.refreshToken}`;
+    const current = copilotRefreshes.get(key);
+    if (current) return current;
+    const refresh = refreshCopilotAccessToken(account)
+      .catch((err: any) => {
+        const failed = { ...account };
+        rememberError(failed, err?.message ?? "GitHub Copilot token refresh failed");
+        failed.state = { ...failed.state, needsTokenRefresh: true, authBlockedUntil: Date.now() + 60_000 };
+        return failed;
+      })
+      .finally(() => { copilotRefreshes.delete(key); });
+    copilotRefreshes.set(key, refresh);
+    return refresh;
+  }
+
+  if (normalizeProvider(account) === "xai") {
+    const current = xaiRefreshes.get(account.id);
+    if (current) return current;
+    const refresh = refreshXaiAccessToken(account)
+      .catch((err: any) => {
+        const failed = { ...account };
+        rememberError(
+          failed,
+          `xAI refresh token failed: ${err?.message ?? String(err)}`,
+        );
+        failed.state = {
+          ...failed.state,
+          needsTokenRefresh: true,
+          authBlockedUntil: Date.now() + 60_000,
+        };
+        return failed;
+      })
+      .finally(() => {
+        xaiRefreshes.delete(account.id);
+      });
+    xaiRefreshes.set(account.id, refresh);
+    return refresh;
+  }
+
+  if (normalizeProvider(account) === "opencode") {
+    const current = openCodeRefreshes.get(account.id);
+    if (current) return current;
+    const refresh = refreshOpenCodeAccessToken(account)
+      .then((token) => ({
+        ...account,
+        accessToken: token.accessToken,
+        refreshToken: token.refreshToken ?? account.refreshToken,
+        expiresAt: token.expiresAt ?? account.expiresAt,
+        state: {
+          ...account.state,
+          needsTokenRefresh: false,
+          authBlockedUntil: undefined,
+        },
+      }))
+      .catch((err: any) => {
+        const failed = { ...account };
+        rememberError(
+          failed,
+          `OpenCode refresh token failed: ${err?.message ?? String(err)}`,
+        );
+        failed.state = {
+          ...failed.state,
+          needsTokenRefresh: true,
+          authBlockedUntil: Date.now() + 60_000,
+        };
+        return failed;
+      })
+      .finally(() => {
+        openCodeRefreshes.delete(account.id);
+      });
+    openCodeRefreshes.set(account.id, refresh);
+    return refresh;
+  }
+
+  try {
+    const refreshed = await refreshAccessToken(
+      oauthConfig,
+      account.refreshToken,
+    );
+    const merged = mergeTokenIntoAccount(account, refreshed);
+    merged.state = {
+      ...merged.state,
+      needsTokenRefresh: false,
+    };
+    return merged;
+  } catch (err: any) {
+    const failed = { ...account };
+    rememberError(
+      failed,
+      `refresh token failed: ${err?.message ?? String(err)}`,
+    );
+    failed.state = {
+      ...failed.state,
+      needsTokenRefresh: true,
+    };
+    return failed;
+  }
+}

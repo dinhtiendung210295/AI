@@ -1,0 +1,28 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { ManagedDiscovery } from "./discovery.js";
+test("discovery proves the execution account, deduplicates concurrent probes and sanitizes failures", async () => {
+  let probes=0;
+  const discovery=new ManagedDiscovery([
+    {providerId:"mistral",credentialRef:"account-1",models:new Set(["configured"]),async chatCompletions(){throw Error("must not infer")},
+      async discoverModels(){probes++;return["configured","new-model"]}},
+    {providerId:"xai",credentialRef:"account-2",models:new Set(["other"]),async chatCompletions(){throw Error("must not infer")},
+      async discoverModels(){throw Error("provider_discovery_authentication_rejected")}},
+    {providerId:"openai",credentialRef:"account-3",models:new Set(["other"]),async chatCompletions(){throw Error("must not infer")},
+      async discoverModels(){throw Error("secret provider response")}},
+  ],()=>1000);
+  const values=await Promise.all([discovery.read(),discovery.read()]);
+  assert.deepEqual(values[0],values[1]);assert.equal(probes,1);
+  const result=values[0] as {accounts:Array<{status:string;failureCode?:string;models:string[];executableModels:string[]}>};
+  assert.deepEqual(result.accounts[0]?.models,["configured","new-model"]);
+  assert.deepEqual(result.accounts[0]?.executableModels,["configured"]);
+  assert.equal(result.accounts[1]?.status,"unavailable");
+  assert.equal(result.accounts[1]?.failureCode,"provider_discovery_authentication_rejected");
+  assert.equal(result.accounts[2]?.failureCode,"provider_discovery_unavailable");
+  assert.doesNotMatch(JSON.stringify(result),/secret provider response/);
+});
+test("Cloud-authorized account discovers new executable IDs without changing deployment",async()=>{
+ const discovery=new ManagedDiscovery([{providerId:"mistral",credentialRef:"account",models:new Set(),modelPolicy:"cloud_authorized",
+  async chatCompletions(){throw Error("discovery must not infer")},async discoverModels(){return ["new-model"]}}],()=>1000);
+ assert.deepEqual((await discovery.read() as {accounts:{executableModels:string[]}[]}).accounts[0].executableModels,["new-model"]);
+});

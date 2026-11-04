@@ -1,0 +1,30 @@
+MultiVibe
+Copyright 2026 Thibaut Rey
+Copyright 2026 Pleiades Solutions
+
+The source code in this repository, including MultiVibe Core and the auditable
+provider-host agent, is licensed under the Apache License, Version 2.0. See the
+accompanying `LICENSE` file for the complete terms.
+
+Third-party dependencies retain their own copyright and license terms. Model
+weights, when obtained separately, likewise retain their own terms. Neither is
+automatically covered by MultiVibe Core's Apache-2.0 license, and this source
+archive makes no broader grant for them.
+
+The macOS Desktop distribution embeds Chromium Embedded Framework under its
+BSD license. The exact CEF/Chromium revision and architecture-specific archive
+digests are pinned by the release build; the upstream license is included in
+the application bundle as `ChromiumEmbeddedFramework-LICENSE.txt`.
+
+Provider marks embedded in the iOS model catalog are vendored from the same
+LobeHub Icons MIT-licensed set documented under `web/public/assets/providers`
+where available. Apple and Meta vector marks are sourced from the CC0-1.0
+Simple Icons collection. All provider names and marks remain trademarks of
+their respective owners.
+
+Every MultiVibe-authored source file distributed in this repository is covered
+by Apache-2.0. The separately implemented and operated multivibe.cloud service
+is not included in this repository or distribution. Apache-2.0 grants no access
+to service accounts, credentials, customer data or non-distributed operational
+assets, and grants no trademark rights beyond the limited use permitted by
+Section 6 of the license.

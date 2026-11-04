@@ -1,0 +1,111 @@
+name: MultiVibeChat
+configs:
+  Debug: debug
+  Release: release
+  QA: debug
+options:
+  developmentLanguage: fr
+  bundleIdPrefix: cloud.multivibe
+  deploymentTarget:
+    iOS: '18.0'
+settings:
+  base:
+    SWIFT_VERSION: '6.0'
+    TARGETED_DEVICE_FAMILY: '1,2'
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    SWIFT_STRICT_CONCURRENCY: complete
+    MARKETING_VERSION: 1.0.0
+    CURRENT_PROJECT_VERSION: 1
+    DEVELOPMENT_TEAM: ''
+packages:
+  WebRTC:
+    url: https://github.com/stasel/WebRTC.git
+    exactVersion: 153.0.0
+  MultiVibeSDK:
+    path: ../sdk/MultiVibeSDK
+targets:
+  MultiVibeChat:
+    type: application
+    platform: iOS
+    sources: [MultiVibeChat]
+    dependencies:
+      - framework: .build/MultiVibeLocalInference.xcframework
+        embed: false
+      - sdk: Metal.framework
+      - sdk: Accelerate.framework
+      - sdk: libc++.tbd
+      - package: WebRTC
+      - package: MultiVibeSDK
+        product: MultiVibeSDK
+      - package: MultiVibeSDK
+        product: MultiVibeChatUI
+    settings:
+      base:
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        PRODUCT_BUNDLE_IDENTIFIER: cloud.multivibe.chat
+        DEVELOPMENT_TEAM: 5E2CNR9H47
+        MULTIVIBE_DISPLAY_NAME: MultiVibe
+        MULTIVIBE_URL_SCHEME: multivibe-chat
+        INFOPLIST_FILE: MultiVibeChat/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: MultiVibeChat/Resources/MultiVibeChat.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+      configs:
+        QA:
+          PRODUCT_BUNDLE_IDENTIFIER: cloud.multivibe.chat.qa
+          MULTIVIBE_DISPLAY_NAME: MultiVibe QA
+          MULTIVIBE_URL_SCHEME: multivibe-chat-qa
+          CODE_SIGN_ENTITLEMENTS: MultiVibeChat/Resources/MultiVibeChatQA.entitlements
+    scheme:
+      testTargets: [MultiVibeChatTests, MultiVibeChatUITests]
+  MultiVibeChatTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [MultiVibeChatTests]
+    dependencies:
+      - target: MultiVibeChat
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+      configs:
+        QA:
+          PRODUCT_BUNDLE_IDENTIFIER: cloud.multivibe.chat.qa.tests
+  MultiVibeChatUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [MultiVibeChatUITests]
+    dependencies:
+      - target: MultiVibeChat
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: MultiVibeChat
+      configs:
+        QA:
+          PRODUCT_BUNDLE_IDENTIFIER: cloud.multivibe.chat.qa.uitests
+schemes:
+  MultiVibeHermesQA:
+    build:
+      targets:
+        MultiVibeChat: [run, test, analyze]
+        MultiVibeChatTests: [test]
+    run:
+      config: QA
+    test:
+      config: QA
+      targets:
+        - name: MultiVibeChatTests
+          parallelizable: false
+          selectedTests:
+            - DownloadedModelDeviceTests/testInstalledQwenUsesUpstreamDocumentEdit()
+            - NativeApplicationIdentityTests
+    analyze:
+      config: QA
+    # XcodeGen emits these actions unconditionally. Keep their configuration
+    # isolated and exclude their build types above.
+    profile:
+      config: QA
+    archive:
+      config: QA
+      revealArchiveInOrganizer: false
+    management:
+      shared: true
