@@ -20,7 +20,8 @@ import urllib.request
 DATA = pathlib.Path(os.environ['LOCALAPPDATA']) / 'MultiVibe-Codex-Pilot'
 ROOT = pathlib.Path(__file__).resolve().parent
 SECRETS_FILE = pathlib.Path(os.environ.get('PILOT_SECRETS_FILE', DATA / 'local-keys.json'))
-KEYS = json.loads(SECRETS_FILE.read_text())
+LOCAL_CONFIG = json.loads(SECRETS_FILE.read_text())
+KEYS = LOCAL_CONFIG
 CONTAINER = 'multivibe-pilot-edge'
 PID_FILE = DATA / 'pilot-service.pid'
 STOP_FILE = DATA / 'pilot-service.stop'
@@ -31,6 +32,9 @@ CONTROL = 'http://127.0.0.1:1456'
 
 
 def accounts():
+    configured = LOCAL_CONFIG.get('accounts')
+    if configured:
+        return configured
     return json.loads((DATA / 'accounts.json').read_text()).get('accounts', [])
 
 

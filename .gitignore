@@ -1,4 +1,5 @@
-local/
+local/*
+!local/README.md
 **/node_modules/
 **/.env
 **/.env.local
