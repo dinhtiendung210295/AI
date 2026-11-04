@@ -29,6 +29,7 @@ SNAPSHOT = DATA / 'pilot-accounts.json'
 LOG = DATA / 'pilot-service.log'
 STATE = DATA / 'pilot-service-state.json'
 CONTROL = 'http://127.0.0.1:1456'
+REFRESH_INTERVAL = float(os.environ.get('PILOT_REFRESH_INTERVAL', '10'))
 
 
 def accounts():
@@ -146,7 +147,7 @@ def run():
     try:
         while not STOP_FILE.exists():
             now = time.time()
-            if now - last_refresh > 60:
+            if now - last_refresh > REFRESH_INTERVAL:
                 try:
                     refresh_quota()
                     pilot_router.router.reload()

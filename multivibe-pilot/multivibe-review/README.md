@@ -27,3 +27,6 @@ python .\multivibe-pilot\multivibe-review\start_pilot_control.py
 
 Credentials, account stores, runtime packages, logs, and local state remain
 outside Git. See `..\local\README.md` for the local secrets file.
+
+Quota refreshes every 10 seconds by default. Override with
+`PILOT_REFRESH_INTERVAL` when operating against a rate-limited control plane.
