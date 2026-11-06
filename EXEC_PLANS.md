@@ -4,31 +4,12 @@
 - Là tài liệu sống: Trong quá trình thực thi,  phải cập nhật ExecPlan để phản ánh cả hiện tại, lịch sử ra quyết định
 
 
-## Mẫu
+# Mẫu
 ---
 
-# [Tên công việc]
-**Cập nhật gần nhất:** [YYYY-MM-DD HH:mm, múi giờ]  
 
 
-## Purpose / Big Picture — Mục tiêu và bức tranh tổng thể
-
-[Giải thích vấn đề từ góc nhìn người sử dụng. Mô tả hành vi trước và sau thay đổi, lợi ích đạt được và cách người dùng tự quan sát kết quả.]
-
-## Tiến độ
-
-- [ ] [Mốc kèm điều kiện hoàn thành].
-- [ ] [Mốc kèm điều kiện hoàn thành].
-- [ ] [Kiểm thử và nghiệm thu cuối].
-
-Cập nhật trạng thái ngay khi có bằng chứng hoàn thành hoàn toàn một mốc
-
-
-## Plan of Work — Kế hoạch thực hiện
-
-**[Tên mốc]** [Tiêu chí để đạt mốc + plan để đạt mốc]
-
-**[Tên mốc]** [Tiêu chí để đạt mốc + plan để đạt mốc]
+ 
 
 
 
