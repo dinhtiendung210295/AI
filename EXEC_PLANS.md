@@ -7,15 +7,8 @@
 
 ## Quy ước cốt lõi
 
-- ExecPlan chỉ chứa **tiêu chí hoàn thành**, không chứa hướng dẫn từng bước.
-- Mỗi tiêu chí là một checkbox và **một link** tới file chứa nội dung chi tiết.
-- Không chép báo cáo, bảng số liệu hay nhật ký vào ExecPlan.
-- Chỉ đánh dấu `[x]` khi tiêu chí có bằng chứng trong file liên kết.
-- Mỗi file nghiệm thu có **một bằng chứng chính** đặt ngay dưới tiêu đề.
-- Mỗi thông tin chỉ được trình bày ở **một file**; file khác chỉ link tới.
+- Mỗi tiêu chí là một checkbox và một file bằng chứng duy nhất, các file khác sẽ đặt link bên trong file này
 - Mỗi bằng chứng chỉ được link ở **một nơi trực tiếp sử dụng**.
-- File chỉ đo trạng thái ban đầu (ví dụ kết quả quét) không dùng làm bằng chứng cho kết quả cuối.
-- Kết quả cuối phải có bảng tổng hợp riêng, dẫn lại từ các bằng chứng đã duyệt.
 - Khi nhắc tới tệp, ghi đường dẫn **tính từ thư mục gốc repository**.
 
 ## Dạng tối thiểu của một ExecPlan
