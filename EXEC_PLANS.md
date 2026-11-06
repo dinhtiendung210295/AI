@@ -34,7 +34,7 @@ Nội dung chi tiết và báo cáo không chép vào ExecPlan.
 
 Số nhóm, tên nhóm và số tiêu chí mỗi nhóm do công việc quyết định; không cần theo một danh sách cố định.
 
-## Dạng tối thiểu của một file nghiệm thu
+## Dạng tối thiểu của một file bằng chứng nghiệm thu
 
 Không đặt khuôn cố định. File chỉ cần:
 
