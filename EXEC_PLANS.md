@@ -7,7 +7,7 @@
 
 ## Quy ước cốt lõi
 
-- Mỗi tiêu chí là một checkbox và một file bằng chứng duy nhất, các file khác sẽ đặt link bên trong file này
+- Mỗi tiêu chí là một checkbox và một file bằng chứng duy nhất, các file khác sẽ đặt link bên trong file này bao gồm một bằng chứng chính và các bằng chứng phụ khác 
 - Mỗi bằng chứng chỉ được link ở **một nơi trực tiếp sử dụng**.
 - Khi nhắc tới tệp, ghi đường dẫn **tính từ thư mục gốc repository**.
 
