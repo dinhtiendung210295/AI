@@ -16,7 +16,7 @@ ExecPlan vừa là kế hoạch triển khai, vừa là nhật ký tiến độ.
 - Xác định phạm vi công việc và các tiêu chí hoàn thành.
 - Dùng [mẫu ExecPlan](assets/exec-plan.md) để tạo kế hoạch trong repository đang thực hiện công việc; thay các placeholder bằng nội dung thực tế.
 - Số nhóm, tên nhóm và số tiêu chí mỗi nhóm do công việc quyết định; không cần theo một danh sách cố định.
-- Mỗi tiêu chí là một checkbox và một link tới file chứa nội dung chi tiết, bằng chứng nghiệm thu của tiêu chí đó.
+- Mỗi tiêu chí là một checkbox và một link tới một file bằng chứng duy nhất. File này chứa nội dung chi tiết, một bằng chứng chính và các link tới bằng chứng phụ; các file khác được liên kết bên trong file này.
 
 ### 2. Update
 
