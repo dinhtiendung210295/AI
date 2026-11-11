@@ -9,7 +9,8 @@ description: Lập, cập nhật và nghiệm thu ExecPlan ngắn gọn cho ngư
 
 ## Structure
 
-- Cấu trúc lặp ở mọi cấp: cha cố nhiều mốc con, drill down vào trong con sẽ thấy nhiều mốc cháu nhỏ hơn, drill down vào mốc cháu sẽ thấy nhiều mốc chắt nhỏ hơn 
+- Cấu trúc lặp ở mọi cấp: cha cố nhiều mốc con, drill down vào trong con sẽ thấy nhiều mốc cháu nhỏ hơn, drill down vào mốc cháu sẽ thấy nhiều mốc chắt nhỏ hơn
+- Không nhất thiết các mốc cùng cấp đều phải drill down như nhau, nếu có một nhánh phức tạp hơn các nhánh khác thì có thể cân nhắc drill down thêm
 - Ở các mốc ở cấp nhỏ nhất cuối cùng sẽ có đúng một link dẫn tới **file bằng chứng** với nội dung và format xúc tích ngắn gọn dễ hiểu cho người đọc.
 
 
