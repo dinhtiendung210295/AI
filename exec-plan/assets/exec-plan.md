@@ -2,6 +2,8 @@
 
 - [ ] <Mốc tổng thể>
   - [ ] <Mốc thành phần>
-    - [ ] <Kết quả có thể kiểm chứng> — [Bằng chứng](<đường-dẫn>).
-    - [ ] <Kết quả có thể kiểm chứng> — [Bằng chứng](<đường-dẫn>).
-  - [ ] <Kết quả có thể kiểm chứng> — [Bằng chứng](<đường-dẫn>).
+    - [ ] <Mốc lá có thể kiểm chứng> — [Bằng chứng](<đường-dẫn>).
+    - [ ] <Mốc lá có thể kiểm chứng> — [Bằng chứng](<đường-dẫn>).
+  - [ ] <Mốc thành phần>
+    - [ ] <Mốc lá có thể kiểm chứng> — [Bằng chứng](<đường-dẫn>).
+    - [ ] <Mốc lá có thể kiểm chứng> — [Bằng chứng](<đường-dẫn>).
