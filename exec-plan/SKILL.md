@@ -5,48 +5,32 @@ description: Lập, cập nhật và nghiệm thu ExecPlan ngắn gọn cho ngư
 
 # ExecPlan
 
-## Purpose
-
-ExecPlan là danh sách tiêu chí hoàn thành và bằng chứng nghiệm thu dùng chung cho người và AI. Giữ lớp tổng quan ngắn gọn; cho phép đọc sâu qua các file liên kết khi cần.
+ExecPlan là danh sách tiêu chí hoàn thành và bằng chứng nghiệm thu cho người và AI cùng đọc; chi tiết được truy vết qua liên kết.
 
 ## Plan Structure
 
-- Ngoài tiêu đề nêu công việc, phạm vi và các nhóm cần thiết, ExecPlan chỉ gồm tiêu chí hoàn thành. Mỗi tiêu chí có một checkbox và đúng một link tới file bằng chứng nghiệm thu duy nhất.
-- Mỗi tiêu chí diễn đạt một kết quả có thể kiểm chứng, đủ rõ điều kiện hoàn thành; không mô tả các bước thực hiện hoặc dùng kết luận chung chung như “hoàn thiện”.
-- Ưu tiên checklist để người đọc dễ quét và AI dễ cập nhật. Chỉ dùng bảng khi cần đối chiếu; không tự thêm các cột quản lý không cần thiết.
-- Chỉ chia nhóm khi giúp đọc dễ hơn. Số nhóm, tên nhóm và số tiêu chí do công việc quyết định, không theo danh sách cố định.
-- Rút gọn bằng cách giới hạn nội dung, không cắt mất điều kiện nghiệm thu hoặc áp giới hạn cứng số dòng, số từ.
-- Dùng [mẫu ExecPlan](assets/exec-plan.md) để tạo kế hoạch trong repository đang thực hiện công việc; thay placeholder bằng nội dung thực tế, bỏ nhóm không cần thiết.
+- Ngoài tiêu đề công việc/phạm vi và nhóm cần thiết, chỉ ghi **checkbox + kết quả có thể kiểm chứng + đúng một link tới file bằng chứng nghiệm thu**. Nêu đủ điều kiện hoàn thành, tránh câu chung chung; không chứa bước thực hiện, giải thích, báo cáo hay nhật ký.
+- Ưu tiên checklist; chỉ dùng bảng khi cần đối chiếu, không thêm cột thừa. Chia nhóm tùy công việc để dễ đọc, không áp khuôn cố định hoặc giới hạn số dòng/từ làm mất ý.
+- Tạo kế hoạch trong repository công việc từ [mẫu ExecPlan](assets/exec-plan.md); thay placeholder, bỏ nhóm không cần.
 
 ## Evidence Structure
 
-- Một file bằng chứng là đầu mối nghiệm thu duy nhất của một tiêu chí, không có nghĩa tiêu chí chỉ được có một tài liệu chứng minh.
-- Dùng [mẫu bằng chứng](assets/acceptance-evidence.md) làm điểm khởi đầu; không áp đặt khuôn nội dung cố định.
-- Tiêu đề nêu đúng tiêu chí được chứng minh. Ngay dưới tiêu đề có một dòng **`Bằng chứng chính:`** kèm link tới một bằng chứng chính.
-- Nội dung tùy tiêu chí: kết luận, bảng, quy tắc hoặc danh sách. Giải thích, báo cáo, lịch sử ra quyết định và link tới bằng chứng bổ trợ nằm trong file này hoặc các file được liên kết từ đây, không nằm trong ExecPlan.
+- Mỗi tiêu chí có một file đầu mối nghiệm thu: tiêu đề nêu đúng tiêu chí, ngay dưới là dòng **`Bằng chứng chính:`** kèm một link. File có thể liên kết nhiều tài liệu bổ trợ.
+- Dùng [mẫu bằng chứng](assets/acceptance-evidence.md), không áp khuôn nội dung: kết luận, bảng, quy tắc, giải thích, báo cáo và lịch sử ra quyết định nằm tại đây hoặc các file liên kết.
+- Không bắt buộc bảng tổng hợp riêng; chỉ thêm trong file bằng chứng khi chứng minh kết quả khác, không chép lại kế hoạch.
 
 ## Fractal Structure
 
-- Ở mọi cấp, ExecPlan tuân theo cùng cấu trúc: tiêu chí có thể kiểm chứng, checkbox và một link bằng chứng.
-- Khi một tiêu chí có nhiều kết quả thành phần cần theo dõi riêng, có thể phân rã thành một file ExecPlan con. Không bắt buộc số cấp hoặc tạo cây thư mục chỉ để đủ hình thức.
-- Kế hoạch cha giữ kết quả tổng thể; kế hoạch con giữ tiêu chí thành phần. Không chép toàn bộ tiêu chí con lên cha.
-- Tiêu chí cha vẫn chỉ link tới file bằng chứng của nó. File bằng chứng này liên kết tới ExecPlan con và các bằng chứng bổ trợ cần thiết; không thêm link kế hoạch con trên dòng tiêu chí cha.
-- ExecPlan con theo dõi các kết quả thành phần, không thay thế bằng chứng nghiệm thu của tiêu chí cha.
+- Áp dụng cùng cấu trúc ở mọi cấp. Chỉ tách thành file ExecPlan con khi có nhiều kết quả thành phần cần theo dõi riêng; không ép số cấp hay tạo cây thư mục hình thức.
+- Cha giữ kết quả tổng thể, con giữ tiêu chí thành phần, không sao chép lên cha. Truy cập con qua file bằng chứng của cha, không thêm link trên dòng tiêu chí; kế hoạch con không thay thế bằng chứng của cha.
 
 ## Progress and Acceptance
 
-- Phải cập nhật tiêu chí và checkbox theo tiến độ thực tế. Checkbox thể hiện trạng thái nghiệm thu; nhật ký và lịch sử ra quyết định được lưu trong các file liên kết.
-- Chỉ đánh dấu `[x]` khi tiêu chí có bằng chứng trong file liên kết.
-- Hoàn thành tiêu chí con là cơ sở để nghiệm thu cha, không tự động khiến tiêu chí cha được đánh dấu `[x]`. Phải xác minh kết quả tổng thể qua file bằng chứng của cha.
-- File chỉ đo trạng thái ban đầu (ví dụ kết quả quét) không dùng làm bằng chứng cho kết quả cuối.
-- Không bắt buộc tạo bảng tổng hợp kết quả riêng vì ExecPlan đã tổng hợp tiêu chí và trạng thái. Chỉ thêm bảng trong file bằng chứng khi cần chứng minh một kết quả khác, không sao chép lại kế hoạch.
+- Phải cập nhật tiêu chí và checkbox theo thực tế; chỉ đánh dấu `[x]` khi file liên kết có bằng chứng nghiệm thu. Đo trạng thái ban đầu không chứng minh kết quả cuối.
+- Con hoàn thành không tự động hoàn thành cha: phải xác minh kết quả tổng thể qua file bằng chứng của cha.
 
 ## Rules
 
-- ExecPlan chỉ chứa tiêu chí hoàn thành; không chứa hướng dẫn từng bước, nội dung chi tiết, báo cáo, bảng số liệu hay nhật ký.
-- Mỗi thông tin chỉ được trình bày ở một file; file khác chỉ link tới.
-- Mỗi bằng chứng chỉ được link ở một nơi trực tiếp sử dụng.
-- Khi nhắc tới tệp của công việc, ghi đường dẫn tính từ thư mục gốc repository.
-- Các liên kết tài nguyên trong skill này được tính từ thư mục chứa `SKILL.md`.
-- Khi nhắc tới hàm, lớp hoặc mô-đun, sử dụng tên chính xác nếu đã xác minh trong mã nguồn.
-- Không bịa đường dẫn hay lệnh kiểm thử.
+- Mỗi thông tin chỉ trình bày ở một file; nơi khác chỉ link tới. Mỗi bằng chứng chỉ được link ở một nơi trực tiếp sử dụng.
+- Đường dẫn công việc tính từ gốc repository; link tài nguyên skill tính từ thư mục chứa `SKILL.md`.
+- Chỉ dùng tên hàm, lớp, mô-đun đã xác minh trong mã nguồn; không bịa đường dẫn hoặc lệnh kiểm thử.
