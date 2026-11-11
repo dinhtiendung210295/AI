@@ -1,9 +1,5 @@
-# <Tên tiêu chí>
+# <Mốc lá được nghiệm thu>
 
-> **Bằng chứng chính:** [<Tên bằng chứng>](<đường-dẫn>) — <một câu nói file này chứng minh điều gì>.
+**Kết luận:** <Đạt/chưa đạt — lý do ngắn gọn>.
 
-<Nội dung tự do: bảng, quy tắc, danh sách hoặc kết luận.>
-
-## Bằng chứng bổ trợ
-
-- [<Tên file>](<đường-dẫn>)
+<Nội dung chứng minh trực tiếp: kết quả kiểm tra, bảng đối chiếu, ảnh hoặc liên kết nguồn cần thiết.>

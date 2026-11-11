@@ -1,6 +1,7 @@
-# <Tên công việc> — <phạm vi/kỳ>
+# <Tên công việc> — <phạm vi>
 
-## <Tên nhóm công việc>
-
-- [ ] <Tiêu chí hoàn thành> — [<Tên bằng chứng>](<đường-dẫn>).
-- [ ] <Tiêu chí hoàn thành> — [<Tên bằng chứng>](<đường-dẫn>).
+- [ ] <Mốc tổng thể>
+  - [ ] <Mốc thành phần>
+    - [ ] <Kết quả có thể kiểm chứng> — [Bằng chứng](<đường-dẫn>).
+    - [ ] <Kết quả có thể kiểm chứng> — [Bằng chứng](<đường-dẫn>).
+  - [ ] <Kết quả có thể kiểm chứng> — [Bằng chứng](<đường-dẫn>).
