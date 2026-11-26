@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><title>Dictation trial</title>
+<style>body{font:14px system-ui;width:390px;padding:12px;line-height:1.5}button{padding:8px;margin:3px}textarea{width:100%;box-sizing:border-box;height:150px}#status{white-space:pre-wrap}small{color:#555}</style>
+</head><body>
+<h3>ChatGPT dictation · bản thử nghiệm</h3>
+<p>Mở tab ChatGPT đã đăng nhập trước khi dùng.</p>
+<p><strong>Giữ Ctrl + ` để thu, thả để lấy chữ.</strong> Đóng popup và dùng trên tab ChatGPT. Không có hộp xác nhận thêm; âm thanh gửi tới ChatGPT. Quyền micro của Chrome vẫn áp dụng. Chưa hỗ trợ ngoài Chrome.</p>
+<p>Micro chỉ bật khi bấm Bắt đầu hoặc giữ Ctrl + `. Âm thanh gửi tới ChatGPT.</p>
+<p><button id="windowsOn">Bật Ctrl + ` toàn Windows</button><button id="windowsOff">Tắt</button></p>
+<p><button id="showTab">Mở tab 🎙 Dictation chuyên dụng</button></p>
+<p id="bridgeStatus" role="status">Cầu nối Windows chưa bật.</p>
+<p><button id="start">Bắt đầu</button><button id="stop">Dừng / lấy chữ</button><button id="cancel">Hủy</button></p>
+<p id="status" role="status">Chưa bật micro.</p>
+<details><summary>Nhãn nút trên trang (chẩn đoán)</summary><div id="controls" style="white-space:pre-wrap;overflow-wrap:anywhere"></div></details>
+<textarea id="result" readonly aria-label="Bản chép"></textarea>
+<button id="copy">Copy bản chép &amp; xóa ô ChatGPT</button>
+<p><small>Không tự gửi chat, không tự dán, không lưu bản chép vào ổ đĩa. Micro cần quyền của ChatGPT trong Chrome. Nếu Hủy không phản hồi, đóng tab ChatGPT để ngắt micro.</small></p>
+<script src="popup.js"></script></body></html>

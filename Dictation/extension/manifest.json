@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "ChatGPT Dictation — Local Trial",
+  "version": "0.3.0",
+  "description": "User-operated dictation UI bridge. No cookies, private APIs or automatic message submission.",
+  "permissions": ["activeTab", "scripting", "nativeMessaging", "tabGroups", "storage"],
+  "host_permissions": ["https://chatgpt.com/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "ChatGPT Dictation Trial" }
+}

@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.browser-profile/
+artifacts/
+native-host.cmd
+native-host.json
